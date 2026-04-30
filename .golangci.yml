@@ -1,62 +1,72 @@
 # Pinned linter set for terraform-provider-gitlabcommits.
-# We deliberately enumerate every linter so a new version of golangci-lint
-# pulling in additional defaults cannot quietly red-light CI.
+# default: none + every enabled linter listed explicitly so a new
+# golangci-lint version pulling in additional defaults cannot quietly
+# red-light CI. Single source of truth for the Go target is go.mod;
+# this file mirrors it.
+version: "2"
 run:
-  timeout: 5m
-  # Single source of truth for the runtime is go.mod; analyzers must target
-  # the same toolchain or they may misparse Go 1.26 features (e.g. new(value)).
   go: "1.26"
   modules-download-mode: vendor
-
 linters:
-  disable-all: true
+  default: none
   enable:
+    - bodyclose
+    - copyloopvar
     - errcheck
+    - errorlint
+    - gocritic
+    - gosec
     - govet
     - ineffassign
-    - staticcheck
-    - unused
-    - gosec
-    - gocritic
-    - revive
     - misspell
-    - bodyclose
-    - errorlint
-    - copyloopvar
     - nilerr
     - prealloc
+    - revive
+    - staticcheck
     - unconvert
-
-linters-settings:
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment
-  revive:
+    - unused
+  settings:
+    gosec:
+      excludes:
+        - G401
+        - G505
+    govet:
+      disable:
+        - fieldalignment
+      enable-all: true
+    revive:
+      rules:
+        - name: var-naming
+        - name: package-comments
+          disabled: true
+        - name: exported
+          disabled: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
     rules:
-      - name: var-naming
-      - name: package-comments
-        disabled: true
-      - name: exported
-        disabled: true
-  gocritic:
-    disabled-checks:
-      - hugeParam
-      - rangeValCopy
-  gosec:
-    excludes:
-      # We deliberately use SHA-1 — git's blob SHA format is SHA-1.
-      - G401
-      - G505
-
+      - linters:
+          - errcheck
+          - gosec
+        path: _test\.go
+      - linters:
+          - all
+        path: vendor/
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
 issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - gosec
-        - errcheck
-    - path: vendor/
-      linters:
-        - all
   max-issues-per-linter: 0
   max-same-issues: 0
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
