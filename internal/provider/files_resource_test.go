@@ -274,8 +274,8 @@ func TestDecodeRemoteContent(t *testing.T) {
 		want []byte
 	}{
 		{"explicit-base64", &gitlab.File{Encoding: "base64", Content: enc}, raw},
-		{"empty-encoding-base64-content", &gitlab.File{Encoding: "", Content: enc}, raw},
-		{"empty-encoding-text-content", &gitlab.File{Encoding: "", Content: "literal-not-base64-padding-broken!"}, []byte("literal-not-base64-padding-broken!")},
+		{"empty-encoding-treated-as-base64", &gitlab.File{Encoding: "", Content: enc}, raw},
+		{"explicit-text", &gitlab.File{Encoding: "text", Content: "hello"}, []byte("hello")},
 	}
 
 	for _, c := range cases {
@@ -289,6 +289,20 @@ func TestDecodeRemoteContent(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("invalid-base64", func(t *testing.T) {
+		_, err := decodeRemoteContent(&gitlab.File{Encoding: "base64", Content: "not-valid-base64!"})
+		if err == nil {
+			t.Fatal("expected error for invalid base64")
+		}
+	})
+
+	t.Run("unknown-encoding", func(t *testing.T) {
+		_, err := decodeRemoteContent(&gitlab.File{Encoding: "rot13", Content: "anything"})
+		if err == nil {
+			t.Fatal("expected error for unknown encoding")
+		}
+	})
 }
 
 // TestStampBlobs ensures stamping reproduces git's blob_id format for both

@@ -792,8 +792,11 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			summary = "GitLab resource not found (HTTP 404)"
 			return summary, fmt.Sprintf("%s: project or branch does not exist. Body: %s", prefix, body)
 		case 400, 409:
-			// 400 with last_commit_id is GitLab's optimistic-lock failure.
-			if strings.Contains(body, "last_commit_id") || strings.Contains(body, "ast commit") {
+			// 400 with last_commit_id is GitLab's optimistic-lock failure;
+			// match case-insensitively because the wording isn't pinned by
+			// the API contract.
+			lower := strings.ToLower(body)
+			if strings.Contains(lower, "last_commit_id") || strings.Contains(lower, "last commit") {
 				summary = "Concurrent modification detected (optimistic_lock)"
 				return summary, fmt.Sprintf("%s: a file was modified by someone else since this resource last touched it. "+
 					"Run `terraform apply -refresh-only` to pull current state, then re-plan. Body: %s", prefix, body)
@@ -828,20 +831,20 @@ func commitOptions(m filesResourceModel, actions []*gitlab.CommitActionOptions) 
 	return opts
 }
 
-// decodeRemoteContent returns raw bytes for a File response, regardless of
-// the encoding GitLab chose for the wire format.
+// decodeRemoteContent returns raw bytes for a File response. GitLab's
+// repository_files endpoints return base64 in practice; an empty Encoding
+// is treated the same way (some self-hosted variants omit it). An "rot13"-
+// or otherwise unknown encoding fails loudly rather than silently
+// passing through whatever string came on the wire — a text file whose
+// content is accidentally valid base64 should not be mis-decoded.
 func decodeRemoteContent(f *gitlab.File) ([]byte, error) {
 	switch f.Encoding {
-	case "base64":
+	case "", "base64":
 		return base64.StdEncoding.DecodeString(f.Content)
-	case "":
-		// Some endpoints omit Encoding; assume base64 (the API default for binary).
-		if b, err := base64.StdEncoding.DecodeString(f.Content); err == nil {
-			return b, nil
-		}
+	case "text":
 		return []byte(f.Content), nil
 	default:
-		return []byte(f.Content), nil
+		return nil, fmt.Errorf("unexpected encoding %q from GitLab", f.Encoding)
 	}
 }
 
