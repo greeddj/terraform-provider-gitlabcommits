@@ -325,6 +325,12 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 // Read refreshes blob_id (and content) for every managed file, dropping files
 // that no longer exist in the repository so the next plan recreates them.
 // If detect_drift is false the resource is treated as opaque after creation.
+//
+// Two-step probe: GetFileMetaData first (HEAD-style, no body) to compare
+// blob_id; only fetch the full content via GetFile when the blob has
+// drifted. For the typical fan-out use case (hundreds of unchanged files
+// per resource) this turns a refresh from N full downloads into N metadata
+// calls plus zero-or-few content downloads.
 func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state filesResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -343,7 +349,7 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 	for _, p := range sortedKeys(state.Files) {
 		f := state.Files[p]
 
-		file, _, err := r.client.RepositoryFiles.GetFile(project, p, &gitlab.GetFileOptions{
+		meta, _, err := r.client.RepositoryFiles.GetFileMetaData(project, p, &gitlab.GetFileMetaDataOptions{
 			Ref: new(branch),
 		}, gitlab.WithContext(ctx))
 		if err != nil {
@@ -358,9 +364,25 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 			return
 		}
 
-		if file.BlobID == f.BlobID.ValueString() &&
-			file.ExecuteFilemode == f.ExecuteFilemode.ValueBool() {
+		if meta.BlobID == f.BlobID.ValueString() &&
+			meta.ExecuteFilemode == f.ExecuteFilemode.ValueBool() {
+			// Refresh last_commit_id even when the blob is unchanged — a
+			// delete-then-re-add with identical content moves the token
+			// forward and would otherwise stale optimistic locking.
+			if meta.LastCommitID != "" && meta.LastCommitID != f.LastCommitID.ValueString() {
+				f.LastCommitID = types.StringValue(meta.LastCommitID)
+				state.Files[p] = f
+			}
 			continue
+		}
+
+		file, _, err := r.client.RepositoryFiles.GetFile(project, p, &gitlab.GetFileOptions{
+			Ref: new(branch),
+		}, gitlab.WithContext(ctx))
+		if err != nil {
+			summary, detail := apiErrorDiag(fmt.Sprintf("reading file %q", p), project, branch, err)
+			resp.Diagnostics.AddError(summary, detail)
+			return
 		}
 
 		raw, err := decodeRemoteContent(file)
