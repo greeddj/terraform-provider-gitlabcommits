@@ -568,12 +568,6 @@ func TestApiErrorDiag(t *testing.T) {
 		})
 	}
 
-	t.Run("nil-error", func(t *testing.T) {
-		s, d := apiErrorDiag("act", "proj", "main", nil)
-		if s != "" || d != "" {
-			t.Fatalf("expected empty pair for nil err, got %q / %q", s, d)
-		}
-	})
 }
 
 // helpers

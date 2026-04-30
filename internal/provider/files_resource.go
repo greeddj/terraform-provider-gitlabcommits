@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -141,14 +142,14 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					"when the remote blob differs, so terraform plan reflects the real repository state.",
 				Optional: true,
 				Computed: true,
-				Default:  staticBoolDefault(true),
+				Default:  booldefault.StaticBool(true),
 			},
 			"delete_on_destroy": schema.BoolAttribute{
 				Description: "If true (default), terraform destroy creates one commit that removes every managed file. " +
 					"Set to false to keep files in place when the resource is removed from state.",
 				Optional: true,
 				Computed: true,
-				Default:  staticBoolDefault(true),
+				Default:  booldefault.StaticBool(true),
 			},
 			"adopt_existing": schema.BoolAttribute{
 				Description: "If true (default), files that exist in the repository but are not yet in state are " +
@@ -156,7 +157,7 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					"as an update. Required for terraform import to converge cleanly.",
 				Optional: true,
 				Computed: true,
-				Default:  staticBoolDefault(true),
+				Default:  booldefault.StaticBool(true),
 			},
 			"create_branch_from": schema.StringAttribute{
 				Description: "If set and `branch` does not yet exist, the provider creates it from this " +
@@ -172,7 +173,7 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					"Set to false to opt out (useful when an external process intentionally co-edits the same files).",
 				Optional: true,
 				Computed: true,
-				Default:  staticBoolDefault(true),
+				Default:  booldefault.StaticBool(true),
 			},
 			"commit_sha": schema.StringAttribute{
 				Description: "SHA of the last commit produced by this resource.",
@@ -211,7 +212,7 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 							Description: "Whether the file should have the executable bit set.",
 							Optional:    true,
 							Computed:    true,
-							Default:     staticBoolDefault(false),
+							Default:     booldefault.StaticBool(false),
 						},
 						"blob_id": schema.StringAttribute{
 							Description: "Computed git blob SHA-1 of the file as last seen by the provider. " +
@@ -877,11 +878,9 @@ func truncateForDiag(s string) string {
 // context. Recognises common cases (401/403 token issues, 404 missing
 // resource, 409 / 400 optimistic-lock conflicts, 429 rate limiting) and gives
 // the user actionable guidance instead of a bare error string.
+//
+// Callers must guard on err != nil; this function does not.
 func apiErrorDiag(action, project, branch string, err error) (string, string) {
-	if err == nil {
-		return "", ""
-	}
-
 	summary := fmt.Sprintf("GitLab API error: %s", action)
 	prefix := fmt.Sprintf("project=%q branch=%q", project, branch)
 
