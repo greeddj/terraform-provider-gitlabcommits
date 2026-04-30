@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -126,6 +127,14 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	clientOpts := []gitlab.ClientOptionFunc{}
 	if baseURL != "" {
 		clientOpts = append(clientOpts, gitlab.WithBaseURL(baseURL))
+		if strings.HasPrefix(strings.ToLower(baseURL), "http://") {
+			resp.Diagnostics.AddAttributeWarning(
+				path.Root("base_url"),
+				"GitLab base_url is using plaintext HTTP",
+				"Traffic between Terraform and GitLab — including the API token — will be sent unencrypted. "+
+					"Use https:// unless this is intentional (e.g. a TLS-terminating proxy in front of the API).",
+			)
+		}
 	}
 
 	maxRetries := int64(5)
