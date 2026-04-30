@@ -3,9 +3,13 @@
 ## Reporting a vulnerability
 
 If you believe you've found a security issue in this provider, **do not open
-a public GitHub issue**. Instead, email the maintainer directly:
+a public GitHub issue**. Use one of these private channels instead:
 
-- greeddj@gmail.com
+- **Preferred:** open a GitHub Security Advisory at
+  <https://github.com/greeddj/terraform-provider-gitlabcommits/security/advisories/new>.
+  This keeps the discussion threaded against a CVE-trackable record and lets
+  us collaborate on a fix in a private fork.
+- **Alternative:** email the maintainer directly at <greeddj@gmail.com>.
 
 Please include:
 - a description of the issue and the impact you observed,
