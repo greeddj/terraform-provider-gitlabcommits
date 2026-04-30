@@ -762,6 +762,19 @@ func buildAction(filePath string, f fileModel, op gitlab.FileActionValue, lastCo
 	return a, nil
 }
 
+// maxDiagBodyChars caps the size of any GitLab response body we splice into
+// a Terraform diagnostic. Without this a pathological GitLab error (or a
+// reverse-proxy returning a full HTML page) would dump kilobytes into every
+// terraform plan / apply output and the local Terraform log.
+const maxDiagBodyChars = 1024
+
+func truncateForDiag(s string) string {
+	if len(s) <= maxDiagBodyChars {
+		return s
+	}
+	return s[:maxDiagBodyChars] + fmt.Sprintf("… (truncated, %d more chars)", len(s)-maxDiagBodyChars)
+}
+
 // apiErrorDiag turns a raw GitLab API error into a structured Terraform
 // diagnostic with HTTP status, response body, and the relevant project / branch
 // context. Recognises common cases (401/403 token issues, 404 missing
@@ -778,7 +791,7 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 	var resp *gitlab.ErrorResponse
 	if errors.As(err, &resp) && resp.Response != nil {
 		status := resp.Response.StatusCode
-		body := resp.Message
+		body := truncateForDiag(resp.Message)
 		switch status {
 		case 401:
 			summary = "GitLab authentication failed (HTTP 401)"
@@ -793,7 +806,7 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			// 400 with last_commit_id is GitLab's optimistic-lock failure;
 			// match case-insensitively because the wording isn't pinned by
 			// the API contract.
-			lower := strings.ToLower(body)
+			lower := strings.ToLower(resp.Message)
 			if strings.Contains(lower, "last_commit_id") || strings.Contains(lower, "last commit") {
 				summary = "Concurrent modification detected (optimistic_lock)"
 				return summary, fmt.Sprintf("%s: a file was modified by someone else since this resource last touched it. "+
@@ -803,6 +816,9 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 		case 429:
 			summary = "GitLab rate limit exceeded (HTTP 429)"
 			retryAfter := resp.Response.Header.Get("Retry-After")
+			if retryAfter == "" {
+				retryAfter = "unknown"
+			}
 			return summary, fmt.Sprintf("%s: retry after %s seconds. Body: %s", prefix, retryAfter, body)
 		default:
 			return summary, fmt.Sprintf("%s: HTTP %d. Body: %s", prefix, status, body)
