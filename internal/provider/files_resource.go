@@ -277,11 +277,17 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 		return
 	}
 
+	paths := sortedKeys(plan.Files)
+	var existsMap map[string]bool
+	if plan.adoptExisting() {
+		existsMap = r.probeExists(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), paths)
+	}
+
 	actions := make([]*gitlab.CommitActionOptions, 0, len(plan.Files))
-	for _, p := range sortedKeys(plan.Files) {
+	for _, p := range paths {
 		f := plan.Files[p]
 		op := gitlab.FileCreate
-		if plan.adoptExisting() && r.fileExists(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), p) {
+		if existsMap[p] {
 			op = gitlab.FileUpdate
 		}
 		// On Create there is no prior state, so no last_commit_id to send.
@@ -544,9 +550,12 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 	branch := state.Branch.ValueString()
 	useLock := state.optimisticLock()
 
+	paths := sortedKeys(state.Files)
+	existsMap := r.probeExists(ctx, project, branch, paths)
+
 	actions := make([]*gitlab.CommitActionOptions, 0, len(state.Files))
-	for _, p := range sortedKeys(state.Files) {
-		if !r.fileExists(ctx, project, branch, p) {
+	for _, p := range paths {
+		if !existsMap[p] {
 			continue
 		}
 		a := &gitlab.CommitActionOptions{
@@ -681,6 +690,30 @@ func (r *filesResource) fileExists(ctx context.Context, project, branch, filePat
 		Ref: new(branch),
 	}, gitlab.WithContext(ctx))
 	return err == nil
+}
+
+// probeExists fans out fileExists across paths at refreshParallelism. Errors
+// are swallowed because fileExists itself swallows errors (a transport hiccup
+// is treated as "absent", same as the sequential code).
+func (r *filesResource) probeExists(ctx context.Context, project, branch string, paths []string) map[string]bool {
+	out := make(map[string]bool, len(paths))
+	if len(paths) == 0 {
+		return out
+	}
+	flags := make([]bool, len(paths))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(refreshParallelism)
+	for i, p := range paths {
+		g.Go(func() error {
+			flags[i] = r.fileExists(gctx, project, branch, p)
+			return nil
+		})
+	}
+	_ = g.Wait()
+	for i, p := range paths {
+		out[p] = flags[i]
+	}
+	return out
 }
 
 // ensureBranch makes sure the target branch exists, creating it from createFrom
