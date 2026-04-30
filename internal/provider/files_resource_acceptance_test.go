@@ -124,6 +124,11 @@ func TestAccFiles_import(t *testing.T) {
 				ImportStateId:     fmt.Sprintf("%s::%s", project, branch),
 				ImportStateVerify: false, // files map is intentionally empty after import
 			},
+			// Re-apply the same config after import. adopt_existing rewrites
+			// the spurious "create" actions into updates so apply converges
+			// without duplicate-file errors, and the framework's automatic
+			// plan-after-apply check enforces zero drift.
+			{Config: cfg},
 		},
 	})
 }
