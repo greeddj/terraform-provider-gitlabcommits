@@ -22,7 +22,14 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
+	"golang.org/x/sync/errgroup"
 )
+
+// refreshParallelism caps concurrent GitLab API calls during a single Read.
+// 16 is well below GitLab.com's authenticated rate budget while giving a
+// 16× speedup on the documented fan-out use case (hundreds of files per
+// resource). The retry layer in the client handles 429s if we do hit a cap.
+const refreshParallelism = 16
 
 var (
 	_ resource.Resource                = &filesResource{}
@@ -328,7 +335,10 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 // blob_id; only fetch the full content via GetFile when the blob has
 // drifted. For the typical fan-out use case (hundreds of unchanged files
 // per resource) this turns a refresh from N full downloads into N metadata
-// calls plus zero-or-few content downloads.
+// calls plus zero-or-few content downloads, fanned out at refreshParallelism.
+//
+// The probe runs concurrently; state mutation is deferred to a serial second
+// pass so we never write to state.Files from multiple goroutines.
 func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state filesResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -344,56 +354,79 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 	branch := state.Branch.ValueString()
 	project := state.ProjectID.ValueString()
 
-	for _, p := range sortedKeys(state.Files) {
-		f := state.Files[p]
+	paths := sortedKeys(state.Files)
+	results := make([]fileRefreshResult, len(paths))
 
-		meta, _, err := r.client.RepositoryFiles.GetFileMetaData(project, p, &gitlab.GetFileMetaDataOptions{
-			Ref: new(branch),
-		}, gitlab.WithContext(ctx))
-		if err != nil {
-			if errors.Is(err, gitlab.ErrNotFound) {
-				tflog.Info(ctx, "managed file is gone, dropping from state",
-					map[string]any{"path": p, "branch": branch})
-				delete(state.Files, p)
-				continue
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(refreshParallelism)
+	for i, p := range paths {
+		f := state.Files[p]
+		g.Go(func() error {
+			meta, _, err := r.client.RepositoryFiles.GetFileMetaData(project, p, &gitlab.GetFileMetaDataOptions{
+				Ref: new(branch),
+			}, gitlab.WithContext(gctx))
+			if err != nil {
+				if errors.Is(err, gitlab.ErrNotFound) {
+					results[i].drop = true
+					return nil
+				}
+				return &pathError{path: p, err: err}
 			}
-			summary, detail := apiErrorDiag(fmt.Sprintf("reading file %q", p), project, branch, err)
+			if meta.BlobID == f.BlobID.ValueString() &&
+				meta.ExecuteFilemode == f.ExecuteFilemode.ValueBool() {
+				results[i].metaLastCommitID = meta.LastCommitID
+				return nil
+			}
+			file, _, err := r.client.RepositoryFiles.GetFile(project, p, &gitlab.GetFileOptions{
+				Ref: new(branch),
+			}, gitlab.WithContext(gctx))
+			if err != nil {
+				return &pathError{path: p, err: err}
+			}
+			results[i].file = file
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		var pe *pathError
+		if errors.As(err, &pe) {
+			summary, detail := apiErrorDiag(fmt.Sprintf("reading file %q", pe.path), project, branch, pe.err)
 			resp.Diagnostics.AddError(summary, detail)
 			return
 		}
+		resp.Diagnostics.AddError("Refresh failed", err.Error())
+		return
+	}
 
-		if meta.BlobID == f.BlobID.ValueString() &&
-			meta.ExecuteFilemode == f.ExecuteFilemode.ValueBool() {
-			// Refresh last_commit_id even when the blob is unchanged — a
-			// delete-then-re-add with identical content moves the token
-			// forward and would otherwise stale optimistic locking.
-			if meta.LastCommitID != "" && meta.LastCommitID != f.LastCommitID.ValueString() {
-				f.LastCommitID = types.StringValue(meta.LastCommitID)
+	for i, p := range paths {
+		res := results[i]
+		if res.drop {
+			tflog.Info(ctx, "managed file is gone, dropping from state",
+				map[string]any{"path": p, "branch": branch})
+			delete(state.Files, p)
+			continue
+		}
+		f := state.Files[p]
+		if res.file == nil {
+			// Blob unchanged — refresh last_commit_id only when it has moved
+			// (a delete-then-re-add with identical content would otherwise
+			// stale the optimistic-lock token in state).
+			if res.metaLastCommitID != "" && res.metaLastCommitID != f.LastCommitID.ValueString() {
+				f.LastCommitID = types.StringValue(res.metaLastCommitID)
 				state.Files[p] = f
 			}
 			continue
 		}
-
-		file, _, err := r.client.RepositoryFiles.GetFile(project, p, &gitlab.GetFileOptions{
-			Ref: new(branch),
-		}, gitlab.WithContext(ctx))
-		if err != nil {
-			summary, detail := apiErrorDiag(fmt.Sprintf("reading file %q", p), project, branch, err)
-			resp.Diagnostics.AddError(summary, detail)
-			return
-		}
-
-		raw, err := decodeRemoteContent(file)
+		raw, err := decodeRemoteContent(res.file)
 		if err != nil {
 			resp.Diagnostics.AddError("Cannot decode remote file content",
 				fmt.Sprintf("file %q: %s", p, err))
 			return
 		}
-
-		f.BlobID = types.StringValue(file.BlobID)
-		f.ExecuteFilemode = types.BoolValue(file.ExecuteFilemode)
-		if file.LastCommitID != "" {
-			f.LastCommitID = types.StringValue(file.LastCommitID)
+		f.BlobID = types.StringValue(res.file.BlobID)
+		f.ExecuteFilemode = types.BoolValue(res.file.ExecuteFilemode)
+		if res.file.LastCommitID != "" {
+			f.LastCommitID = types.StringValue(res.file.LastCommitID)
 		}
 		// Preserve whichever form the user originally chose.
 		if !f.ContentBase64.IsNull() {
@@ -406,6 +439,26 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
+
+// fileRefreshResult is the per-file outcome of a parallel refresh probe.
+// Exactly one of (drop, metaLastCommitID-only, file) holds the answer;
+// the rest are zero values.
+type fileRefreshResult struct {
+	file             *gitlab.File // non-nil iff blob drifted and content was pulled
+	metaLastCommitID string       // non-empty iff blob unchanged
+	drop             bool         // file was deleted at the remote
+}
+
+// pathError attaches a repository path to an underlying error so the parallel
+// refresh can surface "which file failed" through errgroup.Group.Wait without
+// dropping the original *gitlab.ErrorResponse needed by apiErrorDiag.
+type pathError struct {
+	err  error
+	path string
+}
+
+func (e *pathError) Error() string { return fmt.Sprintf("file %q: %v", e.path, e.err) }
+func (e *pathError) Unwrap() error { return e.err }
 
 // Update reconciles plan vs state by emitting only the actions that are
 // actually needed (create / update / delete / chmod) and pushing them as one
