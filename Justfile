@@ -32,7 +32,7 @@ docs-check:
 	git diff --exit-code -- docs
 
 check-vet:
-	go vet -mod vendor ./...
+	go vet ./...
 
 check-staticcheck:
 	go tool staticcheck ./...
@@ -68,7 +68,6 @@ security:
 deps:
 	mkdir -p .gocache .gomodcache
 	go mod tidy
-	go mod vendor
 
 check: check-tf-fmt check-vet check-staticcheck check-govulncheck check-fieldalignment
 

@@ -26,8 +26,6 @@ jobs:
           cache: true
 
       - name: Run unit tests
-        env:
-          GOFLAGS: "-mod=vendor"
         run: go test -v -cover ./...
 
       - uses: golangci/golangci-lint-action@v6

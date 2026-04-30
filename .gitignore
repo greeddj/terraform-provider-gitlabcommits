@@ -34,8 +34,6 @@ go.work.sum
 
 dist/
 
-vendor/
-
 .gocache/
 .staticcheck/
 .golangci-lint-cache/

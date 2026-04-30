@@ -14,7 +14,7 @@ just check       # check-tf-fmt + check-vet + check-staticcheck + check-govulnch
 just docs        # regenerate docs/ via tfplugindocs (go generate ./...)
 just docs-check  # regenerate docs and fail if anything changed
 just headers     # apply copywrite license headers
-just deps        # go mod tidy && go mod vendor
+just deps        # go mod tidy
 just fix         # go fix + fieldalignment -fix
 ```
 
@@ -35,7 +35,7 @@ GITLAB_BASE_URL=https://gitlab.example.com \  # optional, for self-hosted
 go test -v ./internal/provider -run TestAccFiles_basic
 ```
 
-`just ci` is the exact aggregate CI runs locally (`check` + `docs-check` + `headers-check`). Vendoring is mandatory — CI fails if `vendor/`, `go.mod`, `go.sum`, `docs/`, or copywrite headers are out of sync.
+`just ci` is the exact aggregate CI runs locally (`check` + `docs-check` + `headers-check`). Dependencies are resolved from the module cache (no `vendor/`); CI fails if `go.mod`, `go.sum`, `docs/`, or copywrite headers are out of sync.
 
 ## Architecture
 

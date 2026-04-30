@@ -47,7 +47,6 @@ jobs:
       - name: Run acceptance tests
         env:
           TF_ACC: '1'
-          GOFLAGS: '-mod=vendor'
           GITLAB_TOKEN: ${{ secrets.GITLAB_TEST_TOKEN }}
           GITLAB_BASE_URL: ${{ secrets.GITLAB_TEST_BASE_URL }}
           GITLAB_TEST_PROJECT_ID: ${{ secrets.GITLAB_TEST_PROJECT_ID }}
