@@ -22,20 +22,19 @@ permissions:
 
 jobs:
   test:
-    name: Unit Tests (go=${{ matrix.go }} tf=${{ matrix.terraform }})
+    name: Unit Tests (tf=${{ matrix.terraform }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        go: ['1.23', '1.24', '1.25']
         terraform: ['1.5.*', '1.6.*', '1.7.*', '1.8.*', 'latest']
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go }}
+          go-version-file: 'go.mod'
           cache: true
 
       - uses: hashicorp/setup-terraform@v3
@@ -49,7 +48,7 @@ jobs:
         run: go test -v -cover -coverprofile=coverage.out -timeout=120s -parallel=10 ./...
 
       - name: Upload coverage
-        if: matrix.go == '1.25' && matrix.terraform == 'latest'
+        if: matrix.terraform == 'latest'
         uses: codecov/codecov-action@v5
         with:
           files: coverage.out

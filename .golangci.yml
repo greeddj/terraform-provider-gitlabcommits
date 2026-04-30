@@ -3,7 +3,9 @@
 # pulling in additional defaults cannot quietly red-light CI.
 run:
   timeout: 5m
-  go: "1.23"
+  # Single source of truth for the runtime is go.mod; analyzers must target
+  # the same toolchain or they may misparse Go 1.26 features (e.g. new(value)).
+  go: "1.26"
   modules-download-mode: vendor
 
 linters:
