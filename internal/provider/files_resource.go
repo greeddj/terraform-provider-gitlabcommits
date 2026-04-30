@@ -153,12 +153,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			},
 			"create_branch_from": schema.StringAttribute{
 				Description: "If set and `branch` does not yet exist, the provider creates it from this " +
-					"source ref (typically \"main\") on first apply. Leave unset to require the branch to " +
-					"already exist.",
+					"source ref (typically \"main\") on first apply. Only consulted by Create; once " +
+					"the branch exists, changing or removing this value is a state-only no-op " +
+					"(no destroy / recreate).",
 				Optional: true,
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
-				},
 			},
 			"optimistic_lock": schema.BoolAttribute{
 				Description: "If true (default), update / delete actions send the file's last_commit_id to GitLab. " +

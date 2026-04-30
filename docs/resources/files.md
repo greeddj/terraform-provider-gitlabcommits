@@ -69,7 +69,7 @@ resource "gitlabcommits_files" "service" {
 - `adopt_existing` (Boolean) If true (default), files that exist in the repository but are not yet in state are adopted on the next apply: a create-action targeting an existing path is silently rewritten as an update. Required for terraform import to converge cleanly.
 - `author_email` (String) Optional override for commit author email.
 - `author_name` (String) Optional override for commit author name.
-- `create_branch_from` (String) If set and `branch` does not yet exist, the provider creates it from this source ref (typically "main") on first apply. Leave unset to require the branch to already exist.
+- `create_branch_from` (String) If set and `branch` does not yet exist, the provider creates it from this source ref (typically "main") on first apply. Only consulted by Create; once the branch exists, changing or removing this value is a state-only no-op (no destroy / recreate).
 - `delete_on_destroy` (Boolean) If true (default), terraform destroy creates one commit that removes every managed file. Set to false to keep files in place when the resource is removed from state.
 - `detect_drift` (Boolean) If true (default), Read fetches each managed file from GitLab and updates state when the remote blob differs, so terraform plan reflects the real repository state.
 - `optimistic_lock` (Boolean) If true (default), update / delete actions send the file's last_commit_id to GitLab. GitLab rejects the action with HTTP 400 if the file has been modified by anyone else since this resource last touched it, preventing silent overwrites in concurrent pipelines. Set to false to opt out (useful when an external process intentionally co-edits the same files).
