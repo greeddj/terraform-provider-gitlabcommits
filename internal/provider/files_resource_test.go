@@ -8,7 +8,10 @@ import (
 	"crypto/sha1" //nolint:gosec
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -429,6 +432,148 @@ func TestBuildID(t *testing.T) {
 	if id != "group/proj::main" {
 		t.Fatalf("got %s", id)
 	}
+}
+
+// TestParseImportID covers the import ID parser used by ImportState. It must
+// reject anything that does not split cleanly into exactly two non-empty
+// halves so the caller never silently keeps part of the suffix.
+func TestParseImportID(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantProj string
+		wantBr   string
+		wantErr  bool
+	}{
+		{"a::b", "a", "b", false},
+		{"group/sub/proj::main", "group/sub/proj", "main", false},
+		{"123::release/v1", "123", "release/v1", false},
+		{"", "", "", true},
+		{"::", "", "", true},
+		{"a::", "", "", true},
+		{"::b", "", "", true},
+		{"a::b::c", "", "", true},
+		{"no-separator", "", "", true},
+		{"   ::main", "", "", true},
+		{"proj::   ", "", "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			p, b, err := parseImportID(c.in)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, c.wantErr)
+			}
+			if !c.wantErr && (p != c.wantProj || b != c.wantBr) {
+				t.Fatalf("got %q/%q want %q/%q", p, b, c.wantProj, c.wantBr)
+			}
+		})
+	}
+}
+
+// TestApiErrorDiag pins the HTTP-status → diagnostic mapping. Each branch
+// (401/403/404/400/409/429/default) carries actionable wording for the user;
+// asserting the summary plus key detail substrings here keeps the wording from
+// drifting silently and locks in the truncation + Retry-After behaviour.
+func TestApiErrorDiag(t *testing.T) {
+	mkErr := func(status int, msg string, headers http.Header) error {
+		if headers == nil {
+			headers = http.Header{}
+		}
+		return &gitlab.ErrorResponse{
+			Response: &http.Response{StatusCode: status, Header: headers},
+			Message:  msg,
+		}
+	}
+
+	cases := []struct {
+		err         error
+		name        string
+		wantSummary string
+		contains    []string
+	}{
+		{
+			name: "401", err: mkErr(401, "invalid token", nil),
+			wantSummary: "GitLab authentication failed (HTTP 401)",
+			contains:    []string{"token rejected", "invalid token"},
+		},
+		{
+			name: "403", err: mkErr(403, "forbidden", nil),
+			wantSummary: "GitLab permission denied (HTTP 403)",
+			contains:    []string{"write_repository"},
+		},
+		{
+			name: "404", err: mkErr(404, "not found", nil),
+			wantSummary: "GitLab resource not found (HTTP 404)",
+			contains:    []string{"does not exist"},
+		},
+		{
+			name: "400-conflict-snake_case", err: mkErr(400, "last_commit_id mismatch", nil),
+			wantSummary: "Concurrent modification detected (optimistic_lock)",
+			contains:    []string{"refresh-only"},
+		},
+		{
+			name: "400-conflict-prose-mixed-case", err: mkErr(400, "Wrong Last Commit detected", nil),
+			wantSummary: "Concurrent modification detected (optimistic_lock)",
+			contains:    []string{"refresh-only"},
+		},
+		{
+			name: "400-other", err: mkErr(400, "validation failed", nil),
+			wantSummary: "GitLab API error: act",
+			contains:    []string{"HTTP 400", "validation failed"},
+		},
+		{
+			name: "409-conflict", err: mkErr(409, "last commit changed", nil),
+			wantSummary: "Concurrent modification detected (optimistic_lock)",
+			contains:    []string{"refresh-only"},
+		},
+		{
+			name: "429-with-retry-after", err: mkErr(429, "rate limited", http.Header{"Retry-After": []string{"60"}}),
+			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
+			contains:    []string{"retry after 60 seconds"},
+		},
+		{
+			name: "429-without-retry-after", err: mkErr(429, "rate limited", nil),
+			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
+			contains:    []string{"retry after unknown seconds"},
+		},
+		{
+			name: "500-default", err: mkErr(500, "boom", nil),
+			wantSummary: "GitLab API error: act",
+			contains:    []string{"HTTP 500", "boom"},
+		},
+		{
+			name: "plain-error", err: errors.New("connection refused"),
+			wantSummary: "GitLab API error: act",
+			contains:    []string{"connection refused"},
+		},
+		{
+			name: "truncated-body", err: mkErr(400, strings.Repeat("x", 2000), nil),
+			wantSummary: "GitLab API error: act",
+			contains:    []string{"truncated, 976 more chars"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			summary, detail := apiErrorDiag("act", "proj", "main", c.err)
+			if summary != c.wantSummary {
+				t.Errorf("summary = %q, want %q", summary, c.wantSummary)
+			}
+			for _, sub := range c.contains {
+				if !strings.Contains(detail, sub) {
+					t.Errorf("detail missing %q; full detail: %s", sub, detail)
+				}
+			}
+			if !strings.Contains(detail, `project="proj"`) || !strings.Contains(detail, `branch="main"`) {
+				t.Errorf("detail missing project/branch prefix: %s", detail)
+			}
+		})
+	}
+
+	t.Run("nil-error", func(t *testing.T) {
+		s, d := apiErrorDiag("act", "proj", "main", nil)
+		if s != "" || d != "" {
+			t.Fatalf("expected empty pair for nil err, got %q / %q", s, d)
+		}
+	})
 }
 
 // helpers

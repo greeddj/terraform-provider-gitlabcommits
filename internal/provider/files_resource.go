@@ -586,15 +586,26 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 // HCL with the repo, and adopt_existing=true keeps it from blowing up on
 // already-present paths.
 func (r *filesResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	parts := strings.Split(req.ID, "::")
-	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
-		resp.Diagnostics.AddError("Invalid Import ID",
-			fmt.Sprintf("expected \"project_id::branch\", got %q", req.ID))
+	project, branch, err := parseImportID(req.ID)
+	if err != nil {
+		resp.Diagnostics.AddError("Invalid Import ID", err.Error())
 		return
 	}
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("project_id"), types.StringValue(parts[0]))...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("branch"), types.StringValue(parts[1]))...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), types.StringValue(buildID(parts[0], parts[1])))...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("project_id"), types.StringValue(project))...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("branch"), types.StringValue(branch))...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), types.StringValue(buildID(project, branch)))...)
+}
+
+// parseImportID splits a composite import identifier of the form
+// "<project_id>::<branch>" into its two components. Both parts must be
+// non-empty and non-whitespace; multiple "::" separators (e.g. "a::b::c")
+// are rejected so the caller never silently keeps part of the suffix.
+func parseImportID(s string) (project, branch string, err error) {
+	parts := strings.Split(s, "::")
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return "", "", fmt.Errorf("expected \"project_id::branch\", got %q", s)
+	}
+	return parts[0], parts[1], nil
 }
 
 // diffActions computes the minimal set of commit actions needed to make the
