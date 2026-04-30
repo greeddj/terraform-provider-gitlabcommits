@@ -30,6 +30,26 @@ jobs:
           GOFLAGS: "-mod=vendor"
         run: go test -v -cover ./...
 
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.7.*'
+          terraform_wrapper: false
+
+      - name: Verify generated docs are in sync
+        run: |
+          go generate ./...
+          git diff --exit-code -- docs
+
+      - name: Verify copywrite headers are in sync
+        run: |
+          go tool copywrite headers -d . --config .copywrite.hcl
+          git diff --exit-code
+
       - name: Import GPG key
         uses: crazy-max/ghaction-import-gpg@v6
         id: import_gpg
