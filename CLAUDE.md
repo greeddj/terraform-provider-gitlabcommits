@@ -63,7 +63,9 @@ The whole point of the provider is **one commit per `terraform apply` per resour
 
 ### Drift detection without re-downloading content
 
-`Read` compares each managed file's stored `blob_id` against the remote one returned by `RepositoryFiles.GetFile`. The provider computes blob IDs locally with [`gitBlobSHA`](internal/provider/files_resource.go) — `sha1("blob <size>\0<content>")`, the exact form git uses — so the comparison is byte-for-byte exact and free. Only when blobs differ does Read decode the remote payload to update state. Setting `detect_drift = false` makes Read a no-op (the resource becomes opaque after creation).
+`Read` probes each managed file with `RepositoryFiles.GetFileMetaData` (HEAD-style, no body), fanned out at `refreshParallelism` through an `errgroup`. The provider computes blob IDs locally with [`gitBlobSHA`](internal/provider/files_resource.go) — `sha1("blob <size>\0<content>")`, the exact form git uses — and compares against state. Only when the blob has actually drifted does Read pull the full payload via `GetFile` and decode it. Setting `detect_drift = false` makes Read a no-op (the resource becomes opaque after creation).
+
+State mutation stays serial: every goroutine writes only into its own slot in a pre-sized `[]fileRefreshResult`, and a second pass over the slice deletes / updates `state.Files` in path order. No locks, no map writes from goroutines.
 
 The deliberate SHA-1 use is why `gosec` G401/G505 are excluded in [.golangci.yml](.golangci.yml).
 
