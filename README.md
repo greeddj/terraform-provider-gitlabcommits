@@ -39,7 +39,7 @@ files map starts empty and is reconciled on the next plan + apply.
 
 - Terraform >= 1.5
 - A GitLab token with `api` scope and write permission on the target repo
-- Go >= 1.25 (development only)
+- Go >= 1.26 (development only)
 
 ## Provider configuration
 
@@ -64,14 +64,17 @@ provider "gitlabcommits" {
 | Argument | Type | Required | Description |
 | --- | --- | --- | --- |
 | `project_id` | string | yes | Project ID or URL-encoded path. ForceNew. |
-| `branch` | string | yes | Target branch (must exist). ForceNew. |
+| `branch` | string | yes | Target branch (must exist, or set `create_branch_from`). ForceNew. |
 | `commit_message` | string | yes | Used for any commit produced (create / update / destroy). |
 | `author_name` | string | no | Override commit author name. |
 | `author_email` | string | no | Override commit author email. |
+| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this source ref (typically `main`) on first apply. |
 | `detect_drift` | bool | no | Default `true`. If false, Read is a no-op. |
 | `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. |
 | `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist (needed for clean import). |
+| `optimistic_lock` | bool | no | Default `true`. Send each file's `last_commit_id` so GitLab rejects concurrent updates with HTTP 400. Set to `false` to opt out. |
 | `files` | map of object | yes | See below. |
+| `id` | string | computed | Composite identifier `<project_id>::<branch>`. |
 | `commit_sha` | string | computed | SHA of the most recent commit produced by this resource. |
 
 ### `files` entry
@@ -82,6 +85,7 @@ provider "gitlabcommits" {
 | `content_base64` | string | base64-encoded content (use for binaries); mutually exclusive with `content` |
 | `execute_filemode` | bool | default `false`; toggling triggers a `chmod` action |
 | `blob_id` | string | computed git blob SHA-1, used for drift detection |
+| `last_commit_id` | string | computed SHA of the last commit through which this resource touched the file; sent on update / delete when `optimistic_lock = true` |
 
 ## Typical layout: 20 services × 30 environments
 
@@ -145,9 +149,14 @@ apply converges without manual surgery.
 - **State holds your file content.** If you set `content_base64` to the bytes
   of a 10 MB binary, those bytes live in `terraform.tfstate`. Use a secrets
   backend and avoid committing huge binaries through this provider.
-- **No optimistic locking.** Two `terraform apply` runs against the same
-  branch concurrently will both succeed and the second one wins. Serialise
-  through your CI/CD orchestration if you need stronger guarantees.
+- **Optimistic locking is on by default.** Each update / delete action sends
+  the file's `last_commit_id` so GitLab rejects the action with HTTP 400 if
+  someone else has touched the file since this resource last did. The
+  provider surfaces those as "Concurrent modification detected" diagnostics
+  with a hint to run `terraform apply -refresh-only`. Set
+  `optimistic_lock = false` per resource to opt out (e.g. when an external
+  bot intentionally co-edits the same files); the trade-off is silent
+  last-write-wins.
 - **`commit_message` is per-apply**, not per-file. The same message is used
   for create / update / destroy commits. This is by design — one resource,
   one logical change, one message.
@@ -158,8 +167,16 @@ apply converges without manual surgery.
 just build       # build the provider
 just test        # unit tests
 just lint        # vet + staticcheck + golangci-lint
-just check       # fmt-check + test + lint
-just testacc     # acceptance tests (require GITLAB_TOKEN, GITLAB_TEST_PROJECT_ID, TF_ACC=1)
+just check       # fmt-check + vet + staticcheck + govulncheck + fieldalignment
+```
+
+Acceptance tests run against a real GitLab project and are gated by env vars:
+
+```bash
+TF_ACC=1 \
+GITLAB_TOKEN='...' \
+GITLAB_TEST_PROJECT_ID='you/sandbox' \
+go test -v -timeout=20m -run '^TestAcc' ./internal/...
 ```
 
 ## License

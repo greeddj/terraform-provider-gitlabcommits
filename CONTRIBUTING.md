@@ -43,7 +43,7 @@ export TF_ACC=1
 export GITLAB_TOKEN='...'                  # api scope, write_repository
 export GITLAB_TEST_PROJECT_ID='you/sandbox'
 export GITLAB_TEST_BRANCH='tf-acc-test'    # optional
-just testacc
+go test -v -timeout=20m -run '^TestAcc' ./internal/...
 ```
 
 In CI they run via `.github/workflows/acceptance.yml` (manual trigger /
