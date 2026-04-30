@@ -1,41 +1,78 @@
 # Terraform Provider GitLab Commits - Justfile
 
-# Variables
+set shell := ["bash", "-cu"]
+
 binary := "terraform-provider-gitlabcommits"
 version := `git describe --tags --abbrev=0 2>/dev/null || echo "dev"`
-PKG := "github.com/greeddj/{{binary}}"
-flags := "-s -w -extldflags '-static' -X {{PKG}}/main.version={{version}}"
 
-# Default recipe (runs when you just type 'just')
 default:
-  @just --list
+	@just --list
 
-# Install necessary development tools
-tools:
-	brew install golangci/tap/golangci-lint
-	go install honnef.co/go/tools/cmd/staticcheck@latest
-	go install golang.org/x/vuln/cmd/govulncheck@latest
+tf-fmt:
+	terraform fmt -recursive examples/
+check-tf-fmt:
+	terraform fmt -check -recursive examples/
 
-# Run linters
+test:
+	mkdir -p .gocache
+	go test -v ./...
+
 lint:
+	mkdir -p .gocache .gomodcache .staticcheck .golangci-lint-cache
+	go vet ./...
+	go tool staticcheck ./...
 	golangci-lint run ./...
 
-# Run code vetting and vulnerability checks
-check: deps
+docs:
+	mkdir -p .gocache .gomodcache
+	go generate ./...
+
+docs-check:
+	just docs
+	git diff --exit-code -- docs
+
+check-vet:
 	go vet -mod vendor ./...
-	staticcheck ./...
-	govulncheck ./...
 
-# Build the provider
+check-staticcheck:
+	go tool staticcheck ./...
+
+check-govulncheck:
+	go tool govulncheck ./... || echo
+
+check-fieldalignment:
+	go tool fieldalignment ./...
+
+fix:
+	go fix ./...
+	go tool fieldalignment -fix ./...
+
+
 build:
-  mkdir -p dist
-  CGO_ENABLED=0 go build -mod vendor -ldflags="{{flags}}" -o dist/{{binary}} main.go
+	mkdir -p dist
+	mkdir -p .gocache
+	CGO_ENABLED=0 go build -ldflags="-s -w -extldflags '-static' -X main.version={{version}}" -o dist/{{binary}} main.go
 
-# Run tests
-test:
-  go test -v ./...
+headers:
+	mkdir -p .gocache .gomodcache
+	go tool copywrite headers -d . --config .copywrite.hcl
 
-# Refresh Go module dependencies
+headers-check:
+	just headers
+	git diff --exit-code
+
+security:
+	mkdir -p .gocache .gomodcache
+	go tool govulncheck ./...
+
 deps:
-  go mod tidy
-  go mod vendor
+	mkdir -p .gocache .gomodcache
+	go mod tidy
+	go mod vendor
+
+check: check-tf-fmt check-vet check-staticcheck check-govulncheck check-fieldalignment
+
+ci:
+	just check
+	just docs-check
+	just headers-check

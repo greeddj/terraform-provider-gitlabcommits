@@ -1,0 +1,60 @@
+# Pinned linter set for terraform-provider-gitlabcommits.
+# We deliberately enumerate every linter so a new version of golangci-lint
+# pulling in additional defaults cannot quietly red-light CI.
+run:
+  timeout: 5m
+  go: "1.23"
+  modules-download-mode: vendor
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosec
+    - gocritic
+    - revive
+    - misspell
+    - bodyclose
+    - errorlint
+    - copyloopvar
+    - nilerr
+    - prealloc
+    - unconvert
+
+linters-settings:
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment
+  revive:
+    rules:
+      - name: var-naming
+      - name: package-comments
+        disabled: true
+      - name: exported
+        disabled: true
+  gocritic:
+    disabled-checks:
+      - hugeParam
+      - rangeValCopy
+  gosec:
+    excludes:
+      # We deliberately use SHA-1 — git's blob SHA format is SHA-1.
+      - G401
+      - G505
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck
+    - path: vendor/
+      linters:
+        - all
+  max-issues-per-linter: 0
+  max-same-issues: 0

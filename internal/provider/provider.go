@@ -1,18 +1,24 @@
+// Copyright (c) 2025 Dmitrij Shishkin (greeddj@gmail.com)
+// SPDX-License-Identifier: MIT
+
 package provider
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
 
-// Ensure the implementation satisfies the expected interfaces.
 var (
 	_ provider.Provider = &gitlabCommitsProvider{}
 )
@@ -26,27 +32,27 @@ func New(version string) func() provider.Provider {
 	}
 }
 
-// gitlabCommitsProvider is the provider implementation.
 type gitlabCommitsProvider struct {
 	version string
 }
 
-// gitlabCommitsProviderModel maps provider schema data to a Go type.
 type gitlabCommitsProviderModel struct {
-	Token   types.String `tfsdk:"token"`
-	BaseURL types.String `tfsdk:"base_url"`
+	Token          types.String `tfsdk:"token"`
+	BaseURL        types.String `tfsdk:"base_url"`
+	MaxRetries     types.Int64  `tfsdk:"max_retries"`
+	RetryWaitMinMs types.Int64  `tfsdk:"retry_wait_min_ms"`
+	RetryWaitMaxMs types.Int64  `tfsdk:"retry_wait_max_ms"`
 }
 
-// Metadata returns the provider type name.
 func (p *gitlabCommitsProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
 	resp.TypeName = "gitlabcommits"
 	resp.Version = p.version
 }
 
-// Schema defines the provider-level schema for configuration data.
 func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Terraform provider for GitLab Commits API. Allows creating commits with multiple files in a single push operation.",
+		Description: "Terraform provider for managing repository files in GitLab via the Commits API. " +
+			"Each managed resource produces one commit per terraform apply containing all of its file changes.",
 		Attributes: map[string]schema.Attribute{
 			"token": schema.StringAttribute{
 				Description: "GitLab personal access token or project access token. May also be provided via GITLAB_TOKEN environment variable.",
@@ -57,106 +63,131 @@ func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaReque
 				Description: "GitLab base URL for self-hosted instances. Defaults to https://gitlab.com. May also be provided via GITLAB_BASE_URL environment variable.",
 				Optional:    true,
 			},
+			"max_retries": schema.Int64Attribute{
+				Description: "Maximum number of retries on transient failures (5xx, 429). Default 5. Set to 0 to disable retries entirely.",
+				Optional:    true,
+			},
+			"retry_wait_min_ms": schema.Int64Attribute{
+				Description: "Lower bound (ms) of the exponential backoff between retries. Default 1000.",
+				Optional:    true,
+			},
+			"retry_wait_max_ms": schema.Int64Attribute{
+				Description: "Upper bound (ms) of the exponential backoff between retries. Default 30000.",
+				Optional:    true,
+			},
 		},
 	}
 }
 
-// Configure prepares a GitLab API client for data sources and resources.
 func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
-	// Retrieve provider data from configuration
+	tflog.Debug(ctx, "Configuring GitLab Commits provider")
+
 	var config gitlabCommitsProviderModel
-	diags := req.Config.Get(ctx, &config)
-	resp.Diagnostics.Append(diags...)
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// If practitioner provided a configuration value for any of the
-	// attributes, it must be a known value.
 	if config.Token.IsUnknown() {
-		resp.Diagnostics.AddError(
+		resp.Diagnostics.AddAttributeError(
+			path.Root("token"),
 			"Unknown GitLab API Token",
-			"The provider cannot create the GitLab API client as there is an unknown configuration value for the GitLab API token. "+
-				"Either target apply the source of the value first, set the value statically in the configuration, or use the GITLAB_TOKEN environment variable.",
+			"Token must be a known value at provider configure time. Use a static value or `target apply` the source first.",
 		)
 	}
-
 	if config.BaseURL.IsUnknown() {
-		resp.Diagnostics.AddError(
+		resp.Diagnostics.AddAttributeError(
+			path.Root("base_url"),
 			"Unknown GitLab Base URL",
-			"The provider cannot create the GitLab API client as there is an unknown configuration value for the GitLab Base URL. "+
-				"Either target apply the source of the value first, set the value statically in the configuration, or use the GITLAB_BASE_URL environment variable.",
+			"base_url must be a known value at provider configure time.",
 		)
 	}
-
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// Default values to environment variables, but override
-	// with Terraform configuration value if set.
 	token := os.Getenv("GITLAB_TOKEN")
-	baseURL := os.Getenv("GITLAB_BASE_URL")
-
 	if !config.Token.IsNull() {
 		token = config.Token.ValueString()
 	}
-
+	baseURL := os.Getenv("GITLAB_BASE_URL")
 	if !config.BaseURL.IsNull() {
 		baseURL = config.BaseURL.ValueString()
 	}
 
-	// If any of the expected configurations are missing, return
-	// errors with provider-specific guidance.
 	if token == "" {
 		resp.Diagnostics.AddError(
 			"Missing GitLab API Token",
-			"The provider cannot create the GitLab API client as there is a missing or empty value for the GitLab API token. "+
-				"Set the token value in the configuration or use the GITLAB_TOKEN environment variable. "+
-				"If either is already set, ensure the value is not empty.",
+			"Set `token` in the provider block or export GITLAB_TOKEN. The token must have the `api` scope and write_repository on the target project.",
 		)
-	}
-
-	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// Create a new GitLab client using the configuration values
-	var client *gitlab.Client
-	var err error
-
 	clientOpts := []gitlab.ClientOptionFunc{}
-
 	if baseURL != "" {
 		clientOpts = append(clientOpts, gitlab.WithBaseURL(baseURL))
 	}
 
-	client, err = gitlab.NewClient(token, clientOpts...)
+	maxRetries := int64(5)
+	if !config.MaxRetries.IsNull() && !config.MaxRetries.IsUnknown() {
+		maxRetries = config.MaxRetries.ValueInt64()
+	}
+	if maxRetries < 0 {
+		resp.Diagnostics.AddAttributeError(path.Root("max_retries"), "Invalid value", "max_retries must be >= 0")
+		return
+	}
+	if maxRetries == 0 {
+		clientOpts = append(clientOpts, gitlab.WithoutRetries())
+	} else {
+		clientOpts = append(clientOpts, gitlab.WithCustomRetryMax(int(maxRetries)))
+	}
+
+	waitMin := int64(1000)
+	if !config.RetryWaitMinMs.IsNull() && !config.RetryWaitMinMs.IsUnknown() {
+		waitMin = config.RetryWaitMinMs.ValueInt64()
+	}
+	waitMax := int64(30000)
+	if !config.RetryWaitMaxMs.IsNull() && !config.RetryWaitMaxMs.IsUnknown() {
+		waitMax = config.RetryWaitMaxMs.ValueInt64()
+	}
+	if waitMin <= 0 || waitMax <= 0 || waitMin > waitMax {
+		resp.Diagnostics.AddError("Invalid retry wait bounds",
+			fmt.Sprintf("retry_wait_min_ms (%d) must be > 0 and <= retry_wait_max_ms (%d)", waitMin, waitMax))
+		return
+	}
+	clientOpts = append(clientOpts, gitlab.WithCustomRetryWaitMinMax(
+		time.Duration(waitMin)*time.Millisecond,
+		time.Duration(waitMax)*time.Millisecond,
+	))
+
+	clientOpts = append(clientOpts, gitlab.WithUserAgent(
+		fmt.Sprintf("terraform-provider-gitlabcommits/%s", p.version),
+	))
+
+	client, err := gitlab.NewClient(token, clientOpts...)
 	if err != nil {
-		resp.Diagnostics.AddError(
-			"Unable to Create GitLab API Client",
-			"An unexpected error occurred when creating the GitLab API client. "+
-				"If the error is not clear, please contact the provider developers.\n\n"+
-				"GitLab Client Error: "+err.Error(),
-		)
+		resp.Diagnostics.AddError("Unable to create GitLab client", err.Error())
 		return
 	}
 
-	// Make the GitLab client available during DataSource and Resource
-	// type Configure methods.
+	tflog.Info(ctx, "GitLab Commits provider configured", map[string]any{
+		"base_url":    baseURL,
+		"max_retries": maxRetries,
+	})
+
 	resp.DataSourceData = client
 	resp.ResourceData = client
 }
 
-// DataSources defines the data sources implemented in the provider.
 func (p *gitlabCommitsProvider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{}
+	return []func() datasource.DataSource{
+		NewFileDataSource,
+		NewBranchHeadDataSource,
+	}
 }
 
-// Resources defines the resources implemented in the provider.
 func (p *gitlabCommitsProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
-		NewCommitResource,
-		NewFileResource,
+		NewFilesResource,
 	}
 }

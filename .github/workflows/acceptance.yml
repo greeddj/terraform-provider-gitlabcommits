@@ -1,0 +1,60 @@
+name: Acceptance Tests
+
+# Acceptance tests run against a real GitLab instance. They require secrets
+# (token + project) and so should NOT run on PRs from forks. We trigger them
+# manually via workflow_dispatch and on a schedule against `main`, so the
+# default-branch state is always known to be green.
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:17 UTC every day — late enough to not collide with release jobs,
+    # offset by an odd number to spread load across CI providers.
+    - cron: '17 3 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'vendor/**'
+      - '.github/workflows/acceptance.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    name: Acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # If GITLAB_TOKEN secret is not set the job becomes a no-op so forks /
+    # community contributors don't see red CI for missing secrets.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'greeddj/terraform-provider-gitlabcommits' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.7.*'
+          terraform_wrapper: false
+
+      - name: Run acceptance tests
+        env:
+          TF_ACC: '1'
+          GOFLAGS: '-mod=vendor'
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TEST_TOKEN }}
+          GITLAB_BASE_URL: ${{ secrets.GITLAB_TEST_BASE_URL }}
+          GITLAB_TEST_PROJECT_ID: ${{ secrets.GITLAB_TEST_PROJECT_ID }}
+          GITLAB_TEST_BRANCH: 'tf-acc-test-${{ github.run_id }}'
+        run: |
+          if [ -z "$GITLAB_TOKEN" ] || [ -z "$GITLAB_TEST_PROJECT_ID" ]; then
+            echo "::warning::GITLAB_TEST_TOKEN / GITLAB_TEST_PROJECT_ID secrets not configured — skipping acceptance tests"
+            exit 0
+          fi
+          go test -v -timeout=20m -run '^TestAcc' ./internal/...

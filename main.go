@@ -1,7 +1,12 @@
+// Copyright (c) 2025 Dmitrij Shishkin (greeddj@gmail.com)
+// SPDX-License-Identifier: MIT
+
 // Package main is the entry point for the GitLab Commits Terraform provider.
 // It initializes and starts the provider server that communicates with Terraform
 // via the Terraform Plugin Protocol (gRPC).
 package main
+
+//go:generate env GOFLAGS=-mod=vendor go tool tfplugindocs generate --provider-dir . --provider-name gitlabcommits
 
 import (
 	"context"
@@ -31,7 +36,7 @@ func main() {
 	opts := providerserver.ServeOpts{
 		// Address is the provider's registry identifier used by Terraform.
 		// Format: registry.terraform.io/namespace/provider-name
-		Address: "registry.terraform.io/greeddj/gitlab-commits",
+		Address: "registry.terraform.io/greeddj/gitlabcommits",
 		// Debug enables debugger support when true.
 		Debug: debug,
 	}

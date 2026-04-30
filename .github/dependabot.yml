@@ -1,0 +1,28 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "fix(deps)"
+      include: scope
+    groups:
+      hashicorp:
+        patterns:
+          - "github.com/hashicorp/*"
+      gitlab-client:
+        patterns:
+          - "gitlab.com/gitlab-org/api/client-go"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "fix(ci)"
+      include: scope

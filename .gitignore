@@ -35,3 +35,17 @@ go.work.sum
 dist/
 
 vendor/
+
+.gocache/
+.staticcheck/
+.golangci-lint-cache/
+.gomodcache/
+
+.plugin-sockets/
+providers-schema.json
+schema.json
+
+.terraform/
+.terraform.lock.hcl
+
+.claude/
