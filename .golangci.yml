@@ -1,3 +1,6 @@
+# Copyright (c) Dmitrij Shishkin (greeddj@gmail.com)
+# SPDX-License-Identifier: MIT
+
 # Pinned linter set for terraform-provider-gitlabcommits.
 # default: none + every enabled linter listed explicitly so a new
 # golangci-lint version pulling in additional defaults cannot quietly

@@ -6,7 +6,7 @@
 // via the Terraform Plugin Protocol (gRPC).
 package main
 
-//go:generate env GOFLAGS=-mod=vendor go tool tfplugindocs generate --provider-dir . --provider-name gitlabcommits
+//go:generate go tool tfplugindocs generate --provider-dir . --provider-name gitlabcommits
 
 import (
 	"context"

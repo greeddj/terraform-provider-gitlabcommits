@@ -17,7 +17,6 @@ on:
       - 'internal/**'
       - 'go.mod'
       - 'go.sum'
-      - 'vendor/**'
       - '.github/workflows/acceptance.yml'
 
 permissions:
@@ -32,16 +31,20 @@ jobs:
     # community contributors don't see red CI for missing secrets.
     if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'greeddj/terraform-provider-gitlabcommits' }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: 'go.mod'
-          cache: true
 
-      - uses: hashicorp/setup-terraform@v3
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: '1.7.*'
+          terraform_version: 'latest'
           terraform_wrapper: false
 
       - name: Run acceptance tests

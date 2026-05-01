@@ -1,77 +1,60 @@
-# Terraform Provider GitLab Commits - Justfile
+PROJECT := "terraform-provider-gitlabcommits"
+VERSION := `sh -c 'git describe --tags --abbrev=0 2>/dev/null || git rev-parse --abbrev-ref HEAD'`
+LDFLAGS := "-s -w -X main.version=" + VERSION
 
-set shell := ["bash", "-cu"]
-
-binary := "terraform-provider-gitlabcommits"
-version := `git describe --tags --abbrev=0 2>/dev/null || echo "dev"`
-
-default:
-	@just --list
-
-tf-fmt:
-	terraform fmt -recursive examples/
-check-tf-fmt:
-	terraform fmt -check -recursive examples/
-
-test:
-	mkdir -p .gocache
-	go test -v ./...
+deps:
+	@echo "===== Check deps for {{PROJECT}} ====="
+	go mod tidy
 
 lint:
-	mkdir -p .gocache .gomodcache .staticcheck .golangci-lint-cache
+	@echo "===== Lint {{PROJECT}} ====="
+	golangci-lint run ./... --timeout=5m
+
+test:
+	@echo "===== Test {{PROJECT}} ====="
+	go test ./...
+
+check:
+	@echo "===== Check {{PROJECT}} ====="
 	go vet ./...
 	go tool staticcheck ./...
-	golangci-lint run ./...
-
-docs:
-	mkdir -p .gocache .gomodcache
-	go generate ./...
-
-docs-check:
-	just docs
-	git diff --exit-code -- docs
-
-check-vet:
-	go vet ./...
-
-check-staticcheck:
-	go tool staticcheck ./...
-
-check-govulncheck:
 	go tool govulncheck ./...
-
-check-fieldalignment:
 	go tool fieldalignment ./...
 
 fix:
+	@echo "===== Fix {{PROJECT}} ====="
 	go fix ./...
 	go tool fieldalignment -fix ./...
 
+tf-fmt:
+	@echo "===== Format Terraform examples ====="
+	terraform fmt -recursive examples/
 
-build:
-	mkdir -p dist
-	mkdir -p .gocache
-	CGO_ENABLED=0 go build -ldflags="-s -w -extldflags '-static' -X main.version={{version}}" -o dist/{{binary}} main.go
+check-tf-fmt:
+	@echo "===== Check Terraform fmt ====="
+	terraform fmt -check -recursive examples/
+
+docs:
+	@echo "===== Regenerate provider docs ====="
+	go generate ./...
+
+docs-check: docs
+	@echo "===== Verify generated docs are in sync ====="
+	git diff --exit-code -- docs
 
 headers:
-	mkdir -p .gocache .gomodcache
+	@echo "===== Apply copywrite headers ====="
 	go tool copywrite headers -d . --config .copywrite.hcl
 
-headers-check:
-	just headers
+headers-check: headers
+	@echo "===== Verify copywrite headers are in sync ====="
 	git diff --exit-code
 
-security:
-	mkdir -p .gocache .gomodcache
-	go tool govulncheck ./...
+build: check lint test
+	@echo "===== Build {{PROJECT}} ====="
+	mkdir -p dist
+	test -f dist/{{PROJECT}} && rm -f dist/{{PROJECT}} || echo "Not exist dist/{{PROJECT}}"
+	CGO_ENABLED=0 go build -trimpath -ldflags="{{LDFLAGS}}" -o ./dist/{{PROJECT}} main.go
 
-deps:
-	mkdir -p .gocache .gomodcache
-	go mod tidy
-
-check: check-tf-fmt check-vet check-staticcheck check-govulncheck check-fieldalignment
-
-ci:
-	just check
-	just docs-check
-	just headers-check
+ci: check lint test check-tf-fmt docs-check headers-check
+	@echo "===== CI gate passed for {{PROJECT}} ====="

@@ -1,12 +1,13 @@
-name: Release
+name: CI
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   tests_and_checks:
@@ -43,7 +44,7 @@ jobs:
           install-mode: binary
 
       - name: Run tests
-        run: go test -v -race ./...
+        run: go test -v -race -coverprofile=coverage.out ./...
 
       - name: Check terraform fmt (examples)
         run: terraform fmt -check -recursive examples/
@@ -58,34 +59,14 @@ jobs:
           go tool copywrite headers -d . --config .copywrite.hcl
           git diff --exit-code
 
-  release:
-    name: Release
-    runs-on: ubuntu-latest
-    needs: [tests_and_checks]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - name: Upload coverage
+        uses: codecov/codecov-action@v5
         with:
-          go-version-file: 'go.mod'
-
-      - name: Import GPG key
-        uses: crazy-max/ghaction-import-gpg@v6
-        id: import_gpg
-        with:
-          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
-          passphrase: ${{ secrets.GPG_PASSPHRASE }}
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: '~> v2'
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          file: ./coverage.out
+          flags: unittests
+          fail_ci_if_error: false
