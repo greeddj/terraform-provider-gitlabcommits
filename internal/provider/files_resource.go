@@ -620,6 +620,23 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 	actions := make([]*gitlab.CommitActionOptions, 0)
 	useLock := plan.optimisticLock()
 
+	// Probe new-in-plan paths in parallel when adoption is on. The
+	// post-import path (state.Files empty, plan.Files large) hits this with
+	// every managed file marked "new", so a sequential fileExists per path
+	// would dominate the apply latency.
+	var existsMap map[string]bool
+	if plan.adoptExisting() {
+		var newPaths []string
+		for _, p := range sortedKeys(plan.Files) {
+			if _, ok := state.Files[p]; !ok {
+				newPaths = append(newPaths, p)
+			}
+		}
+		if len(newPaths) > 0 {
+			existsMap = r.probeExists(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), newPaths)
+		}
+	}
+
 	for _, p := range sortedKeys(plan.Files) {
 		pf := plan.Files[p]
 		sf, exists := state.Files[p]
@@ -633,7 +650,7 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 		if !exists {
 			op := gitlab.FileCreate
 			lastCommitID := ""
-			if plan.adoptExisting() && r.fileExists(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), p) {
+			if existsMap[p] {
 				op = gitlab.FileUpdate
 				// Adopting an existing file: optimistic-lock would need a
 				// last_commit_id we don't have, so we deliberately skip it
