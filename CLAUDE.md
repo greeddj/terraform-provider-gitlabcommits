@@ -28,7 +28,7 @@ Acceptance tests hit a real GitLab project and are gated behind env vars (skippe
 
 ```bash
 TF_ACC=1 \
-GITLAB_TOKEN=<api scope, write_repository> \
+GITLAB_TOKEN=<api scope; see README Authentication> \
 GITLAB_TEST_PROJECT_ID=<group/project or numeric id> \
 GITLAB_TEST_BRANCH=tf-acc-test \      # optional; defaults to "tf-acc-test"
 GITLAB_BASE_URL=https://gitlab.example.com \  # optional, for self-hosted
@@ -40,6 +40,8 @@ go test -v ./internal/provider -run TestAccFiles_basic
 ## Architecture
 
 This is a **Terraform Plugin Framework** provider (not SDKv2). Generated docs live under `docs/`, sourced from schema descriptions plus example HCL in `examples/`.
+
+Minimum supported GitLab version: **18.x**.
 
 ### The one-resource model
 
@@ -63,15 +65,13 @@ The whole point of the provider is **one commit per `terraform apply` per resour
 
 ### Drift detection without re-downloading content
 
-`Read` probes each managed file with `RepositoryFiles.GetFileMetaData` (HEAD-style, no body), fanned out at `refreshParallelism` through an `errgroup`. The provider computes blob IDs locally with [`gitBlobSHA`](internal/provider/files_resource.go) — `sha1("blob <size>\0<content>")`, the exact form git uses — and compares against state. Only when the blob has actually drifted does Read pull the full payload via `GetFile` and decode it. Setting `detect_drift = false` makes Read a no-op (the resource becomes opaque after creation).
+`Read` probes each managed file with `RepositoryFiles.GetFileMetaData` (HEAD-style, no body), fanned out at `refreshParallelism` through an `errgroup`. The provider treats GitLab's returned `blob_id` as opaque — string-equal to what was stamped in state on the last commit. Only when `blob_id` has actually drifted does Read pull the full payload via `GetFile` and decode it. Setting `detect_drift = false` makes Read a no-op (the resource becomes opaque after creation).
 
 State mutation stays serial: every goroutine writes only into its own slot in a pre-sized `[]fileRefreshResult`, and a second pass over the slice deletes / updates `state.Files` in path order. No locks, no map writes from goroutines.
 
-The deliberate SHA-1 use is why `gosec` G401/G505 are excluded in [.golangci.yml](.golangci.yml).
-
 ### Optimistic locking
 
-`optimistic_lock = true` (default) sends each action's `last_commit_id` (the commit SHA we last observed touching the file). GitLab rejects the action with HTTP 400 if anything else has touched the file since. [`apiErrorDiag`](internal/provider/files_resource.go) inspects the response body to convert that 400 into a "Concurrent modification detected" diagnostic with actionable guidance, instead of a generic API error. After every successful commit, [`stampBlobs`](internal/provider/files_resource.go) refreshes both `blob_id` and `last_commit_id` for every entry in the files map.
+`optimistic_lock = true` (default) sends each action's `last_commit_id` (the commit SHA we last observed touching the file). GitLab rejects the action with HTTP 400 if anything else has touched the file since. [`apiErrorDiag`](internal/provider/files_resource.go) inspects the response body to convert that 400 into a "Concurrent modification detected" diagnostic with actionable guidance, instead of a generic API error. After every successful commit, `stampBlobs` stamps `last_commit_id` on every entry from the commit SHA and refreshes `blob_id` via a parallel HEAD-style metadata fan-out (same `refreshParallelism` errgroup pattern as `Read`). If a metadata probe fails, the file's `blob_id` is left null with a warning; the next `Read` repopulates it.
 
 ### Provider client
 

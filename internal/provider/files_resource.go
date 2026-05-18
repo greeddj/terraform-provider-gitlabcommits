@@ -4,15 +4,15 @@
 package provider
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha1" //nolint:gosec // matches GitLab's git blob_id (git uses SHA-1).
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -38,8 +38,6 @@ var (
 	_ resource.ResourceWithImportState = &filesResource{}
 )
 
-// NewFilesResource returns a fresh instance of the files resource for registration
-// in the provider.
 func NewFilesResource() resource.Resource {
 	return &filesResource{}
 }
@@ -215,8 +213,8 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 							Default:     booldefault.StaticBool(false),
 						},
 						"blob_id": schema.StringAttribute{
-							Description: "Computed git blob SHA-1 of the file as last seen by the provider. " +
-								"Used internally to detect drift without re-downloading content.",
+							Description: "Opaque blob identifier returned by GitLab; used for drift detection. " +
+								"Format is GitLab-specific (git SHA-1 today, possibly SHA-256 on SHA-256 repositories).",
 							Computed: true,
 						},
 						"last_commit_id": schema.StringAttribute{
@@ -317,8 +315,8 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 		return
 	}
 
-	if err := stampBlobs(plan.Files, commit.ID); err != nil {
-		resp.Diagnostics.AddError("Internal blob hashing error", err.Error())
+	resp.Diagnostics.Append(r.stampBlobs(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), plan.Files, commit.ID)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 	plan.CommitSHA = types.StringValue(commit.ID)
@@ -516,8 +514,8 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 		return
 	}
 
-	if err := stampBlobs(plan.Files, commit.ID); err != nil {
-		resp.Diagnostics.AddError("Internal blob hashing error", err.Error())
+	resp.Diagnostics.Append(r.stampBlobs(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), plan.Files, commit.ID)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 	plan.CommitSHA = types.StringValue(commit.ID)
@@ -645,7 +643,6 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 		if err != nil {
 			return nil, fmt.Errorf("file %q: %w", p, err)
 		}
-		planBlob := gitBlobSHA(raw)
 
 		if !exists {
 			op := gitlab.FileCreate
@@ -656,7 +653,8 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 				// last_commit_id we don't have, so we deliberately skip it
 				// for this action.
 			}
-			a, err := buildAction(p, pf, op, lastCommitID)
+			var a *gitlab.CommitActionOptions
+			a, err = buildAction(p, pf, op, lastCommitID)
 			if err != nil {
 				return nil, fmt.Errorf("file %q: %w", p, err)
 			}
@@ -669,7 +667,11 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 			lastCommitID = sf.LastCommitID.ValueString()
 		}
 
-		if planBlob != sf.BlobID.ValueString() {
+		stateRaw, err := sf.rawBytes()
+		if err != nil {
+			return nil, fmt.Errorf("file %q: %w", p, err)
+		}
+		if !bytes.Equal(raw, stateRaw) {
 			a, err := buildAction(p, pf, gitlab.FileUpdate, lastCommitID)
 			if err != nil {
 				return nil, fmt.Errorf("file %q: %w", p, err)
@@ -817,32 +819,89 @@ func (f fileModel) rawBytes() ([]byte, error) {
 	}
 }
 
-// gitBlobSHA computes the SHA-1 of a git blob object for the given content.
-// Matches GitLab's BlobID exactly, so we can detect drift without re-downloading content.
-func gitBlobSHA(content []byte) string {
-	h := sha1.New() //nolint:gosec
-	fmt.Fprintf(h, "blob %d\x00", len(content))
-	h.Write(content)
-	return hex.EncodeToString(h.Sum(nil))
-}
+// stampBlobs refreshes BlobID and LastCommitID for every entry in files
+// after a successful CreateCommit. BlobID is pulled via parallel
+// GetFileMetaData probes (HEAD-style) so state reflects what GitLab
+// returns — including any future blob-id format (SHA-256 repos).
+//
+// When a probe succeeds, LastCommitID is taken from the probe response
+// (meta.LastCommitID) rather than commitSHA so that a concurrent writer
+// between our CreateCommit and the HEAD probe is not silently invisible:
+// the racing writer's LastCommitID is preserved in state and will trigger
+// optimistic-lock protection on the next apply. commitSHA is used as
+// LastCommitID only when the probe fails (fail-soft path).
+//
+// Fail-soft covers two shapes: probe error AND a server-returned blob_id
+// longer than 256 bytes (generous ceiling above SHA-512 hex; anything
+// longer is unexpected and treated as hostile). In both cases BlobID is
+// left null, LastCommitID keeps the commitSHA first-pass stamp, and a
+// warning is appended; the next Read will repopulate both.
+func (r *filesResource) stampBlobs(
+	ctx context.Context,
+	project, branch string,
+	files map[string]fileModel,
+	commitSHA string,
+) diag.Diagnostics {
+	var diagnostics diag.Diagnostics
 
-// stampBlobs walks every entry in files and sets BlobID to the locally-computed
-// blob SHA, plus stamps last_commit_id with commitSHA so the next update /
-// delete carries the right token for optimistic locking. Called after a
-// successful commit so state matches what GitLab will report on the next Read.
-func stampBlobs(files map[string]fileModel, commitSHA string) error {
+	// First pass (serial): stamp LastCommitID from the known commit SHA and
+	// reset BlobID to null so a probe failure leaves it null rather than stale.
 	for p, f := range files {
-		raw, err := f.rawBytes()
-		if err != nil {
-			return fmt.Errorf("file %q: %w", p, err)
-		}
-		f.BlobID = types.StringValue(gitBlobSHA(raw))
 		if commitSHA != "" {
 			f.LastCommitID = types.StringValue(commitSHA)
 		}
+		f.BlobID = types.StringNull()
 		files[p] = f
 	}
-	return nil
+
+	paths := sortedKeys(files)
+	type probeResult struct {
+		err          error
+		blobID       string
+		lastCommitID string
+	}
+	results := make([]probeResult, len(paths))
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(refreshParallelism)
+	for i, p := range paths {
+		g.Go(func() error {
+			meta, _, err := r.client.RepositoryFiles.GetFileMetaData(project, p, &gitlab.GetFileMetaDataOptions{
+				Ref: new(branch),
+			}, gitlab.WithContext(gctx))
+			if err != nil {
+				results[i].err = err
+				return nil //nolint:nilerr // intentional: store per-file error, don't cancel other probes
+			}
+			if len(meta.BlobID) > 256 {
+				results[i].err = fmt.Errorf("path %q: server returned blob_id of unexpected length %d (max 256)", p, len(meta.BlobID))
+				return nil //nolint:nilerr // intentional: treat oversized blob_id as probe failure
+			}
+			results[i].blobID = meta.BlobID
+			results[i].lastCommitID = meta.LastCommitID
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	// Second pass (serial): apply probe results. On success, overwrite the
+	// first-pass commitSHA with the server's LastCommitID so a concurrent
+	// writer between our commit and this probe is reflected in state.
+	for i, p := range paths {
+		f := files[p]
+		if results[i].err != nil {
+			diagnostics = append(diagnostics, diag.NewWarningDiagnostic(
+				"Could not refresh blob_id after commit",
+				fmt.Sprintf("path %q: %s", p, results[i].err),
+			))
+		} else {
+			f.BlobID = types.StringValue(results[i].blobID)
+			f.LastCommitID = types.StringValue(results[i].lastCommitID)
+		}
+		files[p] = f
+	}
+
+	return diagnostics
 }
 
 // buildAction translates one fileModel into a CommitActionOptions for the
@@ -911,16 +970,27 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			return summary, fmt.Sprintf("%s: token rejected. Verify the token has the `api` scope and is not expired. Body: %s", prefix, body)
 		case 403:
 			summary = "GitLab permission denied (HTTP 403)"
-			return summary, fmt.Sprintf("%s: token lacks write_repository on the project, or the branch is protected. Body: %s", prefix, body)
+			return summary, fmt.Sprintf("%s: %s Body: %s", prefix,
+				"The token was rejected by GitLab. Verify that: "+
+					"(1) the token has the `api` scope (write_repository alone does not authenticate REST API calls); "+
+					"(2) the token's user has the Developer role on the project, or Maintainer for a protected branch; "+
+					"(3) if you are using CI_JOB_TOKEN, switch to a Personal / Project / Group access token — job tokens cannot POST to /repository/commits.",
+				body)
 		case 404:
 			summary = "GitLab resource not found (HTTP 404)"
 			return summary, fmt.Sprintf("%s: project or branch does not exist. Body: %s", prefix, body)
 		case 400, 409:
-			// 400 with last_commit_id is GitLab's optimistic-lock failure;
-			// match case-insensitively because the wording isn't pinned by
-			// the API contract.
+			// 400 with optimistic-lock failure: GitLab 18 returns
+			//   "You are attempting to update a file that has changed since you
+			//    started editing it. Try again. File last commit id: <sha>"
+			// We match three substrings — `last_commit_id` (snake_case, future-proof if
+			// the API ever exposes the parameter name), `last commit` (current prose
+			// form), and `has changed since` (most stable phrase) — so any one
+			// surviving a future rewording keeps the diagnostic accurate.
 			lower := strings.ToLower(resp.Message)
-			if strings.Contains(lower, "last_commit_id") || strings.Contains(lower, "last commit") {
+			if strings.Contains(lower, "last_commit_id") ||
+				strings.Contains(lower, "last commit") ||
+				strings.Contains(lower, "has changed since") {
 				summary = "Concurrent modification detected (optimistic_lock)"
 				return summary, fmt.Sprintf("%s: a file was modified by someone else since this resource last touched it. "+
 					"Run `terraform apply -refresh-only` to pull current state, then re-plan. Body: %s", prefix, body)

@@ -19,7 +19,7 @@ import (
 // variables to run them:
 //
 //	TF_ACC=1
-//	GITLAB_TOKEN=<token with `api` scope and write_repository on the project>
+//	GITLAB_TOKEN=<token with `api` scope; see README Authentication>
 //	GITLAB_TEST_PROJECT_ID=<group/project> (URL-encoded path or numeric ID)
 //	GITLAB_TEST_BRANCH=<branch>             (defaults to a unique throwaway branch)
 //	GITLAB_BASE_URL=<https://gitlab.example.com>  (optional)

@@ -86,3 +86,18 @@ resource "gitlabcommits_files" "frontend" {
 ```
 
 The first apply after the migration produces zero commits in the repo.
+
+## `blob_id` is now opaque
+
+Prior to v0.3, the provider computed each file's `blob_id` locally using
+`sha1("blob <size>\0<content>")` — git's own format — so the value in
+`terraform.tfstate` was always a 40-character SHA-1. From v0.3 onwards the
+provider stores whatever `blob_id` GitLab returns, treating it as an
+opaque string. On SHA-1 repositories the value is unchanged; on SHA-256
+repositories (GitLab 16.1+ experimental, wider in 18.x) it will be a
+64-character SHA-256.
+
+No user action is required: `blob_id` is `Computed`, so the first plan /
+apply after the upgrade overwrites it from the GitLab API. If you
+reference `blob_id` from another resource or output, expect the value to
+change in state on the next apply.

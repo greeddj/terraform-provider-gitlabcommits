@@ -12,7 +12,7 @@ Acceptance tests in this provider hit a **real GitLab project**. They're gated b
 | Var | Required | Default | Notes |
 |---|---|---|---|
 | `TF_ACC` | yes | — | Must be `1`. Without it, acceptance tests skip. |
-| `GITLAB_TOKEN` | yes | — | Personal access token with `api` scope and `write_repository`. |
+| `GITLAB_TOKEN` | yes | — | Personal, Project, or Group access token with the `api` scope. See README Authentication. |
 | `GITLAB_TEST_PROJECT_ID` | yes | — | Group/project path (e.g. `my-group/sandbox`) or numeric ID. |
 | `GITLAB_TEST_BRANCH` | no | `tf-acc-test` | Throwaway branch. Tests create/reset/delete it. |
 | `GITLAB_BASE_URL` | no | gitlab.com | Set for self-hosted GitLab. |
@@ -53,7 +53,7 @@ Then delete the test branch (`GITLAB_TEST_BRANCH`) to wipe everything in one ope
 ## What stays in unit-test land
 
 - `diffActions` shape (in/out comparison).
-- `gitBlobSHA` correctness against known git blobs.
+- bytewise content comparison in diffActions (state vs plan equality).
 - Validator regex behavior.
 - Plan-modifier behavior.
 - `apiErrorDiag` parsing of canned GitLab error bodies.

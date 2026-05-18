@@ -15,7 +15,7 @@ provider "gitlabcommits" {
 }
 
 variable "gitlab_token" {
-  description = "GitLab token with the `api` scope and write_repository on the target project."
+  description = "GitLab token with the `api` scope. Personal, Project, or Group access tokens are supported."
   type        = string
   sensitive   = true
 }

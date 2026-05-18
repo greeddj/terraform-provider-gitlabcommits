@@ -32,7 +32,7 @@ Hot paths in `internal/provider/files_resource.go` map to:
 | `RepositoryFiles.GetFile` (full body on drift) | `GET /projects/:id/repository/files/:file_path` | <https://docs.gitlab.com/api/repository_files/index.md> |
 | `Commits.CreateCommit` (the single per-apply commit) | `POST /projects/:id/repository/commits` | <https://docs.gitlab.com/api/commits/index.md> |
 | `Branches.GetBranch` (branch_head data source) | `GET /projects/:id/repository/branches/:branch` | <https://docs.gitlab.com/api/branches/index.md> |
-| Auth scopes (`api`, `write_repository`) | n/a — policy doc | <https://docs.gitlab.com/user/profile/personal_access_tokens/index.md> |
+| Auth scopes (`api` only — `write_repository` does not authenticate REST API calls) | n/a — policy doc | <https://docs.gitlab.com/user/profile/personal_access_tokens/index.md> |
 | Rate limits | n/a — policy doc | <https://docs.gitlab.com/administration/settings/rate_limits/index.md> |
 | Error responses | n/a — convention doc | <https://docs.gitlab.com/api/rest/troubleshooting/index.md> |
 

@@ -29,10 +29,6 @@ linters:
     - unconvert
     - unused
   settings:
-    gosec:
-      excludes:
-        - G401
-        - G505
     govet:
       disable:
         - fieldalignment

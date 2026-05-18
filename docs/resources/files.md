@@ -90,7 +90,7 @@ Optional:
 
 Read-Only:
 
-- `blob_id` (String) Computed git blob SHA-1 of the file as last seen by the provider. Used internally to detect drift without re-downloading content.
+- `blob_id` (String) Opaque blob identifier returned by GitLab; used for drift detection. Format is GitLab-specific (git SHA-1 today, possibly SHA-256 on SHA-256 repositories).
 - `last_commit_id` (String) SHA of the last commit through which this resource touched the file. When optimistic_lock is enabled, sent to GitLab on update / delete to detect concurrent modifications.
 
 ## Import

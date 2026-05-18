@@ -53,12 +53,15 @@ func (p *gitlabCommitsProvider) Metadata(_ context.Context, _ provider.MetadataR
 func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Description: "Terraform provider for managing repository files in GitLab via the Commits API. " +
-			"Each managed resource produces one commit per terraform apply containing all of its file changes.",
+			"Each managed resource produces one commit per terraform apply containing all of its file changes. " +
+			"Tested against GitLab 18.x; older versions may work for basic operations but are not supported.",
 		Attributes: map[string]schema.Attribute{
 			"token": schema.StringAttribute{
-				Description: "GitLab personal access token or project access token. May also be provided via GITLAB_TOKEN environment variable.",
-				Optional:    true,
-				Sensitive:   true,
+				Description: "GitLab token used for REST API calls. Must have the `api` scope. " +
+					"Personal, Project, or Group access tokens are supported; CI_JOB_TOKEN is not (its allowlist excludes POST /repository/commits). " +
+					"May also be provided via the GITLAB_TOKEN environment variable. See the provider documentation's Authentication section for details.",
+				Optional:  true,
+				Sensitive: true,
 			},
 			"base_url": schema.StringAttribute{
 				Description: "GitLab base URL for self-hosted instances. Defaults to https://gitlab.com. May also be provided via GITLAB_BASE_URL environment variable.",
@@ -119,7 +122,7 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	if token == "" {
 		resp.Diagnostics.AddError(
 			"Missing GitLab API Token",
-			"Set `token` in the provider block or export GITLAB_TOKEN. The token must have the `api` scope and write_repository on the target project.",
+			"Set `token` in the provider block or export GITLAB_TOKEN. The token must have the `api` scope (Personal, Project, or Group access token). See the provider documentation's Authentication section for details.",
 		)
 		return
 	}

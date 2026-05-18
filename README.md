@@ -20,11 +20,11 @@ branch of one project. The provider:
 - **Create** — pushes one commit that creates every file. If `adopt_existing`
   is true (default) and a path already exists in the repo, the action is
   silently rewritten from `create` to `update`, so the apply does not fail.
-- **Read** — fetches each managed file from the GitLab API and compares its
-  `blob_id` with the one stamped in state. The provider computes blob ids
-  locally (the same `sha1("blob <size>\0<content>")` git itself uses) so the
-  comparison is exact and free. Any drift updates state, so the next plan
-  shows real differences against the repo.
+- **Read** — probes each managed file via a HEAD-style metadata call
+  (`GetFileMetaData`) and compares the GitLab-returned `blob_id` with the
+  one in state. Only when the blob has actually drifted does it pull the
+  full content. Any drift updates state, so the next plan shows real
+  differences against the repo.
 - **Update** — diffs plan vs state and emits the **minimum** set of actions:
   new paths → `create`, gone paths → `delete`, content changed → `update`,
   exec bit flipped → `chmod`. If nothing changed, no commit is produced.
@@ -38,7 +38,8 @@ files map starts empty and is reconciled on the next plan + apply.
 ## Requirements
 
 - Terraform >= 1.5
-- A GitLab token with `api` scope and write permission on the target repo
+- GitLab >= 18.x (older versions may work for basic operations but are not supported)
+- A token that can call the GitLab REST API on the target project (see Authentication below)
 - Go >= 1.26 (development only)
 
 ## Provider configuration
@@ -58,6 +59,28 @@ provider "gitlabcommits" {
   base_url = "https://gitlab.example.com"  # optional; or GITLAB_BASE_URL
 }
 ```
+
+## Authentication
+
+The provider needs a token that can call the GitLab REST API on the target
+project. Supported token types:
+
+- **Personal Access Token** with the `api` scope.
+- **Project Access Token** (or **Group Access Token**) with the `api` scope.
+  Recommended for CI/CD — scope a token to exactly the project(s) you manage.
+
+The token's user (or the token itself, for Project/Group tokens) needs the
+**Developer** role, or **Maintainer** to push to a protected branch.
+
+Pass the token via the `GITLAB_TOKEN` environment variable or the `token`
+attribute on the provider block. In CI, prefer a CI variable such as
+`TF_VAR_gitlab_token` over committing the token.
+
+> The `write_repository` scope is for Git-over-HTTP (push/pull) and does
+> **not** authenticate REST API calls — `api` is the only scope that does.
+> `CI_JOB_TOKEN` is not supported: GitLab's job-token allowlist permits only
+> GET on Commits/Files/Branches APIs, while this provider needs
+> `POST /repository/commits`.
 
 ## Resource: `gitlabcommits_files`
 
@@ -79,13 +102,13 @@ provider "gitlabcommits" {
 
 ### `files` entry
 
-| Field | Type | Notes |
-| --- | --- | --- |
-| `content` | string | text content; mutually exclusive with `content_base64` |
-| `content_base64` | string | base64-encoded content (use for binaries); mutually exclusive with `content` |
-| `execute_filemode` | bool | default `false`; toggling triggers a `chmod` action |
-| `blob_id` | string | computed git blob SHA-1, used for drift detection |
-| `last_commit_id` | string | computed SHA of the last commit through which this resource touched the file; sent on update / delete when `optimistic_lock = true` |
+| Field | Type | Computed | Notes |
+| --- | --- | --- | --- |
+| `content` | string | no | text content; mutually exclusive with `content_base64` |
+| `content_base64` | string | no | base64-encoded content (use for binaries); mutually exclusive with `content` |
+| `execute_filemode` | bool | no | default `false`; toggling triggers a `chmod` action |
+| `blob_id` | string | yes | opaque blob identifier returned by GitLab; used for drift detection (git SHA-1 today, possibly SHA-256 on SHA-256 repos) |
+| `last_commit_id` | string | yes | SHA of the last commit through which this resource touched the file; sent on update / delete when `optimistic_lock = true` |
 
 ## Typical layout: 20 services × 30 environments
 

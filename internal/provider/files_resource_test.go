@@ -5,46 +5,17 @@ package provider
 
 import (
 	"context"
-	"crypto/sha1" //nolint:gosec
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
-
-// TestGitBlobSHA pins our blob SHA implementation to git's actual format
-// (`blob <size>\0<content>`) so it stays compatible with GitLab's BlobID.
-func TestGitBlobSHA(t *testing.T) {
-	tests := []struct {
-		name    string
-		content string
-	}{
-		{"empty", ""},
-		{"hello", "hello\n"},
-		{"yaml", "app:\n  name: myapp\n"},
-		{"binary-ish", "\x00\x01\x02\xff"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := sha1.New() //nolint:gosec
-			fmt.Fprintf(h, "blob %d\x00", len(tt.content))
-			h.Write([]byte(tt.content))
-			want := hex.EncodeToString(h.Sum(nil))
-
-			got := gitBlobSHA([]byte(tt.content))
-			if got != want {
-				t.Fatalf("blob sha mismatch: got %s want %s", got, want)
-			}
-		})
-	}
-}
 
 // TestRawBytes verifies that fileModel.rawBytes returns identical bytes whether
 // content was provided as text or as base64.
@@ -91,12 +62,12 @@ func TestRawBytes(t *testing.T) {
 // TestDiffActions exercises the central reconciliation logic: the set of
 // actions emitted for any given (state, plan) pair.
 func TestDiffActions(t *testing.T) {
-	// helper to mint a fileModel with a deterministic blob.
+	// textFile is a state-side file — content set, blob opaque (as stored after stampBlobs).
 	textFile := func(content string) fileModel {
 		return fileModel{
 			Content:         types.StringValue(content),
 			ExecuteFilemode: types.BoolValue(false),
-			BlobID:          types.StringValue(gitBlobSHA([]byte(content))),
+			BlobID:          types.StringValue("opaque-blob-id-" + content),
 		}
 	}
 	planFile := func(content string) fileModel {
@@ -164,7 +135,7 @@ func TestDiffActions(t *testing.T) {
 				"run.sh": {
 					Content:         types.StringValue("#!/bin/sh\n"),
 					ExecuteFilemode: types.BoolValue(false),
-					BlobID:          types.StringValue(gitBlobSHA([]byte("#!/bin/sh\n"))),
+					BlobID:          types.StringValue("opaque-blob-id-run.sh"),
 				},
 			},
 			plan: map[string]fileModel{
@@ -205,6 +176,44 @@ func TestDiffActions(t *testing.T) {
 				t.Fatalf("got %v want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// TestDiffActions_ContentEqualBytewise verifies that identical content expressed
+// via different attributes (content vs content_base64) produces no action.
+func TestDiffActions_ContentEqualBytewise(t *testing.T) {
+	r := &filesResource{}
+
+	state := filesResourceModel{
+		ProjectID: types.StringValue("group/proj"),
+		Branch:    types.StringValue("main"),
+		Files: map[string]fileModel{
+			"a.txt": {
+				Content:         types.StringValue("hello"),
+				ExecuteFilemode: types.BoolValue(false),
+				BlobID:          types.StringValue("opaque-anything"),
+			},
+		},
+	}
+	plan := filesResourceModel{
+		ProjectID:     types.StringValue("group/proj"),
+		Branch:        types.StringValue("main"),
+		AdoptExisting: types.BoolValue(false),
+		Files: map[string]fileModel{
+			"a.txt": {
+				ContentBase64:   types.StringValue(base64.StdEncoding.EncodeToString([]byte("hello"))),
+				ExecuteFilemode: types.BoolValue(false),
+				BlobID:          types.StringNull(),
+			},
+		},
+	}
+
+	actions, err := r.diffActions(context.Background(), plan, state)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("expected no actions for bytewise-equal content, got %d: %v", len(actions), summarise(actions))
 	}
 }
 
@@ -308,28 +317,99 @@ func TestDecodeRemoteContent(t *testing.T) {
 	})
 }
 
-// TestStampBlobs ensures stamping reproduces git's blob_id format for both
-// text and base64 inputs, and propagates last_commit_id for optimistic locking.
-func TestStampBlobs(t *testing.T) {
-	files := map[string]fileModel{
-		"a": {Content: types.StringValue("hello")},
-		"b": {ContentBase64: types.StringValue(base64.StdEncoding.EncodeToString([]byte("hello")))},
+// TestStampBlobsAfterCommit_FetchesMetadata verifies that stampBlobs issues
+// parallel HEAD probes and populates BlobID from the X-Gitlab-Blob-Id header.
+// LastCommitID must come from the probe's X-Gitlab-Last-Commit-Id, not the
+// commitSHA argument, so that a concurrent writer between CreateCommit and the
+// HEAD probe is reflected in state.
+//
+// The test is parameterised on blob-id format to prove that stampBlobs is
+// opaque to blob-id length: both 40-char SHA-1 and 64-char SHA-256 IDs must
+// round-trip cleanly through state.
+func TestStampBlobsAfterCommit_FetchesMetadata(t *testing.T) {
+	cases := []struct {
+		name   string
+		blobID string
+	}{
+		{
+			name:   "sha1",
+			blobID: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", // git empty-blob SHA-1
+		},
+		{
+			name:   "sha256",
+			blobID: "9d3b8e6bfdcaee5a3b9b8e6c1d4e3c8a7f8b2c5d6e7f8a9b0c1d2e3f4a5b6c7d",
+		},
 	}
-	if err := stampBlobs(files, "deadbeef"); err != nil {
-		t.Fatal(err)
-	}
-	want := gitBlobSHA([]byte("hello"))
-	if files["a"].BlobID.ValueString() != want {
-		t.Errorf("a: %s != %s", files["a"].BlobID.ValueString(), want)
-	}
-	if files["b"].BlobID.ValueString() != want {
-		t.Errorf("b: %s != %s", files["b"].BlobID.ValueString(), want)
-	}
-	if files["a"].LastCommitID.ValueString() != "deadbeef" {
-		t.Errorf("a: last_commit_id not stamped, got %q", files["a"].LastCommitID.ValueString())
-	}
-	if files["b"].LastCommitID.ValueString() != "deadbeef" {
-		t.Errorf("b: last_commit_id not stamped, got %q", files["b"].LastCommitID.ValueString())
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Per-path blob IDs and server-side last-commit-ids the stub will return.
+			// These server-commit values are distinct from "deadbeef" (our commitSHA arg)
+			// so a regression that silently falls back to commitSHA fails the assertion.
+			type pathMeta struct {
+				blobID       string
+				lastCommitID string
+			}
+			metaByPath := map[string]pathMeta{
+				"a.txt": {blobID: tc.blobID, lastCommitID: "server-commit-001"},
+				"b.txt": {blobID: tc.blobID, lastCommitID: "server-commit-002"},
+			}
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodHead {
+					http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
+					return
+				}
+				// URL pattern: /api/v4/projects/proj/repository/files/<encoded-path>
+				for p, m := range metaByPath {
+					if strings.Contains(r.URL.Path, p) {
+						w.Header().Set("X-Gitlab-Blob-Id", m.blobID)
+						w.Header().Set("X-Gitlab-Last-Commit-Id", m.lastCommitID)
+						w.Header().Set("X-Gitlab-Commit-Id", m.lastCommitID)
+						w.Header().Set("X-Gitlab-File-Path", p)
+						w.Header().Set("X-Gitlab-Ref", "main")
+						w.Header().Set("X-Gitlab-Size", "5")
+						w.WriteHeader(http.StatusOK)
+						return
+					}
+				}
+				http.NotFound(w, r)
+			}))
+			defer srv.Close()
+
+			client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+
+			res := &filesResource{client: client}
+
+			files := map[string]fileModel{
+				"a.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
+				"b.txt": {Content: types.StringValue("world"), BlobID: types.StringNull()},
+			}
+
+			diags := res.stampBlobs(context.Background(), "proj", "main", files, "deadbeef")
+			for _, d := range diags {
+				if d.Severity() == 1 { // error
+					t.Errorf("unexpected error diagnostic: %s: %s", d.Summary(), d.Detail())
+				}
+			}
+
+			for p, wantMeta := range metaByPath {
+				f, ok := files[p]
+				if !ok {
+					t.Fatalf("path %q missing from files map after stampBlobs", p)
+				}
+				if f.BlobID.ValueString() != wantMeta.blobID {
+					t.Errorf("path %q: BlobID = %q, want %q", p, f.BlobID.ValueString(), wantMeta.blobID)
+				}
+				// LastCommitID must come from the server probe, not from "deadbeef".
+				if f.LastCommitID.ValueString() != wantMeta.lastCommitID {
+					t.Errorf("path %q: LastCommitID = %q, want %q (server value)", p, f.LastCommitID.ValueString(), wantMeta.lastCommitID)
+				}
+			}
+		})
 	}
 }
 
@@ -346,13 +426,13 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 			"a.yaml": {
 				Content:         types.StringValue("v1"),
 				ExecuteFilemode: types.BoolValue(false),
-				BlobID:          types.StringValue(gitBlobSHA([]byte("v1"))),
+				BlobID:          types.StringValue("opaque-blob-a"),
 				LastCommitID:    types.StringValue("commit-A"),
 			},
 			"b.yaml": {
 				Content:         types.StringValue("keep"),
 				ExecuteFilemode: types.BoolValue(false),
-				BlobID:          types.StringValue(gitBlobSHA([]byte("keep"))),
+				BlobID:          types.StringValue("opaque-blob-b"),
 				LastCommitID:    types.StringValue("commit-B"),
 			},
 		},
@@ -498,7 +578,7 @@ func TestApiErrorDiag(t *testing.T) {
 		{
 			name: "403", err: mkErr(403, "forbidden", nil),
 			wantSummary: "GitLab permission denied (HTTP 403)",
-			contains:    []string{"write_repository"},
+			contains:    []string{"api", "Developer", "CI_JOB_TOKEN"},
 		},
 		{
 			name: "404", err: mkErr(404, "not found", nil),
@@ -512,6 +592,24 @@ func TestApiErrorDiag(t *testing.T) {
 		},
 		{
 			name: "400-conflict-prose-mixed-case", err: mkErr(400, "Wrong Last Commit detected", nil),
+			wantSummary: "Concurrent modification detected (optimistic_lock)",
+			contains:    []string{"refresh-only"},
+		},
+		{
+			// Verbatim GitLab 18 message for optimistic-lock failure.
+			name: "400-gitlab18-verbatim",
+			err: mkErr(400,
+				"You are attempting to update a file that has changed since you started editing it. Try again. File last commit id: 8a2b3c4d", nil),
+			wantSummary: "Concurrent modification detected (optimistic_lock)",
+			contains:    []string{"refresh-only"},
+		},
+		{
+			// Fictional message that contains only "has changed since" — no overlap
+			// with "last_commit_id" or "last commit". Falsifies the third substring
+			// branch in apiErrorDiag independently of the other two matchers.
+			name: "400-has-changed-since-only",
+			err: mkErr(400,
+				"The remote file has changed since you started editing. Please reload.", nil),
 			wantSummary: "Concurrent modification detected (optimistic_lock)",
 			contains:    []string{"refresh-only"},
 		},
@@ -568,6 +666,208 @@ func TestApiErrorDiag(t *testing.T) {
 		})
 	}
 
+}
+
+// TestStampBlobs_OneProbeFailure verifies the fail-soft contract: when one
+// HEAD probe returns a server error, stampBlobs appends a warning (not an
+// error), leaves that file's BlobID null, and still stamps BlobID correctly
+// for the file whose probe succeeded.
+//
+// LastCommitID diverges between the two paths:
+//   - good-path: comes from the probe's X-Gitlab-Last-Commit-Id ("server-commit-good")
+//   - bad-path:  falls back to commitSHA ("deadbeef") because the probe failed
+//
+// This uniquely covers the fail-soft path of the new behaviour.
+func TestStampBlobs_OneProbeFailure(t *testing.T) {
+	const (
+		goodBlob           = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"
+		goodServerCommitID = "server-commit-good"
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
+			return
+		}
+		// Route by path segment: "bad-path" → 500, "good-path" → 200 with blob header.
+		if strings.Contains(r.URL.Path, "bad-path") {
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		if strings.Contains(r.URL.Path, "good-path") {
+			w.Header().Set("X-Gitlab-Blob-Id", goodBlob)
+			w.Header().Set("X-Gitlab-Last-Commit-Id", goodServerCommitID)
+			w.Header().Set("X-Gitlab-Commit-Id", goodServerCommitID)
+			w.Header().Set("X-Gitlab-File-Path", "good-path")
+			w.Header().Set("X-Gitlab-Ref", "main")
+			w.Header().Set("X-Gitlab-Size", "5")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	res := &filesResource{client: client}
+
+	files := map[string]fileModel{
+		"bad-path":  {Content: types.StringValue("bad"), BlobID: types.StringNull()},
+		"good-path": {Content: types.StringValue("good"), BlobID: types.StringNull()},
+	}
+
+	diags := res.stampBlobs(context.Background(), "proj", "main", files, "deadbeef")
+
+	if diags.HasError() {
+		t.Fatalf("expected no errors, got: %v", diags.Errors())
+	}
+	if n := diags.WarningsCount(); n != 1 {
+		t.Fatalf("expected 1 warning, got %d", n)
+	}
+	w := diags.Warnings()[0]
+	if !strings.Contains(w.Summary(), "Could not refresh blob_id after commit") {
+		t.Errorf("warning summary = %q, want it to contain %q", w.Summary(), "Could not refresh blob_id after commit")
+	}
+	if !strings.Contains(w.Detail(), "bad-path") {
+		t.Errorf("warning detail = %q, want it to mention %q", w.Detail(), "bad-path")
+	}
+
+	bad := files["bad-path"]
+	if !bad.BlobID.IsNull() {
+		t.Errorf("bad-path BlobID should be null after probe failure, got %q", bad.BlobID.ValueString())
+	}
+	// Probe failed → falls back to commitSHA.
+	if bad.LastCommitID.ValueString() != "deadbeef" {
+		t.Errorf("bad-path LastCommitID = %q, want %q (commitSHA fallback)", bad.LastCommitID.ValueString(), "deadbeef")
+	}
+
+	good := files["good-path"]
+	if good.BlobID.ValueString() != goodBlob {
+		t.Errorf("good-path BlobID = %q, want %q", good.BlobID.ValueString(), goodBlob)
+	}
+	// Probe succeeded → LastCommitID comes from the server, not commitSHA.
+	if good.LastCommitID.ValueString() != goodServerCommitID {
+		t.Errorf("good-path LastCommitID = %q, want %q (server value)", good.LastCommitID.ValueString(), goodServerCommitID)
+	}
+}
+
+// TestStampBlobs_OversizedBlobIDRejected verifies the defensive length cap: when
+// the server returns a blob_id longer than 256 bytes (anything above SHA-512 hex
+// is unexpected and could indicate a hostile/MITM'd response), stampBlobs treats
+// the probe as failed: BlobID is null, LastCommitID falls back to commitSHA, and
+// a warning (not an error) is emitted.
+func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
+	oversized := strings.Repeat("a", 300)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("X-Gitlab-Blob-Id", oversized)
+		w.Header().Set("X-Gitlab-Last-Commit-Id", "should-not-appear")
+		w.Header().Set("X-Gitlab-Commit-Id", "should-not-appear")
+		w.Header().Set("X-Gitlab-File-Path", "file.txt")
+		w.Header().Set("X-Gitlab-Ref", "main")
+		w.Header().Set("X-Gitlab-Size", "5")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	res := &filesResource{client: client}
+
+	files := map[string]fileModel{
+		"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
+	}
+
+	diags := res.stampBlobs(context.Background(), "proj", "main", files, "deadbeef")
+
+	if diags.HasError() {
+		t.Fatalf("expected no errors, got: %v", diags.Errors())
+	}
+	if n := diags.WarningsCount(); n != 1 {
+		t.Fatalf("expected 1 warning, got %d", n)
+	}
+	w := diags.Warnings()[0]
+	if !strings.Contains(w.Detail(), "file.txt") {
+		t.Errorf("warning detail %q should mention the path %q", w.Detail(), "file.txt")
+	}
+	if !strings.Contains(w.Detail(), "300") {
+		t.Errorf("warning detail %q should mention the length %d", w.Detail(), 300)
+	}
+
+	f := files["file.txt"]
+	if !f.BlobID.IsNull() {
+		t.Errorf("BlobID should be null for oversized blob_id, got %q", f.BlobID.ValueString())
+	}
+	// Probe treated as failure → commitSHA fallback for LastCommitID.
+	if f.LastCommitID.ValueString() != "deadbeef" {
+		t.Errorf("LastCommitID = %q, want %q (commitSHA fallback)", f.LastCommitID.ValueString(), "deadbeef")
+	}
+}
+
+// TestStampBlobs_RaceDetectedViaServerLastCommitID is the directly-falsifying
+// test for the security fix: if another writer commits between our CreateCommit
+// and the HEAD probe, the server returns their LastCommitID. stampBlobs must
+// preserve that server value in state (not overwrite it with our commitSHA) so
+// optimistic_lock catches the race on the next apply.
+func TestStampBlobs_RaceDetectedViaServerLastCommitID(t *testing.T) {
+	const (
+		ourCommitSHA       = "ours"
+		racerLastCommitID  = "raced-by-someone-else"
+		racerBlobID        = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
+			return
+		}
+		// Simulate the racer's commit being visible at HEAD: different blob
+		// and last_commit_id from what we just committed.
+		w.Header().Set("X-Gitlab-Blob-Id", racerBlobID)
+		w.Header().Set("X-Gitlab-Last-Commit-Id", racerLastCommitID)
+		w.Header().Set("X-Gitlab-Commit-Id", racerLastCommitID)
+		w.Header().Set("X-Gitlab-File-Path", "file.txt")
+		w.Header().Set("X-Gitlab-Ref", "main")
+		w.Header().Set("X-Gitlab-Size", "5")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	res := &filesResource{client: client}
+
+	files := map[string]fileModel{
+		"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
+	}
+
+	diags := res.stampBlobs(context.Background(), "proj", "main", files, ourCommitSHA)
+	if diags.HasError() {
+		t.Fatalf("unexpected error: %v", diags.Errors())
+	}
+
+	f := files["file.txt"]
+	// The racer's LastCommitID must be preserved, not our commitSHA.
+	if f.LastCommitID.ValueString() != racerLastCommitID {
+		t.Errorf("LastCommitID = %q, want %q (racer's server value)", f.LastCommitID.ValueString(), racerLastCommitID)
+	}
+	if f.BlobID.ValueString() != racerBlobID {
+		t.Errorf("BlobID = %q, want %q (racer's blob)", f.BlobID.ValueString(), racerBlobID)
+	}
 }
 
 // helpers
