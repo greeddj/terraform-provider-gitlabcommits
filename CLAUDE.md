@@ -96,3 +96,62 @@ The `files` map has a `mapNonEmpty()` validator on purpose — an empty map at u
 - **Generated docs are committed.** Any schema change must be followed by `just docs`; CI fails on drift.
 - **Acceptance test paths are namespaced** under `tf-acc-test/` (see `accTestPathPrefix`) so they're easy to spot and clean up after a stuck run.
 - **Conventional commit titles** drive the goreleaser changelog (`feat:`, `fix:`, `docs:`, `chore:`, `test:`).
+
+## Agents, skills, and commands (`.claude/`)
+
+This repo ships a multi-agent workflow under [.claude/](.claude/). When you (Claude Code) are asked to do non-trivial work in this provider, **start with the architect** — do not jump straight to editing files.
+
+### Roles
+
+| Agent | Model | Owns | Never does |
+| --- | --- | --- | --- |
+| **architect** | opus | analysis, decisions, delegation, final review | writes code |
+| **developer** | sonnet | code, why-comments, unit tests, self-verification | designs / decides scope |
+| **tester** | sonnet | running tests, coverage gap analysis, classifying uncovered branches as needs-test / won't-test / dead-code | implements features |
+| **security** | opus | CVE / attack-surface / interaction review across the change set and its neighbors | writes code, runs unrelated tests |
+| **techwriter** | sonnet | comment audit (why-only rule), `just docs` regen, README/CLAUDE.md/MIGRATION.md updates | invents undocumented features |
+
+### Standard loop (architect-led)
+
+```text
+main → architect (analyze, accept|reject)
+       → developer (implement + self-verify)
+       → tester (run + coverage gap report)
+       → security (CVE + attack surface + interaction risks)
+       → techwriter (comments + just docs + human docs)
+       → architect (final summary)
+       → main
+```
+
+The architect re-enters as many times as needed. "Looks fine" is never enough — only "the version a strict senior would ship" passes. The architect **must reject** plans that break invariants (one-commit-per-apply, HEAD-style drift probes, serial state mutation, `RequiresReplace` on `project_id`/`branch`, etc.) instead of writing the code anyway.
+
+Two delegation modes are supported:
+
+- **A**: architect calls subagents directly via the `Task` tool.
+- **B**: architect emits dispatch instructions; main thread relays them to each subagent and feeds results back. Brain stays with the architect.
+
+See [.claude/skills/multi-agent-workflow/SKILL.md](.claude/skills/multi-agent-workflow/SKILL.md) for the full loop, when to invoke each role, and the stop conditions.
+
+### Slash commands
+
+Justfile wrappers (each delegates to the matching `just` target):
+
+- `/build`, `/test [pattern]`, `/lint`, `/check`, `/fix`, `/ci`
+- `/docs`, `/docs-check`, `/tf-fmt [check]`, `/headers`, `/deps`
+- `/acc-test [pattern]` — gated by `TF_ACC=1 GITLAB_TOKEN=... GITLAB_TEST_PROJECT_ID=...`
+
+Workflow entry points:
+
+- `/architect <task>` — hand off to the architect agent for analysis and orchestration.
+- `/workflow <task>` — same, with explicit "run the full loop, no shortcuts" intent.
+
+### Skills
+
+Each loaded on demand when the relevant task starts:
+
+- `gitlab-provider-conventions` — load before any change in `internal/provider/` (the load-bearing invariants).
+- `terraform-framework-patterns` — load when touching Resource/DataSource/Provider plumbing.
+- `go-performance` — load when writing or reviewing hot-path code (CRUD, goroutine fan-out, allocations).
+- `acceptance-tests` — load before running or designing `TestAcc*`.
+- `gitlab-api-docs` — load before verifying any GitLab REST API contract. Every `docs.gitlab.com/<path>/` page has an LLM-friendly twin at `<path>/index.md` (clean markdown, no HTML chrome); use that via WebFetch.
+- `multi-agent-workflow` — load before kicking off any cross-role task.

@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.gitlab.com)",
+      "WebFetch(domain:gitlab.com)",
+      "WebFetch(domain:registry.terraform.io)",
+      "WebFetch(domain:developer.hashicorp.com)",
+      "WebFetch(domain:pkg.go.dev)",
+      "WebFetch(domain:nvd.nist.gov)",
+      "Bash(go:*)",
+      "Bash(just:*)",
+      "Bash(cat:*)",
+      "Bash(grep:*)",
+      "Bash(sed:*)",
+      "Bash(awk:*)",
+      "Bash(column:*)",
+      "Bash(timeout:*)",
+      "Bash(terraform fmt *)",
+      "Bash(terraform validate *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git branch*)",
+      "Bash(git commit*)",
+      "Bash(gh pr view*)",
+      "Bash(gh pr diff*)",
+      "Bash(gh pr list*)",
+      "Bash(gh pr checks*)",
+      "Bash(gh issue view*)",
+      "Bash(gh issue list*)"
+    ],
+    "ask": [
+      "Bash(rm:*)"
+    ],
+    "deny": [
+      "Bash(git push *)"
+    ]
+  }
+}

@@ -46,4 +46,5 @@ schema.json
 .terraform/
 .terraform.lock.hcl
 
-.claude/
+.claude/settings.local.json
+.claude/plan.md
