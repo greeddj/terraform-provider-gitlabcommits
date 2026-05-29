@@ -464,8 +464,12 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 			return
 		}
 		if len(res.file.BlobID) > maxBlobIDLen {
-			// Treat an absurdly long blob_id as hostile: leave it unset (the next
-			// Read re-probes) rather than persisting it into state.
+			// Treat an absurdly long blob_id as hostile: leave it unset rather
+			// than persisting it. A server that keeps returning an oversized
+			// blob_id makes every Read re-fetch content (the null we store never
+			// equals the oversized HEAD blob, so drift never settles), but Read
+			// never commits or persists a wrong value, so the only cost is
+			// repeated GETs against a misbehaving server.
 			resp.Diagnostics.AddWarning("Ignoring oversized blob_id",
 				fmt.Sprintf("file %q: server returned blob_id of unexpected length %d (max %d); leaving blob_id unset", p, len(res.file.BlobID), maxBlobIDLen))
 			f.BlobID = types.StringNull()
