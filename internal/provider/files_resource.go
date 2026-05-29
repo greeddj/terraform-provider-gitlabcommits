@@ -409,6 +409,11 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 			if err != nil {
 				return &pathError{path: p, err: err}
 			}
+			// A nil *File (2xx JSON-null body) for a blob we already know drifted
+			// must not fall through and be treated as "unchanged" below.
+			if file == nil {
+				return &pathError{path: p, err: errors.New("GitLab returned an empty file object")}
+			}
 			results[i].file = file
 			return nil
 		})
@@ -434,9 +439,11 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 		}
 		f := state.Files[p]
 		if res.file == nil {
-			// Blob unchanged — refresh last_commit_id only when it has moved
-			// (a delete-then-re-add with identical content would otherwise
-			// stale the optimistic-lock token in state).
+			// Took the metadata-only branch (blob unchanged) — refresh
+			// last_commit_id only when it has moved (a delete-then-re-add with
+			// identical content would otherwise stale the optimistic-lock token
+			// in state). A nil *File from a drifted blob is surfaced as an error
+			// in the probe above, so it never reaches here.
 			if res.metaLastCommitID != "" && res.metaLastCommitID != f.LastCommitID.ValueString() {
 				f.LastCommitID = types.StringValue(res.metaLastCommitID)
 				state.Files[p] = f
@@ -449,7 +456,15 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 				fmt.Sprintf("file %q: %s", p, err))
 			return
 		}
-		f.BlobID = types.StringValue(res.file.BlobID)
+		if len(res.file.BlobID) > maxBlobIDLen {
+			// Treat an absurdly long blob_id as hostile: leave it unset (the next
+			// Read re-probes) rather than persisting it into state.
+			resp.Diagnostics.AddWarning("Ignoring oversized blob_id",
+				fmt.Sprintf("file %q: server returned blob_id of unexpected length %d (max %d); leaving blob_id unset", p, len(res.file.BlobID), maxBlobIDLen))
+			f.BlobID = types.StringNull()
+		} else {
+			f.BlobID = types.StringValue(res.file.BlobID)
+		}
 		f.ExecuteFilemode = types.BoolValue(res.file.ExecuteFilemode)
 		if res.file.LastCommitID != "" {
 			f.LastCommitID = types.StringValue(res.file.LastCommitID)
@@ -917,8 +932,8 @@ func (r *filesResource) stampBlobs(
 				results[i].err = err
 				return nil //nolint:nilerr // intentional: store per-file error, don't cancel other probes
 			}
-			if len(meta.BlobID) > 256 {
-				results[i].err = fmt.Errorf("path %q: server returned blob_id of unexpected length %d (max 256)", p, len(meta.BlobID))
+			if len(meta.BlobID) > maxBlobIDLen {
+				results[i].err = fmt.Errorf("path %q: server returned blob_id of unexpected length %d (max %d)", p, len(meta.BlobID), maxBlobIDLen)
 				return nil //nolint:nilerr // intentional: treat oversized blob_id as probe failure
 			}
 			results[i].blobID = meta.BlobID
@@ -979,6 +994,12 @@ func buildAction(filePath string, f fileModel, op gitlab.FileActionValue, lastCo
 	}
 	return a, nil
 }
+
+// maxBlobIDLen bounds a server-returned blob_id we will store in state. GitLab's
+// blob_id is a git SHA (40 hex today, 64 on SHA-256 repos); anything past this
+// generous ceiling (well above SHA-512 hex) is unexpected and treated as hostile
+// so a malicious response cannot bloat Terraform state.
+const maxBlobIDLen = 256
 
 // maxDiagBodyChars caps the size of any GitLab response body we splice into
 // a Terraform diagnostic. Without this a pathological GitLab error (or a
