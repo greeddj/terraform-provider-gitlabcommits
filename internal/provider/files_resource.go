@@ -314,6 +314,14 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 		resp.Diagnostics.AddError(summary, detail)
 		return
 	}
+	// A 2xx response with a JSON-null body decodes to a nil *Commit with no
+	// error; guard before dereferencing so a hostile/buggy GitLab cannot panic
+	// the provider process after a commit may already have landed.
+	if commit == nil {
+		resp.Diagnostics.AddError("GitLab returned no commit",
+			"CreateCommit succeeded but the response contained no commit object; repository state is unknown. Run `terraform plan` to reconcile.")
+		return
+	}
 
 	resp.Diagnostics.Append(r.stampBlobs(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), plan.Files, commit.ID)...)
 	if resp.Diagnostics.HasError() {
@@ -511,6 +519,12 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	if err != nil {
 		summary, detail := apiErrorDiag("pushing update commit", plan.ProjectID.ValueString(), plan.Branch.ValueString(), err)
 		resp.Diagnostics.AddError(summary, detail)
+		return
+	}
+	// See Create: a JSON-null body decodes to a nil *Commit with no error.
+	if commit == nil {
+		resp.Diagnostics.AddError("GitLab returned no commit",
+			"CreateCommit succeeded but the response contained no commit object; repository state is unknown. Run `terraform plan` to reconcile.")
 		return
 	}
 
@@ -1035,6 +1049,11 @@ func commitOptions(m filesResourceModel, actions []*gitlab.CommitActionOptions) 
 // passing through whatever string came on the wire — a text file whose
 // content is accidentally valid base64 should not be mis-decoded.
 func decodeRemoteContent(f *gitlab.File) ([]byte, error) {
+	// GetFile returns a nil *File (with no error) when the server sends a 2xx
+	// JSON-null body; reject it rather than dereferencing f.Encoding.
+	if f == nil {
+		return nil, errors.New("GitLab returned an empty file object")
+	}
 	switch f.Encoding {
 	case "", "base64":
 		return base64.StdEncoding.DecodeString(f.Content)

@@ -91,6 +91,15 @@ func (d *branchHeadDataSource) Read(ctx context.Context, req datasource.ReadRequ
 		return
 	}
 
+	// GetBranch can return a branch whose Commit pointer is nil (omitted or
+	// null in the response body); guard before dereferencing so a hostile/buggy
+	// GitLab cannot panic the provider during a read-only data-source eval.
+	if b == nil || b.Commit == nil {
+		resp.Diagnostics.AddError("GitLab returned a branch with no commit",
+			fmt.Sprintf("branch %q in project %q has no head commit in the API response", branch, project))
+		return
+	}
+
 	data.CommitSHA = types.StringValue(b.Commit.ID)
 	data.Protected = types.BoolValue(b.Protected)
 

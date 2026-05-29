@@ -5,7 +5,9 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -182,6 +184,12 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 		return
 	}
 
+	// The token travels as a Private-Token header, which net/http does NOT strip
+	// when following a cross-host redirect (unlike Authorization/Cookie). Refuse
+	// off-host redirects so a malicious or misconfigured GitLab cannot bounce the
+	// token to another host.
+	client.HTTPClient().CheckRedirect = crossHostRedirectGuard
+
 	tflog.Info(ctx, "GitLab Commits provider configured", map[string]any{
 		"base_url":    baseURL,
 		"max_retries": maxRetries,
@@ -202,4 +210,24 @@ func (p *gitlabCommitsProvider) Resources(_ context.Context) []func() resource.R
 	return []func() resource.Resource{
 		NewFilesResource,
 	}
+}
+
+// crossHostRedirectGuard is the http.Client CheckRedirect policy for the GitLab
+// client. net/http strips Authorization/Cookie on a cross-host redirect but
+// leaves custom headers like Private-Token intact, so a 3xx pointing off-host
+// would otherwise forward the API token to an attacker-controlled host. Same-host
+// redirects (including http->https upgrades) are allowed; the chain is capped at
+// 10 to match net/http's default behaviour, which a non-nil CheckRedirect drops.
+func crossHostRedirectGuard(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if req.URL.Host != via[0].URL.Host {
+		return fmt.Errorf("refusing cross-host redirect to %q: the GitLab token must not be sent to a host other than %q",
+			req.URL.Host, via[0].URL.Host)
+	}
+	return nil
 }
