@@ -112,8 +112,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 				Validators: []validator.String{
 					stringNotEmpty(),
-					// git's branch naming rules approximated: no spaces, no double dots,
-					// no leading/trailing slash, no funny chars.
+					// Permissive character allowlist only: letters, digits, dot,
+					// underscore, dash, slash. Does NOT reject "..", a leading or
+					// trailing slash, or other git-invalid shapes; GitLab validates
+					// those server-side. This only blocks whitespace and exotic chars.
 					stringMatchesRegex(
 						`^[A-Za-z0-9_./-]+$`,
 						"branch name can only contain letters, digits, dot, underscore, dash, and slash",
@@ -121,8 +123,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 			},
 			"commit_message": schema.StringAttribute{
-				Description: "Message used for any commit (create / update / destroy) the resource produces.",
-				Required:    true,
+				Description: "Message used for any commit (create / update / destroy) the resource produces. " +
+					"Only takes effect on an apply that actually changes file content, mode, or set; editing just " +
+					"commit_message or the author fields produces no commit, so the new value applies to the next change.",
+				Required: true,
 				Validators: []validator.String{
 					stringNotEmpty(),
 				},
@@ -167,7 +171,7 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Optional: true,
 			},
 			"optimistic_lock": schema.BoolAttribute{
-				Description: "If true (default), update / delete actions send the file's last_commit_id to GitLab. " +
+				Description: "If true (default), update / delete / chmod actions send the file's last_commit_id to GitLab. " +
 					"GitLab rejects the action with HTTP 400 if the file has been modified by anyone else since " +
 					"this resource last touched it, preventing silent overwrites in concurrent pipelines. " +
 					"Set to false to opt out (useful when an external process intentionally co-edits the same files).",
@@ -184,9 +188,9 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Required:    true,
 				Validators: []validator.Map{
 					mapNonEmpty(),
-					// Repository paths: no leading slash, no `..` segments, no NUL bytes,
-					// no whitespace runs. Tolerant on characters otherwise — git accepts
-					// quite a lot.
+					// Repository paths: no leading slash, no `..` or `.` segments, no NUL
+					// bytes, no leading whitespace per segment. Interior spaces and other
+					// characters are tolerated - git accepts quite a lot.
 					mapKeysMatchRegex(
 						`^(?:[^/\s\x00.][^/\x00]*|\.[^./\x00][^/\x00]*)(?:/(?:[^/\s\x00.][^/\x00]*|\.[^./\x00][^/\x00]*))*$`,
 						"file paths must be relative (no leading slash), must not contain `..` or NUL bytes",
@@ -198,15 +202,18 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					},
 					Attributes: map[string]schema.Attribute{
 						"content": schema.StringAttribute{
-							Description: "Text content. Mutually exclusive with content_base64.",
-							Optional:    true,
+							Description: "Text content. Mutually exclusive with content_base64. Not intended for secret " +
+								"values: it is stored in plaintext in state and printed in plan / apply output (and thus CI logs). " +
+								"Deliver secrets via SealedSecrets / ExternalSecrets / Vault and reference them from the managed file.",
+							Optional: true,
 							Validators: []validator.String{
 								stringConflictsWithSibling("content_base64"),
 							},
 						},
 						"content_base64": schema.StringAttribute{
-							Description: "Base64-encoded content (use for binaries). Mutually exclusive with content.",
-							Optional:    true,
+							Description: "Base64-encoded content (use for binaries). Mutually exclusive with content. " +
+								"Not intended for secret values (see content).",
+							Optional: true,
 							Validators: []validator.String{
 								stringConflictsWithSibling("content"),
 							},

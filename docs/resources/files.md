@@ -60,7 +60,7 @@ resource "gitlabcommits_files" "service" {
 ### Required
 
 - `branch` (String) Target branch. Must already exist, or set create_branch_from to materialise it.
-- `commit_message` (String) Message used for any commit (create / update / destroy) the resource produces.
+- `commit_message` (String) Message used for any commit (create / update / destroy) the resource produces. Only takes effect on an apply that actually changes file content, mode, or set; editing just commit_message or the author fields produces no commit, so the new value applies to the next change.
 - `files` (Attributes Map) Map of repository_path → file definition. The map key is the path inside the repo. (see [below for nested schema](#nestedatt--files))
 - `project_id` (String) Project ID or URL-encoded path (e.g. "group/project" or "12345").
 
@@ -72,7 +72,7 @@ resource "gitlabcommits_files" "service" {
 - `create_branch_from` (String) If set and `branch` does not yet exist, the provider creates it from this source ref (typically "main") on first apply. Only consulted by Create; once the branch exists, changing or removing this value is a state-only no-op (no destroy / recreate).
 - `delete_on_destroy` (Boolean) If true (default), terraform destroy creates one commit that removes every managed file. Set to false to keep files in place when the resource is removed from state.
 - `detect_drift` (Boolean) If true (default), Read fetches each managed file from GitLab and updates state when the remote blob differs, so terraform plan reflects the real repository state.
-- `optimistic_lock` (Boolean) If true (default), update / delete actions send the file's last_commit_id to GitLab. GitLab rejects the action with HTTP 400 if the file has been modified by anyone else since this resource last touched it, preventing silent overwrites in concurrent pipelines. Set to false to opt out (useful when an external process intentionally co-edits the same files).
+- `optimistic_lock` (Boolean) If true (default), update / delete / chmod actions send the file's last_commit_id to GitLab. GitLab rejects the action with HTTP 400 if the file has been modified by anyone else since this resource last touched it, preventing silent overwrites in concurrent pipelines. Set to false to opt out (useful when an external process intentionally co-edits the same files).
 
 ### Read-Only
 
@@ -84,8 +84,8 @@ resource "gitlabcommits_files" "service" {
 
 Optional:
 
-- `content` (String) Text content. Mutually exclusive with content_base64.
-- `content_base64` (String) Base64-encoded content (use for binaries). Mutually exclusive with content.
+- `content` (String) Text content. Mutually exclusive with content_base64. Not intended for secret values: it is stored in plaintext in state and printed in plan / apply output (and thus CI logs). Deliver secrets via SealedSecrets / ExternalSecrets / Vault and reference them from the managed file.
+- `content_base64` (String) Base64-encoded content (use for binaries). Mutually exclusive with content. Not intended for secret values (see content).
 - `execute_filemode` (Boolean) Whether the file should have the executable bit set.
 
 Read-Only:

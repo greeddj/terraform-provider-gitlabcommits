@@ -71,7 +71,7 @@ func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, r
 				Computed:    true,
 			},
 			"blob_id": schema.StringAttribute{
-				Description: "Git blob SHA-1 of the file content.",
+				Description: "Opaque blob identifier returned by GitLab (git SHA-1 today, possibly SHA-256 on SHA-256 repositories).",
 				Computed:    true,
 			},
 			"execute_filemode": schema.BoolAttribute{

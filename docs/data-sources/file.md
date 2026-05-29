@@ -23,7 +23,7 @@ Reads a single file from a GitLab repository at the given branch ref. Useful for
 
 ### Read-Only
 
-- `blob_id` (String) Git blob SHA-1 of the file content.
+- `blob_id` (String) Opaque blob identifier returned by GitLab (git SHA-1 today, possibly SHA-256 on SHA-256 repositories).
 - `content` (String) Decoded text content of the file. Always set; for binaries use content_base64.
 - `content_base64` (String) Base64-encoded raw bytes of the file. Always set.
 - `execute_filemode` (Boolean) Whether the file has the executable bit set in the repo.
