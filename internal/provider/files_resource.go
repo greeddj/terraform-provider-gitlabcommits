@@ -193,6 +193,9 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					),
 				},
 				NestedObject: schema.NestedAttributeObject{
+					Validators: []validator.Object{
+						objectFileContentRequired(),
+					},
 					Attributes: map[string]schema.Attribute{
 						"content": schema.StringAttribute{
 							Description: "Text content. Mutually exclusive with content_base64.",

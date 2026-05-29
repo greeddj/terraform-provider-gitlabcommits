@@ -160,3 +160,41 @@ func (v mapKeysRegexValidator) ValidateMap(_ context.Context, req validator.MapR
 		}
 	}
 }
+
+// objectFileContentRequired enforces the "at least one" half of the
+// content/content_base64 contract at plan time: a file object that sets neither
+// is rejected during validate/plan instead of failing at apply with a runtime
+// "either content or content_base64 must be set". Combined with the per-attribute
+// stringConflictsWithSibling validators (the "not both" half), this gives the two
+// fields exactly-one-of semantics before any commit is attempted.
+func objectFileContentRequired() validator.Object {
+	return objectFileContentRequiredValidator{}
+}
+
+type objectFileContentRequiredValidator struct{}
+
+func (v objectFileContentRequiredValidator) Description(_ context.Context) string {
+	return "either content or content_base64 must be set"
+}
+func (v objectFileContentRequiredValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+func (v objectFileContentRequiredValidator) ValidateObject(_ context.Context, req validator.ObjectRequest, resp *validator.ObjectResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	attrs := req.ConfigValue.Attributes()
+	content, _ := attrs["content"].(types.String)
+	contentB64, _ := attrs["content_base64"].(types.String)
+
+	// An unknown value (e.g. content fed by another resource) cannot be decided
+	// yet; defer to the post-known re-validation rather than false-positive.
+	if content.IsUnknown() || contentB64.IsUnknown() {
+		return
+	}
+	if content.IsNull() && contentB64.IsNull() {
+		resp.Diagnostics.AddAttributeError(req.Path,
+			"Missing file content",
+			"Each file must set either content or content_base64.")
+	}
+}

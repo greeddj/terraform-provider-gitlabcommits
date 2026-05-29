@@ -17,6 +17,47 @@ import (
 // reaches into req.Config which requires a fully constructed tfsdk.Config
 // only available through resource.Test machinery. Acceptance tests cover it.
 
+// TestObjectFileContentRequired pins TF-1: a file object with neither content
+// nor content_base64 is rejected at validate time; setting either one passes;
+// an unknown value defers rather than false-positives.
+func TestObjectFileContentRequired(t *testing.T) {
+	attrTypes := map[string]attr.Type{
+		"content":        types.StringType,
+		"content_base64": types.StringType,
+	}
+	mk := func(content, b64 types.String) types.Object {
+		o, d := types.ObjectValue(attrTypes, map[string]attr.Value{
+			"content":        content,
+			"content_base64": b64,
+		})
+		if d.HasError() {
+			t.Fatalf("ObjectValue: %v", d)
+		}
+		return o
+	}
+
+	cases := []struct {
+		name    string
+		obj     types.Object
+		wantErr bool
+	}{
+		{"both null", mk(types.StringNull(), types.StringNull()), true},
+		{"content set", mk(types.StringValue("x"), types.StringNull()), false},
+		{"base64 set", mk(types.StringNull(), types.StringValue("eA==")), false},
+		{"content unknown defers", mk(types.StringUnknown(), types.StringNull()), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp := &validator.ObjectResponse{}
+			objectFileContentRequired().ValidateObject(context.Background(),
+				validator.ObjectRequest{Path: path.Root("files").AtMapKey("x"), ConfigValue: c.obj}, resp)
+			if c.wantErr != resp.Diagnostics.HasError() {
+				t.Fatalf("wantErr=%v, got diags=%v", c.wantErr, resp.Diagnostics)
+			}
+		})
+	}
+}
+
 func TestStringNotEmpty(t *testing.T) {
 	cases := []struct {
 		name    string
