@@ -132,6 +132,9 @@ func TestRead_DriftUpdatesContent(t *testing.T) {
 	if f.BlobID.ValueString() != "newblob" {
 		t.Errorf("blob_id = %q, want %q", f.BlobID.ValueString(), "newblob")
 	}
+	if f.LastCommitID.ValueString() != "newlcid" {
+		t.Errorf("last_commit_id = %q, want %q (restamped on drift)", f.LastCommitID.ValueString(), "newlcid")
+	}
 }
 
 // TestRead_NullFileBodyOnDriftErrors pins ADD-4: a 2xx JSON-null GetFile body for

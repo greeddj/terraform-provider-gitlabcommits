@@ -6,6 +6,7 @@ package provider
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -52,6 +53,76 @@ func runUpdate(t *testing.T, client *gitlab.Client, plan, state filesResourceMod
 	resp := &resource.UpdateResponse{State: tfsdk.State{Schema: sch}}
 	res.Update(ctx, resource.UpdateRequest{Plan: pl, State: st}, resp)
 	return resp
+}
+
+func runCreate(t *testing.T, client *gitlab.Client, plan filesResourceModel) *resource.CreateResponse {
+	t.Helper()
+	ctx := context.Background()
+	res := &filesResource{client: client}
+
+	sresp := &resource.SchemaResponse{}
+	res.Schema(ctx, resource.SchemaRequest{}, sresp)
+	sch := sresp.Schema
+
+	pl := tfsdk.Plan{Schema: sch}
+	if d := pl.Set(ctx, &plan); d.HasError() {
+		t.Fatalf("plan.Set: %v", d)
+	}
+	resp := &resource.CreateResponse{State: tfsdk.State{Schema: sch}}
+	res.Create(ctx, resource.CreateRequest{Plan: pl}, resp)
+	return resp
+}
+
+// TestCreate_NullCommitBodyErrors pins the DOS-1 guard in Create: a 2xx
+// JSON-null commit body must produce an error diagnostic, not a nil-deref panic.
+func TestCreate_NullCommitBodyErrors(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead:
+			http.Error(w, "absent", http.StatusNotFound)
+		case r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte("null"))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	resp := runCreate(t, client, readState("oldblob"))
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an error for a null commit body on Create")
+	}
+}
+
+// TestUpdate_NullCommitBodyErrors pins the DOS-1 guard in Update.
+func TestUpdate_NullCommitBodyErrors(t *testing.T) {
+	postCalled := false
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			postCalled = true
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte("null"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	state := readState("oldblob")
+	plan := readState("oldblob")
+	pf := plan.Files["f.txt"]
+	pf.Content = types.StringValue("changed")
+	plan.Files["f.txt"] = pf
+
+	resp := runUpdate(t, client, plan, state)
+	if !postCalled {
+		t.Fatal("expected Update to attempt a commit when content changed")
+	}
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an error for a null commit body on Update")
+	}
 }
 
 // TestDelete_DeleteOnDestroyFalseSkipsAPI: delete_on_destroy=false is a
