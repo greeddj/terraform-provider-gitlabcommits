@@ -152,7 +152,9 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"adopt_existing": schema.BoolAttribute{
 				Description: "If true (default), files that exist in the repository but are not yet in state are " +
 					"adopted on the next apply: a create-action targeting an existing path is silently rewritten " +
-					"as an update. Required for terraform import to converge cleanly.",
+					"as an update. When optimistic_lock is enabled, that adopt-update carries the file's current " +
+					"commit, so a concurrent external modification is still detected instead of being overwritten. " +
+					"Required for terraform import to converge cleanly.",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
@@ -277,20 +279,28 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 	}
 
 	paths := sortedKeys(plan.Files)
-	var existsMap map[string]bool
+	useLock := plan.optimisticLock()
+	var probes map[string]remoteProbe
 	if plan.adoptExisting() {
-		existsMap = r.probeExists(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), paths)
+		probes = r.probeRemote(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), paths)
 	}
 
 	actions := make([]*gitlab.CommitActionOptions, 0, len(plan.Files))
 	for _, p := range paths {
 		f := plan.Files[p]
 		op := gitlab.FileCreate
-		if existsMap[p] {
+		// On Create there is no prior state. When adopting a file that already
+		// exists remotely, forward its current last_commit_id under
+		// optimistic_lock so the adopt-update fails on a concurrent writer
+		// instead of blindly overwriting it.
+		lastCommitID := ""
+		if probes[p].exists {
 			op = gitlab.FileUpdate
+			if useLock {
+				lastCommitID = probes[p].lastCommitID
+			}
 		}
-		// On Create there is no prior state, so no last_commit_id to send.
-		a, err := buildAction(p, f, op, "")
+		a, err := buildAction(p, f, op, lastCommitID)
 		if err != nil {
 			resp.Diagnostics.AddAttributeError(path.Root("files").AtMapKey(p), "Invalid file", err.Error())
 			return
@@ -564,11 +574,11 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 	useLock := state.optimisticLock()
 
 	paths := sortedKeys(state.Files)
-	existsMap := r.probeExists(ctx, project, branch, paths)
+	probes := r.probeRemote(ctx, project, branch, paths)
 
 	actions := make([]*gitlab.CommitActionOptions, 0, len(state.Files))
 	for _, p := range paths {
-		if !existsMap[p] {
+		if !probes[p].exists {
 			continue
 		}
 		a := &gitlab.CommitActionOptions{
@@ -634,9 +644,9 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 
 	// Probe new-in-plan paths in parallel when adoption is on. The
 	// post-import path (state.Files empty, plan.Files large) hits this with
-	// every managed file marked "new", so a sequential fileExists per path
+	// every managed file marked "new", so a sequential probe per path
 	// would dominate the apply latency.
-	var existsMap map[string]bool
+	var probes map[string]remoteProbe
 	if plan.adoptExisting() {
 		var newPaths []string
 		for _, p := range sortedKeys(plan.Files) {
@@ -645,7 +655,7 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 			}
 		}
 		if len(newPaths) > 0 {
-			existsMap = r.probeExists(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), newPaths)
+			probes = r.probeRemote(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), newPaths)
 		}
 	}
 
@@ -661,11 +671,14 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 		if !exists {
 			op := gitlab.FileCreate
 			lastCommitID := ""
-			if existsMap[p] {
+			if probes[p].exists {
 				op = gitlab.FileUpdate
-				// Adopting an existing file: optimistic-lock would need a
-				// last_commit_id we don't have, so we deliberately skip it
-				// for this action.
+				// Adopting an existing file: forward the probed last_commit_id
+				// under optimistic_lock so the overwrite still fails on a
+				// concurrent writer instead of blindly clobbering it.
+				if useLock {
+					lastCommitID = probes[p].lastCommitID
+				}
 			}
 			var a *gitlab.CommitActionOptions
 			a, err = buildAction(p, pf, op, lastCommitID)
@@ -727,36 +740,50 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 	return actions, nil
 }
 
-// fileExists returns true if the file is present at branch HEAD. Used to
-// rewrite spurious "create" actions into "update" when adopting existing files,
-// and to skip already-deleted paths during destroy.
-func (r *filesResource) fileExists(ctx context.Context, project, branch, filePath string) bool {
-	_, _, err := r.client.RepositoryFiles.GetFileMetaData(project, filePath, &gitlab.GetFileMetaDataOptions{
-		Ref: new(branch),
-	}, gitlab.WithContext(ctx))
-	return err == nil
+// remoteProbe is the result of a HEAD-style metadata probe for one path:
+// whether the file exists at branch HEAD and, if so, its current
+// last_commit_id. The token lets an adopt-update be guarded by optimistic_lock
+// even though there is no prior state for the file.
+type remoteProbe struct {
+	lastCommitID string
+	exists       bool
 }
 
-// probeExists fans out fileExists across paths at refreshParallelism. Errors
-// are swallowed because fileExists itself swallows errors (a transport hiccup
-// is treated as "absent", same as the sequential code).
-func (r *filesResource) probeExists(ctx context.Context, project, branch string, paths []string) map[string]bool {
-	out := make(map[string]bool, len(paths))
+// probeFile reports whether filePath is present at branch HEAD and returns its
+// last_commit_id. Used to rewrite spurious "create" actions into "update" when
+// adopting existing files, to forward a lock token on that adopt-update, and to
+// skip already-deleted paths during destroy. A transport error is treated as
+// "absent" (same as the sequential code it replaced).
+func (r *filesResource) probeFile(ctx context.Context, project, branch, filePath string) remoteProbe {
+	meta, _, err := r.client.RepositoryFiles.GetFileMetaData(project, filePath, &gitlab.GetFileMetaDataOptions{
+		Ref: new(branch),
+	}, gitlab.WithContext(ctx))
+	if err != nil || meta == nil {
+		return remoteProbe{}
+	}
+	return remoteProbe{exists: true, lastCommitID: meta.LastCommitID}
+}
+
+// probeRemote fans probeFile out across paths at refreshParallelism. Errors are
+// swallowed because probeFile itself swallows errors (a transport hiccup is
+// treated as "absent", same as the sequential code).
+func (r *filesResource) probeRemote(ctx context.Context, project, branch string, paths []string) map[string]remoteProbe {
+	out := make(map[string]remoteProbe, len(paths))
 	if len(paths) == 0 {
 		return out
 	}
-	flags := make([]bool, len(paths))
+	probes := make([]remoteProbe, len(paths))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(refreshParallelism)
 	for i, p := range paths {
 		g.Go(func() error {
-			flags[i] = r.fileExists(gctx, project, branch, p)
+			probes[i] = r.probeFile(gctx, project, branch, p)
 			return nil
 		})
 	}
 	_ = g.Wait()
 	for i, p := range paths {
-		out[p] = flags[i]
+		out[p] = probes[i]
 	}
 	return out
 }

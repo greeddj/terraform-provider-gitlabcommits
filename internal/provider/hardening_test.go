@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
@@ -135,4 +136,72 @@ func TestBranchHeadDataSource_NilCommitNoPanic(t *testing.T) {
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("expected an error diagnostic for a branch with nil commit, got none")
 	}
+}
+
+// TestDiffActions_AdoptForwardsLockToken pins CRU-1: when adopt_existing rewrites
+// a new-to-state path that already exists remotely into an update, the probed
+// last_commit_id is forwarded under optimistic_lock so the overwrite is still
+// guarded against a concurrent writer; with optimistic_lock off, no token is sent.
+func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
+	const probedLCID = "abc123probed"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("X-Gitlab-Blob-Id", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+		w.Header().Set("X-Gitlab-Last-Commit-Id", probedLCID)
+		w.Header().Set("X-Gitlab-File-Path", "adopted.txt")
+		w.Header().Set("X-Gitlab-Ref", "main")
+		w.Header().Set("X-Gitlab-Size", "5")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res := &filesResource{client: client}
+
+	emptyState := func() filesResourceModel { return filesResourceModel{Files: map[string]fileModel{}} }
+	plan := func(lock bool) filesResourceModel {
+		return filesResourceModel{
+			ProjectID:      types.StringValue("proj"),
+			Branch:         types.StringValue("main"),
+			OptimisticLock: types.BoolValue(lock),
+			AdoptExisting:  types.BoolValue(true),
+			Files:          map[string]fileModel{"adopted.txt": {Content: types.StringValue("hello")}},
+		}
+	}
+
+	t.Run("lock on forwards probed token", func(t *testing.T) {
+		actions, err := res.diffActions(context.Background(), plan(true), emptyState())
+		if err != nil {
+			t.Fatalf("diffActions: %v", err)
+		}
+		if len(actions) != 1 {
+			t.Fatalf("want 1 action, got %d", len(actions))
+		}
+		a := actions[0]
+		if *a.Action != gitlab.FileUpdate {
+			t.Errorf("action = %s, want update (adopt rewrite)", *a.Action)
+		}
+		if a.LastCommitID == nil || *a.LastCommitID != probedLCID {
+			t.Errorf("LastCommitID = %v, want %q (probed token forwarded)", a.LastCommitID, probedLCID)
+		}
+	})
+
+	t.Run("lock off omits token", func(t *testing.T) {
+		actions, err := res.diffActions(context.Background(), plan(false), emptyState())
+		if err != nil {
+			t.Fatalf("diffActions: %v", err)
+		}
+		if len(actions) != 1 {
+			t.Fatalf("want 1 action, got %d", len(actions))
+		}
+		if actions[0].LastCommitID != nil {
+			t.Errorf("LastCommitID = %q, want nil (lock disabled)", *actions[0].LastCommitID)
+		}
+	})
 }

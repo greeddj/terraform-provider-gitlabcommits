@@ -66,7 +66,7 @@ resource "gitlabcommits_files" "service" {
 
 ### Optional
 
-- `adopt_existing` (Boolean) If true (default), files that exist in the repository but are not yet in state are adopted on the next apply: a create-action targeting an existing path is silently rewritten as an update. Required for terraform import to converge cleanly.
+- `adopt_existing` (Boolean) If true (default), files that exist in the repository but are not yet in state are adopted on the next apply: a create-action targeting an existing path is silently rewritten as an update. When optimistic_lock is enabled, that adopt-update carries the file's current commit, so a concurrent external modification is still detected instead of being overwritten. Required for terraform import to converge cleanly.
 - `author_email` (String) Optional override for commit author email.
 - `author_name` (String) Optional override for commit author name.
 - `create_branch_from` (String) If set and `branch` does not yet exist, the provider creates it from this source ref (typically "main") on first apply. Only consulted by Create; once the branch exists, changing or removing this value is a state-only no-op (no destroy / recreate).
