@@ -9,13 +9,62 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	rschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 )
 
-// stringConflictsWithSibling is intentionally not unit-tested here — it
-// reaches into req.Config which requires a fully constructed tfsdk.Config
-// only available through resource.Test machinery. Acceptance tests cover it.
+// TestStringConflictsWithSibling exercises the content/content_base64 mutual
+// exclusion directly: setting both is a conflict, setting one is fine. A
+// synthetic flat config stands in for the nested file object, so no
+// resource.Test machinery is needed.
+func TestStringConflictsWithSibling(t *testing.T) {
+	ctx := context.Background()
+	sch := rschema.Schema{Attributes: map[string]rschema.Attribute{
+		"content":        rschema.StringAttribute{Optional: true},
+		"content_base64": rschema.StringAttribute{Optional: true},
+	}}
+	ptr := func(s string) *string { return &s }
+	cfg := func(content, b64 *string) tfsdk.Config {
+		toVal := func(s *string) tftypes.Value {
+			if s == nil {
+				return tftypes.NewValue(tftypes.String, nil)
+			}
+			return tftypes.NewValue(tftypes.String, *s)
+		}
+		raw := tftypes.NewValue(sch.Type().TerraformType(ctx), map[string]tftypes.Value{
+			"content":        toVal(content),
+			"content_base64": toVal(b64),
+		})
+		return tfsdk.Config{Schema: sch, Raw: raw}
+	}
+
+	t.Run("both set conflicts", func(t *testing.T) {
+		resp := &validator.StringResponse{}
+		stringConflictsWithSibling("content_base64").ValidateString(ctx, validator.StringRequest{
+			Path:        path.Root("content"),
+			ConfigValue: types.StringValue("x"),
+			Config:      cfg(ptr("x"), ptr("eA==")),
+		}, resp)
+		if !resp.Diagnostics.HasError() {
+			t.Fatal("expected a conflict error when both content and content_base64 are set")
+		}
+	})
+
+	t.Run("only content is fine", func(t *testing.T) {
+		resp := &validator.StringResponse{}
+		stringConflictsWithSibling("content_base64").ValidateString(ctx, validator.StringRequest{
+			Path:        path.Root("content"),
+			ConfigValue: types.StringValue("x"),
+			Config:      cfg(ptr("x"), nil),
+		}, resp)
+		if resp.Diagnostics.HasError() {
+			t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+		}
+	})
+}
 
 // TestObjectFileContentRequired pins TF-1: a file object with neither content
 // nor content_base64 is rejected at validate time; setting either one passes;
