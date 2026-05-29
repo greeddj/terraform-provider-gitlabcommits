@@ -1072,6 +1072,17 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 					"Run `terraform apply -refresh-only` to pull current state, then re-plan. Body: %s", prefix, body)
 			}
 			return summary, fmt.Sprintf("%s: HTTP %d. Body: %s", prefix, status, body)
+		case 413:
+			// GitLab rejects a commit request whose body exceeds a cap (default
+			// 300 MB / 314572800 bytes) with 413. one-commit-per-apply batches
+			// every file into one request, so we are more prone to this than a
+			// per-file client; point the user at splitting the resource, not the
+			// commit.
+			summary = "GitLab commit too large (HTTP 413)"
+			return summary, fmt.Sprintf("%s: the commit request exceeded GitLab's body size cap (default 300 MB). "+
+				"This provider batches every file change into one commit per apply, so split the files across multiple "+
+				"`gitlabcommits_files` resources (for example with for_each), or on self-managed GitLab raise the "+
+				"GITLAB_COMMITS_MAX_REQUEST_SIZE_BYTES limit. Body: %s", prefix, body)
 		case 429:
 			summary = "GitLab rate limit exceeded (HTTP 429)"
 			retryAfter := resp.Response.Header.Get("Retry-After")

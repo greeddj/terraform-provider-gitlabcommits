@@ -634,6 +634,13 @@ func TestApiErrorDiag(t *testing.T) {
 			contains:    []string{"retry after unknown seconds"},
 		},
 		{
+			name: "413-too-large",
+			err: mkErr(413,
+				"RequestBody: upload failed: the upload size is over maximum of 314572800 bytes", nil),
+			wantSummary: "GitLab commit too large (HTTP 413)",
+			contains:    []string{"300 MB", "for_each"},
+		},
+		{
 			name: "500-default", err: mkErr(500, "boom", nil),
 			wantSummary: "GitLab API error: act",
 			contains:    []string{"HTTP 500", "boom"},
