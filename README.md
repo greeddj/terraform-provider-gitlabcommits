@@ -48,8 +48,9 @@ files map starts empty and is reconciled on the next plan + apply.
 terraform {
   required_providers {
     gitlabcommits = {
-      source  = "greeddj/gitlabcommits"
-      version = "~> 0.2"
+      source = "greeddj/gitlabcommits"
+      # Pin a version once you depend on released behaviour, e.g.:
+      # version = "~> 1.0"
     }
   }
 }
@@ -184,13 +185,34 @@ apply converges without manual surgery.
   for create / update / destroy commits. This is by design — one resource,
   one logical change, one message.
 
+## Limits and retries
+
+- **Commit request size.** GitLab caps the commit request body (300 MB by
+  default). Because this provider batches every file change into one request,
+  a very large bundle can hit that cap; the provider surfaces the 413 with
+  advice to split the bundle across multiple resources (`for_each`), or raise
+  `GITLAB_COMMITS_MAX_REQUEST_SIZE_BYTES` on self-managed GitLab.
+- **Rate limits.** 429 and transient 5xx responses are retried with
+  exponential backoff (`max_retries`, `retry_wait_min_ms`,
+  `retry_wait_max_ms` on the provider block). GitLab.com additionally
+  throttles writes above ~20 MB.
+- **Commits are not idempotent.** `POST /repository/commits` has no request
+  deduplication, so if the network fails after GitLab accepted the commit but
+  before the response arrived, a retry replays the request. With
+  `optimistic_lock = true` (default) the replay fails loudly as a
+  "Concurrent modification detected" conflict while the original commit
+  stands - run `terraform plan` to reconcile. With the lock disabled a replay
+  can land a duplicate commit. If your pipeline is sensitive to duplicate
+  pipelines per apply, keep the lock on.
+
 ## Development
 
 ```bash
-just build       # build the provider
-just test        # unit tests
-just lint        # vet + staticcheck + golangci-lint
-just check       # fmt-check + vet + staticcheck + govulncheck + fieldalignment
+just build       # check + lint + test, then a static binary in ./dist
+just test        # unit tests (go test ./...)
+just lint        # golangci-lint
+just check       # go vet + staticcheck + govulncheck + fieldalignment
+just ci          # the full CI gate: check + lint + test + tf-fmt + docs + headers
 ```
 
 Acceptance tests run against a real GitLab project and are gated by env vars:
@@ -199,6 +221,7 @@ Acceptance tests run against a real GitLab project and are gated by env vars:
 TF_ACC=1 \
 GITLAB_TOKEN='...' \
 GITLAB_TEST_PROJECT_ID='you/sandbox' \
+GITLAB_TEST_BRANCH_FROM='main' \
 go test -v -timeout=20m -run '^TestAcc' ./internal/...
 ```
 

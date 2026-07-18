@@ -9,9 +9,9 @@ short — please read all of it.
 git clone https://github.com/greeddj/terraform-provider-gitlabcommits
 cd terraform-provider-gitlabcommits
 
-just check     # fmt-check + unit tests + lint
+just ci        # the full CI gate: check + lint + test + tf-fmt + docs + headers
 just docs      # regenerate the docs (uses tfplugindocs)
-just build     # local binary in ./dist
+just build     # local binary in ./dist (runs check + lint + test first)
 ```
 
 If you don't have [Just](https://github.com/casey/just), each target maps to
@@ -22,16 +22,17 @@ a one-liner you can run manually — see the `Justfile`.
 1. **Edit code** under `internal/provider/`. New code paths need unit tests in
    the same package — see `*_test.go` for examples (table-driven where it
    helps).
-2. **Run `just check`** before pushing. This runs:
-   - `gofmt`, `terraform fmt`
-   - `go vet`
-   - `staticcheck`
-   - `golangci-lint`
-   - `go test ./...`
+2. **Run `just ci`** before pushing - it is the exact gate CI runs:
+   - `just check` (`go vet`, `staticcheck`, `govulncheck`, `fieldalignment`)
+   - `just lint` (`golangci-lint`, including the `gofmt` formatter)
+   - `just test` (`go test ./...`)
+   - `terraform fmt -check` over `examples/`
+   - generated-docs and copywrite-header sync checks
 3. **Regenerate docs** if you changed any schema:
    `just docs` or `go generate ./...`. CI fails if `docs/` is out of sync.
-4. **Add a CHANGELOG entry** under `## [Unreleased]` for any user-visible
-   change.
+4. **Use a conventional commit title** (`feat:`, `fix:`, `docs:`, `chore:`,
+   `test:`) for any user-visible change - goreleaser builds the release
+   changelog from commit titles; there is no CHANGELOG file to edit.
 
 ## Acceptance tests
 
@@ -42,7 +43,8 @@ Acceptance tests run against a real GitLab project. They are **not** part of
 export TF_ACC=1
 export GITLAB_TOKEN='...'                  # api scope (see README Authentication)
 export GITLAB_TEST_PROJECT_ID='you/sandbox'
-export GITLAB_TEST_BRANCH='tf-acc-test'    # optional
+export GITLAB_TEST_BRANCH='tf-acc-test'    # optional; must pre-exist unless GITLAB_TEST_BRANCH_FROM is set
+export GITLAB_TEST_BRANCH_FROM='main'      # optional; create the branch from this ref, delete it after the test
 go test -v -timeout=20m -run '^TestAcc' ./internal/...
 ```
 
@@ -70,6 +72,7 @@ nightly cron).
 ## Filing an issue
 
 Please include:
+
 - provider version,
 - Terraform version,
 - the relevant HCL,

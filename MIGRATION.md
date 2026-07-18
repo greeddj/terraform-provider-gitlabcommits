@@ -21,8 +21,8 @@ as the unit of state — which is what users actually want to manage.
 
 ### Step-by-step upgrade
 
-1. **Pin the new provider version** — bump `version = "~> 0.2"` (or whatever
-   the new release is) in `required_providers`.
+1. **Pin the release you are upgrading to** in `required_providers` (any
+   release that ships `gitlabcommits_files`).
 2. **Re-write each `gitlabcommits_commit` resource** to `gitlabcommits_files`:
    - Convert the `files` list to a map keyed by `file_path`.
    - Drop the `action` attribute — the provider computes it from the diff.
@@ -33,9 +33,12 @@ as the unit of state — which is what users actually want to manage.
    `gitlabcommits_commit.*` resource.
 4. **Apply with `adopt_existing = true`** (the default). For each new
    `gitlabcommits_files` resource the provider does a preflight
-   `GetFileMetaData` per path, rewrites `create` to `update` for
-   already-existing paths, and the apply produces no actual commit if the
-   rendered content matches the repo. State now points at the right files.
+   `GetFileMetaData` per path and rewrites `create` to `update` for
+   already-existing paths, so the apply converges without "file already
+   exists" errors. Note that this first apply pushes **one adoption commit
+   per resource** (its updates simply re-write the same bytes when the
+   rendered content already matches the repo); only subsequent applies with
+   no changes produce zero commits.
 5. **Inspect once** — run `terraform plan` again; it should report no
    changes.
 
@@ -85,15 +88,16 @@ resource "gitlabcommits_files" "frontend" {
 }
 ```
 
-The first apply after the migration produces zero commits in the repo.
+The first apply after the migration produces one adoption commit per
+resource; every later apply with no changes produces zero commits.
 
 ## `blob_id` is now opaque
 
-Prior to v0.3, the provider computed each file's `blob_id` locally using
+Early pre-release builds computed each file's `blob_id` locally using
 `sha1("blob <size>\0<content>")` — git's own format — so the value in
-`terraform.tfstate` was always a 40-character SHA-1. From v0.3 onwards the
-provider stores whatever `blob_id` GitLab returns, treating it as an
-opaque string. On SHA-1 repositories the value is unchanged; on SHA-256
+`terraform.tfstate` was always a 40-character SHA-1. The provider now
+stores whatever `blob_id` GitLab returns, treating it as an opaque
+string. On SHA-1 repositories the value is unchanged; on SHA-256
 repositories (GitLab 16.1+ experimental, wider in 18.x) it will be a
 64-character SHA-256.
 
