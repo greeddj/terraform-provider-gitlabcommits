@@ -561,6 +561,7 @@ func TestParseImportID(t *testing.T) {
 		{"a::b", "a", "b", false},
 		{"group/sub/proj::main", "group/sub/proj", "main", false},
 		{"123::release/v1", "123", "release/v1", false},
+		{" proj :: main ", "proj", "main", false},
 		{"", "", "", true},
 		{"::", "", "", true},
 		{"a::", "", "", true},

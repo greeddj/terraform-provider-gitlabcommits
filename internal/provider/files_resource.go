@@ -272,18 +272,10 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 		return
 	}
 
-	if err := r.ensureBranch(ctx,
-		plan.ProjectID.ValueString(),
-		plan.Branch.ValueString(),
-		plan.CreateBranchFrom.ValueString(),
-	); err != nil {
-		summary, detail := apiErrorDiag("ensuring branch exists", plan.ProjectID.ValueString(), plan.Branch.ValueString(), err)
-		resp.Diagnostics.AddError(summary, detail)
-		return
-	}
-
 	paths := sortedKeys(plan.Files)
 	useLock := plan.optimisticLock()
+	// Probes on a branch that does not exist yet simply 404 into "absent", so
+	// they may run before ensureBranch materialises it.
 	var probes map[string]remoteProbe
 	if plan.adoptExisting() {
 		probes = r.probeRemote(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), paths)
@@ -297,6 +289,19 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 			return
 		}
 		actions = append(actions, acts...)
+	}
+
+	// The branch is created only after every action validated: failing on a
+	// bad file before touching the repository avoids orphaning a freshly
+	// created branch that the failed Create will never commit to.
+	if err := r.ensureBranch(ctx,
+		plan.ProjectID.ValueString(),
+		plan.Branch.ValueString(),
+		plan.CreateBranchFrom.ValueString(),
+	); err != nil {
+		summary, detail := apiErrorDiag("ensuring branch exists", plan.ProjectID.ValueString(), plan.Branch.ValueString(), err)
+		resp.Diagnostics.AddError(summary, detail)
+		return
 	}
 
 	tflog.Debug(ctx, "Creating GitLab files commit", map[string]any{
@@ -687,12 +692,18 @@ func (r *filesResource) ImportState(ctx context.Context, req resource.ImportStat
 // "<project_id>::<branch>" into its two components. Both parts must be
 // non-empty and non-whitespace; multiple "::" separators (e.g. "a::b::c")
 // are rejected so the caller never silently keeps part of the suffix.
+// Surrounding whitespace (a stray space in a copy-pasted import command) is
+// trimmed rather than smuggled into the project or branch value.
 func parseImportID(s string) (project, branch string, err error) {
 	parts := strings.Split(s, "::")
-	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+	if len(parts) != 2 {
 		return "", "", fmt.Errorf("expected \"project_id::branch\", got %q", s)
 	}
-	return parts[0], parts[1], nil
+	project, branch = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	if project == "" || branch == "" {
+		return "", "", fmt.Errorf("expected \"project_id::branch\", got %q", s)
+	}
+	return project, branch, nil
 }
 
 // diffActions computes the minimal set of commit actions needed to make the
@@ -911,7 +922,7 @@ func (r *filesResource) ensureBranch(ctx context.Context, project, branch, creat
 		Ref:    new(createFrom),
 	}, gitlab.WithContext(ctx))
 	if err != nil {
-		return fmt.Errorf("creating branch %q from %q: %w", branch, createFrom, err)
+		return fmt.Errorf("creating branch %q from create_branch_from ref %q: %w", branch, createFrom, err)
 	}
 	tflog.Info(ctx, "Created GitLab branch", map[string]any{
 		"project_id": project,

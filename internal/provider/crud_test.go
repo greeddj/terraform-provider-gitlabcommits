@@ -557,8 +557,8 @@ func TestEnsureBranch(t *testing.T) {
 		})
 		r := &filesResource{client: client}
 		err := r.ensureBranch(context.Background(), "proj", "feature", "nope")
-		if err == nil || !strings.Contains(err.Error(), `creating branch "feature" from "nope"`) {
-			t.Fatalf("want a creating-branch error naming the ref, got: %v", err)
+		if err == nil || !strings.Contains(err.Error(), `creating branch "feature" from create_branch_from ref "nope"`) {
+			t.Fatalf("want a creating-branch error naming the attribute and ref, got: %v", err)
 		}
 	})
 }
