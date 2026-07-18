@@ -5,9 +5,12 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -130,35 +133,55 @@ func (v mapNonEmptyValidator) ValidateMap(_ context.Context, req validator.MapRe
 	}
 }
 
-// mapKeysMatchRegex validates every key in a map against a pattern. Used for
-// repository file paths: no leading slash, no `..`, no NUL bytes.
-func mapKeysMatchRegex(pattern, msg string) validator.Map {
-	return mapKeysRegexValidator{re: regexp.MustCompile(pattern), msg: msg, pattern: pattern}
+// mapKeysValidRepoPath validates every key in the files map as a repository
+// path. Explicit logic instead of a character-class regex: only the exact "."
+// and ".." traversal segments are rejected, so legal git names like
+// "..config" stay usable; the rest (exotic characters, length limits) is
+// GitLab's to validate server-side.
+func mapKeysValidRepoPath() validator.Map {
+	return mapKeysRepoPathValidator{}
 }
 
-type mapKeysRegexValidator struct {
-	re      *regexp.Regexp
-	msg     string
-	pattern string
-}
+type mapKeysRepoPathValidator struct{}
 
-func (v mapKeysRegexValidator) Description(_ context.Context) string {
-	return fmt.Sprintf("each key must match %s (%s)", v.pattern, v.msg)
+func (v mapKeysRepoPathValidator) Description(_ context.Context) string {
+	return "each key must be a relative repository path: no leading slash, no \".\" or \"..\" segments, no NUL bytes, no empty segments, no segment starting with whitespace"
 }
-func (v mapKeysRegexValidator) MarkdownDescription(ctx context.Context) string {
+func (v mapKeysRepoPathValidator) MarkdownDescription(ctx context.Context) string {
 	return v.Description(ctx)
 }
-func (v mapKeysRegexValidator) ValidateMap(_ context.Context, req validator.MapRequest, resp *validator.MapResponse) {
+func (v mapKeysRepoPathValidator) ValidateMap(_ context.Context, req validator.MapRequest, resp *validator.MapResponse) {
 	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
 		return
 	}
 	for k := range req.ConfigValue.Elements() {
-		if !v.re.MatchString(k) {
+		if err := validateRepoPath(k); err != nil {
 			resp.Diagnostics.AddAttributeError(req.Path.AtMapKey(k),
 				"Invalid file path",
-				fmt.Sprintf("path %q is invalid: %s", k, v.msg))
+				fmt.Sprintf("path %q is invalid: %s", k, err))
 		}
 	}
+}
+
+func validateRepoPath(p string) error {
+	if p == "" {
+		return errors.New("must not be empty")
+	}
+	if strings.ContainsRune(p, 0) {
+		return errors.New("must not contain NUL bytes")
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" {
+			return errors.New("must not contain empty segments (no leading, trailing, or doubled slashes)")
+		}
+		if seg == "." || seg == ".." {
+			return errors.New("must not contain \".\" or \"..\" segments")
+		}
+		if r, _ := utf8.DecodeRuneInString(seg); unicode.IsSpace(r) {
+			return errors.New("segments must not start with whitespace")
+		}
+	}
+	return nil
 }
 
 // objectFileContentRequired enforces the "at least one" half of the

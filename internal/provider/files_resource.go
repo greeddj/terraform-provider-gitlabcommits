@@ -189,13 +189,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Required:    true,
 				Validators: []validator.Map{
 					mapNonEmpty(),
-					// Repository paths: no leading slash, no `..` or `.` segments, no NUL
-					// bytes, no leading whitespace per segment. Interior spaces and other
-					// characters are tolerated - git accepts quite a lot.
-					mapKeysMatchRegex(
-						`^(?:[^/\s\x00.][^/\x00]*|\.[^./\x00][^/\x00]*)(?:/(?:[^/\s\x00.][^/\x00]*|\.[^./\x00][^/\x00]*))*$`,
-						"file paths must be relative (no leading slash), must not contain `..` or NUL bytes",
-					),
+					// Interior spaces and other characters are tolerated - git
+					// accepts quite a lot; only traversal segments, NUL bytes,
+					// empty segments, and leading whitespace are rejected.
+					mapKeysValidRepoPath(),
 				},
 				NestedObject: schema.NestedAttributeObject{
 					Validators: []validator.Object{

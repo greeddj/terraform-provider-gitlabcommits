@@ -198,13 +198,11 @@ func TestMapNonEmpty(t *testing.T) {
 	}
 }
 
-func TestMapKeysMatchRegex(t *testing.T) {
-	// Use the actual production regex so this test pins the path-validation
-	// contract: no leading slash, no `..`, no NUL bytes, no whitespace runs.
-	v := mapKeysMatchRegex(
-		`^(?:[^/\s\x00.][^/\x00]*|\.[^./\x00][^/\x00]*)(?:/(?:[^/\s\x00.][^/\x00]*|\.[^./\x00][^/\x00]*))*$`,
-		"file paths must be relative",
-	)
+func TestMapKeysValidRepoPath(t *testing.T) {
+	// Pins the path-validation contract: relative paths only, no traversal
+	// segments, no NUL bytes, no empty segments, no segment starting with
+	// whitespace - while legal-but-odd git names stay usable.
+	v := mapKeysValidRepoPath()
 	cases := []struct {
 		name    string
 		keys    []string
@@ -213,10 +211,15 @@ func TestMapKeysMatchRegex(t *testing.T) {
 		{"plain", []string{"foo.yaml", "bar/baz.yaml"}, false},
 		{"hidden-file", []string{".gitignore", ".github/CODEOWNERS"}, false},
 		{"deep-path", []string{"services/frontend/values/dev.yaml"}, false},
+		{"double-dot-name", []string{"..config", "a/..b"}, false},
+		{"interior-space", []string{"docs/read me.txt"}, false},
 		{"dotdot-segment", []string{"foo/../bar"}, true},
 		{"leading-slash", []string{"/abs/path"}, true},
 		{"single-dot-segment", []string{"./foo"}, true},
 		{"nul-byte", []string{"foo\x00bar"}, true},
+		{"trailing-slash", []string{"foo/"}, true},
+		{"doubled-slash", []string{"a//b"}, true},
+		{"leading-space-segment", []string{"a/ b.txt"}, true},
 		{"empty-map-ignored", []string{}, false},
 	}
 	for _, c := range cases {
