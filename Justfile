@@ -40,15 +40,15 @@ docs:
 
 docs-check: docs
 	@echo "===== Verify generated docs are in sync ====="
-	git diff --exit-code -- docs
+	@test -z "$(git status --porcelain -- docs)" || { git status --porcelain -- docs; echo "docs/ is out of sync: run 'just docs' and commit the result"; exit 1; }
 
 headers:
 	@echo "===== Apply copywrite headers ====="
 	go tool copywrite headers -d . --config .copywrite.hcl
 
-headers-check: headers
+headers-check:
 	@echo "===== Verify copywrite headers are in sync ====="
-	git diff --exit-code
+	go tool copywrite headers -d . --config .copywrite.hcl --plan
 
 build: check lint test
 	@echo "===== Build {{PROJECT}} ====="
