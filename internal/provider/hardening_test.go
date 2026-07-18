@@ -49,6 +49,8 @@ func TestCrossHostRedirectGuard(t *testing.T) {
 		{"same host", mk("https://gitlab.example.com/redir"), []*http.Request{orig}, false},
 		{"http to https same host", mk("https://gitlab.example.com/up"), []*http.Request{mk("http://gitlab.example.com/x")}, false},
 		{"cross host refused", mk("https://evil.example.net/steal"), []*http.Request{orig}, true},
+		{"https to http downgrade refused", mk("http://gitlab.example.com/down"), []*http.Request{orig}, true},
+		{"http stays http allowed", mk("http://gitlab.example.com/next"), []*http.Request{mk("http://gitlab.example.com/x")}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

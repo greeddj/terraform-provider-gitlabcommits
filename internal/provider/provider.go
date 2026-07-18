@@ -231,8 +231,10 @@ func (p *gitlabCommitsProvider) Resources(_ context.Context) []func() resource.R
 // client. net/http strips Authorization/Cookie on a cross-host redirect but
 // leaves custom headers like Private-Token intact, so a 3xx pointing off-host
 // would otherwise forward the API token to an attacker-controlled host. Same-host
-// redirects (including http->https upgrades) are allowed; the chain is capped at
-// 10 to match net/http's default behaviour, which a non-nil CheckRedirect drops.
+// redirects (including http->https upgrades) are allowed, but an https->http
+// downgrade is refused - it would resend the token in cleartext. The chain is
+// capped at 10 to match net/http's default behaviour, which a non-nil
+// CheckRedirect drops.
 func crossHostRedirectGuard(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
@@ -243,6 +245,9 @@ func crossHostRedirectGuard(req *http.Request, via []*http.Request) error {
 	if req.URL.Host != via[0].URL.Host {
 		return fmt.Errorf("refusing cross-host redirect to %q: the GitLab token must not be sent to a host other than %q",
 			req.URL.Host, via[0].URL.Host)
+	}
+	if req.URL.Scheme == "http" && via[len(via)-1].URL.Scheme == "https" {
+		return fmt.Errorf("refusing https->http redirect downgrade to %q: the GitLab token must not be resent in cleartext", req.URL.String())
 	}
 	return nil
 }
