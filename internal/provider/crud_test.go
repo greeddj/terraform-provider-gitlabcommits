@@ -472,70 +472,79 @@ func TestUpdate_HappyPathStampsState(t *testing.T) {
 	}
 }
 
-// TestEnsureBranch drives every ensureBranch branch directly: present branch,
-// non-404 lookup failure, absent branch without a source ref, successful
-// creation with the right payload, and a failing creation.
-func TestEnsureBranch(t *testing.T) {
-	t.Run("branch exists", func(t *testing.T) {
+// TestBranchHelpers drives the branch lifecycle helpers directly: existence
+// check outcomes, the missing-branch preflight, and branch creation with the
+// right payload.
+func TestBranchHelpers(t *testing.T) {
+	t.Run("branchExists true", func(t *testing.T) {
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
 		})
 		r := &filesResource{client: client}
-		if err := r.ensureBranch(context.Background(), "proj", "main", ""); err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		ok, err := r.branchExists(context.Background(), "proj", "main")
+		if err != nil || !ok {
+			t.Fatalf("want (true, nil), got (%v, %v)", ok, err)
 		}
 	})
 
-	t.Run("non-404 lookup failure", func(t *testing.T) {
+	t.Run("branchExists false on 404", func(t *testing.T) {
+		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "no branch", http.StatusNotFound)
+		})
+		r := &filesResource{client: client}
+		ok, err := r.branchExists(context.Background(), "proj", "feature")
+		if err != nil || ok {
+			t.Fatalf("want (false, nil), got (%v, %v)", ok, err)
+		}
+	})
+
+	t.Run("branchExists surfaces non-404", func(t *testing.T) {
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 		})
 		r := &filesResource{client: client}
-		err := r.ensureBranch(context.Background(), "proj", "main", "")
+		_, err := r.branchExists(context.Background(), "proj", "main")
 		if err == nil || !strings.Contains(err.Error(), "checking branch") {
 			t.Fatalf("want a checking-branch error, got: %v", err)
 		}
 	})
 
-	t.Run("absent without create_branch_from", func(t *testing.T) {
+	t.Run("preflight rejects empty repository", func(t *testing.T) {
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-			if strings.Contains(r.URL.Path, "/branches/") {
-				http.Error(w, "no branch", http.StatusNotFound)
-				return
-			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":1,"empty_repo":true}`))
+		})
+		r := &filesResource{client: client}
+		err := r.missingBranchPreflight(context.Background(), "proj", "feature", "main")
+		if err == nil || !strings.Contains(err.Error(), "no commits") {
+			t.Fatalf("want the empty-repository diagnostic, got: %v", err)
+		}
+	})
+
+	t.Run("preflight demands create_branch_from", func(t *testing.T) {
+		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
 		})
 		r := &filesResource{client: client}
-		err := r.ensureBranch(context.Background(), "proj", "feature", "")
+		err := r.missingBranchPreflight(context.Background(), "proj", "feature", "")
 		if err == nil || !strings.Contains(err.Error(), "create_branch_from") {
 			t.Fatalf("want the create_branch_from hint, got: %v", err)
 		}
 	})
 
-	t.Run("creates branch from ref", func(t *testing.T) {
+	t.Run("createBranch sends branch and ref", func(t *testing.T) {
 		var createBody string
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-			switch {
-			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
-				http.Error(w, "no branch", http.StatusNotFound)
-			case r.Method == http.MethodGet:
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
-			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/branches"):
-				b, _ := io.ReadAll(r.Body)
-				createBody = string(b)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusCreated)
-				_, _ = w.Write([]byte(`{"name":"feature","commit":{"id":"base"}}`))
-			default:
-				t.Errorf("unexpected call %s %s", r.Method, r.URL.Path)
-				http.Error(w, "unexpected", http.StatusInternalServerError)
-			}
+			b, _ := io.ReadAll(r.Body)
+			createBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"name":"feature","commit":{"id":"base"}}`))
 		})
 		r := &filesResource{client: client}
-		if err := r.ensureBranch(context.Background(), "proj", "feature", "main"); err != nil {
+		if err := r.createBranch(context.Background(), "proj", "feature", "main"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if !strings.Contains(createBody, `"branch":"feature"`) || !strings.Contains(createBody, `"ref":"main"`) {
@@ -543,24 +552,87 @@ func TestEnsureBranch(t *testing.T) {
 		}
 	})
 
-	t.Run("creation fails", func(t *testing.T) {
+	t.Run("createBranch failure names the attribute and ref", func(t *testing.T) {
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-			switch {
-			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
-				http.Error(w, "no branch", http.StatusNotFound)
-			case r.Method == http.MethodGet:
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
-			default:
-				http.Error(w, "bad ref", http.StatusBadRequest)
-			}
+			http.Error(w, "bad ref", http.StatusBadRequest)
 		})
 		r := &filesResource{client: client}
-		err := r.ensureBranch(context.Background(), "proj", "feature", "nope")
+		err := r.createBranch(context.Background(), "proj", "feature", "nope")
 		if err == nil || !strings.Contains(err.Error(), `creating branch "feature" from create_branch_from ref "nope"`) {
 			t.Fatalf("want a creating-branch error naming the attribute and ref, got: %v", err)
 		}
 	})
+}
+
+// TestCreate_AdoptsFromCreateBranchFromRef is the regression test for
+// adoption across branch materialisation: when the branch does not exist yet
+// and create_branch_from points at a ref that already contains a managed
+// path, the adopt probe must resolve against that source ref - the new
+// branch will inherit the file, so a plain create would die with "already
+// exists" right after the branch was created.
+func TestCreate_AdoptsFromCreateBranchFromRef(t *testing.T) {
+	var commitBody string
+	branchCreated := false
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			http.Error(w, "no branch yet", http.StatusNotFound)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "main":
+			// The managed path already exists on the source ref.
+			w.Header().Set("X-Gitlab-Blob-Id", "srcblob")
+			w.Header().Set("X-Gitlab-Last-Commit-Id", "src-lcid")
+			w.Header().Set("X-Gitlab-File-Path", "f.txt")
+			w.Header().Set("X-Gitlab-Ref", "main")
+			w.Header().Set("X-Gitlab-Size", "3")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "absha":
+			w.Header().Set("X-Gitlab-Blob-Id", "stampedblob")
+			w.Header().Set("X-Gitlab-Last-Commit-Id", "absha")
+			w.Header().Set("X-Gitlab-File-Path", "f.txt")
+			w.Header().Set("X-Gitlab-Ref", "absha")
+			w.Header().Set("X-Gitlab-Size", "3")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/branches"):
+			branchCreated = true
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"name":"feature","commit":{"id":"base"}}`))
+		case r.Method == http.MethodPost:
+			if !branchCreated {
+				t.Error("commit must not be attempted before the branch is created")
+			}
+			b, _ := io.ReadAll(r.Body)
+			commitBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"absha"}`))
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	})
+
+	plan := readState("ignored")
+	plan.Branch = types.StringValue("feature")
+	plan.ID = types.StringValue("proj::feature")
+	plan.CreateBranchFrom = types.StringValue("main")
+
+	resp := runCreate(t, client, plan)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if !branchCreated {
+		t.Error("expected the branch to be created")
+	}
+	if !strings.Contains(commitBody, `"action":"update"`) {
+		t.Errorf("inherited path must be adopted as an update, body: %s", commitBody)
+	}
+	if !strings.Contains(commitBody, `"last_commit_id":"src-lcid"`) {
+		t.Errorf("adopt-update must carry the source ref's lock token, body: %s", commitBody)
+	}
 }
 
 // TestCommitOptions_AuthorPropagation: author overrides reach the commit

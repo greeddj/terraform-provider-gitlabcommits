@@ -272,13 +272,37 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 		return
 	}
 
+	project := plan.ProjectID.ValueString()
+	branch := plan.Branch.ValueString()
+	createFrom := plan.CreateBranchFrom.ValueString()
+
+	branchExists, existsErr := r.branchExists(ctx, project, branch)
+	if existsErr != nil {
+		summary, detail := apiErrorDiag("checking branch", project, branch, existsErr)
+		resp.Diagnostics.AddError(summary, detail)
+		return
+	}
+	if !branchExists {
+		if err := r.missingBranchPreflight(ctx, project, branch, createFrom); err != nil {
+			summary, detail := apiErrorDiag("ensuring branch exists", project, branch, err)
+			resp.Diagnostics.AddError(summary, detail)
+			return
+		}
+	}
+
 	paths := sortedKeys(plan.Files)
 	useLock := plan.optimisticLock()
-	// Probes on a branch that does not exist yet simply 404 into "absent", so
-	// they may run before ensureBranch materialises it.
+	// Adoption must be resolved against what the target branch will actually
+	// contain: the branch itself when it exists, otherwise the ref it is
+	// about to be created from - a managed path inherited from that ref must
+	// become an adopt-update, not a create doomed to "already exists".
 	var probes map[string]remoteProbe
 	if plan.adoptExisting() {
-		probes = r.probeRemote(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), paths)
+		probeRef := branch
+		if !branchExists {
+			probeRef = createFrom
+		}
+		probes = r.probeRemote(ctx, project, probeRef, paths)
 	}
 
 	actions := make([]*gitlab.CommitActionOptions, 0, len(plan.Files))
@@ -294,14 +318,12 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 	// The branch is created only after every action validated: failing on a
 	// bad file before touching the repository avoids orphaning a freshly
 	// created branch that the failed Create will never commit to.
-	if err := r.ensureBranch(ctx,
-		plan.ProjectID.ValueString(),
-		plan.Branch.ValueString(),
-		plan.CreateBranchFrom.ValueString(),
-	); err != nil {
-		summary, detail := apiErrorDiag("ensuring branch exists", plan.ProjectID.ValueString(), plan.Branch.ValueString(), err)
-		resp.Diagnostics.AddError(summary, detail)
-		return
+	if !branchExists {
+		if err := r.createBranch(ctx, project, branch, createFrom); err != nil {
+			summary, detail := apiErrorDiag("ensuring branch exists", project, branch, err)
+			resp.Diagnostics.AddError(summary, detail)
+			return
+		}
 	}
 
 	tflog.Debug(ctx, "Creating GitLab files commit", map[string]any{
@@ -872,9 +894,11 @@ func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) (
 	return actions, nil
 }
 
-// probeRemote fans probeFile out across paths at refreshParallelism. Errors are
-// swallowed because probeFile itself swallows errors (a transport hiccup is
-// treated as "absent", same as the sequential code).
+// probeRemote fans probeFile out across paths at refreshParallelism. The
+// goroutines always return nil so Wait never fails; each path's outcome -
+// including non-404 probe errors - travels in its remoteProbe's err field
+// for the caller to interpret (Delete aborts on it, the adopt paths ignore
+// it on purpose).
 func (r *filesResource) probeRemote(ctx context.Context, project, branch string, paths []string) map[string]remoteProbe {
 	out := make(map[string]remoteProbe, len(paths))
 	if len(paths) == 0 {
@@ -896,20 +920,24 @@ func (r *filesResource) probeRemote(ctx context.Context, project, branch string,
 	return out
 }
 
-// ensureBranch makes sure the target branch exists, creating it from createFrom
-// if it doesn't and createFrom is non-empty. Returns nil when the branch is
-// already present, or once it has been successfully created.
-func (r *filesResource) ensureBranch(ctx context.Context, project, branch, createFrom string) error {
+// branchExists reports whether branch is present, distinguishing a genuine
+// 404 from transport/auth failures.
+func (r *filesResource) branchExists(ctx context.Context, project, branch string) (bool, error) {
 	_, _, err := r.client.Branches.GetBranch(project, branch, gitlab.WithContext(ctx))
 	if err == nil {
-		return nil
+		return true, nil
 	}
-	if !errors.Is(err, gitlab.ErrNotFound) {
-		return fmt.Errorf("checking branch %q: %w", branch, err)
+	if errors.Is(err, gitlab.ErrNotFound) {
+		return false, nil
 	}
-	// On a repository with zero commits every branch lookup 404s and no ref
-	// exists to branch from, so the create_branch_from advice below would be
-	// a dead end; detect that case and say what actually helps.
+	return false, fmt.Errorf("checking branch %q: %w", branch, err)
+}
+
+// missingBranchPreflight validates that an absent branch can actually be
+// materialised. On a repository with zero commits every branch lookup 404s
+// and no ref exists to branch from, so the create_branch_from advice would
+// be a dead end; detect that case and say what actually helps.
+func (r *filesResource) missingBranchPreflight(ctx context.Context, project, branch, createFrom string) error {
 	if proj, _, perr := r.client.Projects.GetProject(project, nil, gitlab.WithContext(ctx)); perr == nil && proj != nil && proj.EmptyRepo {
 		return fmt.Errorf("repository %q has no commits, so branch %q cannot exist and create_branch_from has no ref to start from; "+
 			"create an initial commit first (for example initialize the project with a README)", project, branch)
@@ -917,7 +945,11 @@ func (r *filesResource) ensureBranch(ctx context.Context, project, branch, creat
 	if createFrom == "" {
 		return fmt.Errorf("branch %q does not exist; set create_branch_from to materialise it", branch)
 	}
-	_, _, err = r.client.Branches.CreateBranch(project, &gitlab.CreateBranchOptions{
+	return nil
+}
+
+func (r *filesResource) createBranch(ctx context.Context, project, branch, createFrom string) error {
+	_, _, err := r.client.Branches.CreateBranch(project, &gitlab.CreateBranchOptions{
 		Branch: new(branch),
 		Ref:    new(createFrom),
 	}, gitlab.WithContext(ctx))
@@ -1078,8 +1110,9 @@ func (r *filesResource) stampBlobs(
 	_ = g.Wait()
 
 	// Second pass (serial): apply probe results. On success, overwrite the
-	// first-pass commitSHA with the server's LastCommitID so a concurrent
-	// writer between our commit and this probe is reflected in state.
+	// first-pass commitSHA with the per-file LastCommitID probed at
+	// Ref=commitSHA, so files this commit did not touch keep their older
+	// commit id instead of a token that would trip a false lock conflict.
 	for i, p := range paths {
 		f := files[p]
 		if results[i].err != nil {
