@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -167,11 +168,12 @@ func accBranch(t *testing.T) string {
 	return branch
 }
 
-// accConfig renders a minimal HCL config exercising the resource for a given
-// set of (path, content) entries. When GITLAB_TEST_BRANCH_FROM is set the
-// config carries create_branch_from so the provider materialises the branch
-// on first apply (unique per-run branches in CI never pre-exist).
-func accConfig(project, branch string, files map[string]string) string {
+// accResourceHeader renders the shared opening of the test resource config:
+// provider block, project/branch/commit_message, and - when
+// GITLAB_TEST_BRANCH_FROM is set - create_branch_from so the provider
+// materialises the branch on first apply (unique per-run branches in CI never
+// pre-exist).
+func accResourceHeader(project, branch string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `
 provider "gitlabcommits" {}
@@ -184,6 +186,14 @@ resource "gitlabcommits_files" "test" {
 	if from := accBranchFrom(); from != "" {
 		fmt.Fprintf(&b, "  create_branch_from = %q\n", from)
 	}
+	return b.String()
+}
+
+// accConfig renders a minimal HCL config exercising the resource for a given
+// set of (path, content) entries.
+func accConfig(project, branch string, files map[string]string) string {
+	var b strings.Builder
+	b.WriteString(accResourceHeader(project, branch))
 	b.WriteString("  files = {\n")
 	for path, content := range files {
 		fmt.Fprintf(&b, "    %q = { content = %q }\n", path, content)
@@ -235,4 +245,137 @@ func accCheckFileGone(project, branch, path string) resource.TestCheckFunc {
 		}
 		return nil
 	}
+}
+
+// accCheckFileExec asserts the executable bit of path at branch HEAD.
+func accCheckFileExec(project, branch, path string, want bool) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		c, err := accClient()
+		if err != nil {
+			return err
+		}
+		meta, _, err := c.RepositoryFiles.GetFileMetaData(project, path, &gitlab.GetFileMetaDataOptions{
+			Ref: gitlab.Ptr(branch),
+		}, gitlab.WithContext(context.Background()))
+		if err != nil {
+			return fmt.Errorf("metadata for %q on %q: %w", path, branch, err)
+		}
+		if meta.ExecuteFilemode != want {
+			return fmt.Errorf("exec bit for %q = %t, want %t", path, meta.ExecuteFilemode, want)
+		}
+		return nil
+	}
+}
+
+// TestAccFiles_optimisticLockConflict provokes a real optimistic-lock 400:
+// detect_drift=false keeps the stale last_commit_id in state, an out-of-band
+// commit moves the file, and the next apply must fail with the dedicated
+// conflict diagnostic instead of silently overwriting the external edit.
+func TestAccFiles_optimisticLockConflict(t *testing.T) {
+	testAccPreCheck(t)
+
+	project := os.Getenv("GITLAB_TEST_PROJECT_ID")
+	branch := accBranch(t)
+	path := accTestPathPrefix + "lock/f.txt"
+
+	cfg := func(content string) string {
+		var b strings.Builder
+		b.WriteString(accResourceHeader(project, branch))
+		b.WriteString("  detect_drift = false\n  files = {\n")
+		fmt.Fprintf(&b, "    %q = { content = %q }\n", path, content)
+		b.WriteString("  }\n}\n")
+		return b.String()
+	}
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: cfg("v1\n")},
+			{
+				PreConfig: func() {
+					c, err := accClient()
+					if err != nil {
+						t.Fatalf("accClient: %v", err)
+					}
+					_, _, err = c.RepositoryFiles.UpdateFile(project, path, &gitlab.UpdateFileOptions{
+						Branch:        gitlab.Ptr(branch),
+						Content:       gitlab.Ptr("external edit\n"),
+						CommitMessage: gitlab.Ptr("tf-acc-test external edit"),
+					}, gitlab.WithContext(context.Background()))
+					if err != nil {
+						t.Fatalf("out-of-band update: %v", err)
+					}
+				},
+				Config:      cfg("v2\n"),
+				ExpectError: regexp.MustCompile(`Concurrent modification detected`),
+			},
+			// Converge again so the destroy step does not trip over the stale
+			// lock token: re-enable drift detection to refresh state first.
+			{Config: strings.Replace(cfg("v2\n"), "detect_drift = false", "detect_drift = true", 1)},
+		},
+	})
+}
+
+// TestAccFiles_chmodCycle flips the executable bit both ways without touching
+// content and asserts the bit actually lands in the repository each time.
+func TestAccFiles_chmodCycle(t *testing.T) {
+	testAccPreCheck(t)
+
+	project := os.Getenv("GITLAB_TEST_PROJECT_ID")
+	branch := accBranch(t)
+	path := accTestPathPrefix + "chmod/tool.sh"
+
+	cfg := func(exec bool) string {
+		var b strings.Builder
+		b.WriteString(accResourceHeader(project, branch))
+		b.WriteString("  files = {\n")
+		fmt.Fprintf(&b, "    %q = { content = %q, execute_filemode = %t }\n", path, "#!/bin/sh\necho ok\n", exec)
+		b.WriteString("  }\n}\n")
+		return b.String()
+	}
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: cfg(true), Check: accCheckFileExec(project, branch, path, true)},
+			{Config: cfg(false), Check: accCheckFileExec(project, branch, path, false)},
+		},
+	})
+}
+
+// TestAccFiles_keepOnDestroy: delete_on_destroy=false must leave the file in
+// the repository after terraform destroy.
+func TestAccFiles_keepOnDestroy(t *testing.T) {
+	testAccPreCheck(t)
+
+	project := os.Getenv("GITLAB_TEST_PROJECT_ID")
+	branch := accBranch(t)
+	path := accTestPathPrefix + "keep/f.txt"
+
+	var b strings.Builder
+	b.WriteString(accResourceHeader(project, branch))
+	b.WriteString("  delete_on_destroy = false\n  files = {\n")
+	fmt.Fprintf(&b, "    %q = { content = %q }\n", path, "keep me\n")
+	b.WriteString("  }\n}\n")
+
+	t.Cleanup(func() {
+		c, err := accClient()
+		if err != nil {
+			return
+		}
+		// Best-effort: remove the survivor so a pre-existing shared branch is
+		// left clean (per-run branches are deleted wholesale anyway).
+		_, _ = c.RepositoryFiles.DeleteFile(project, path, &gitlab.DeleteFileOptions{
+			Branch:        gitlab.Ptr(branch),
+			CommitMessage: gitlab.Ptr("tf-acc-test cleanup"),
+		}, gitlab.WithContext(context.Background()))
+	})
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             accCheckFileExists(project, branch, path),
+		Steps: []resource.TestStep{
+			{Config: b.String(), Check: accCheckFileExists(project, branch, path)},
+		},
+	})
 }
