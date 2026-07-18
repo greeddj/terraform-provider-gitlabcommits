@@ -108,6 +108,21 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 			"base_url must be a known value at provider configure time.",
 		)
 	}
+	// Unknown retry settings must not silently become defaults: the user set
+	// them to something, and guessing here would hide a config wiring mistake.
+	for name, v := range map[string]types.Int64{
+		"max_retries":       config.MaxRetries,
+		"retry_wait_min_ms": config.RetryWaitMinMs,
+		"retry_wait_max_ms": config.RetryWaitMaxMs,
+	} {
+		if v.IsUnknown() {
+			resp.Diagnostics.AddAttributeError(
+				path.Root(name),
+				"Unknown retry configuration",
+				name+" must be a known value at provider configure time.",
+			)
+		}
+	}
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -143,7 +158,7 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	}
 
 	maxRetries := int64(5)
-	if !config.MaxRetries.IsNull() && !config.MaxRetries.IsUnknown() {
+	if !config.MaxRetries.IsNull() {
 		maxRetries = config.MaxRetries.ValueInt64()
 	}
 	if maxRetries < 0 {
@@ -157,11 +172,11 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	}
 
 	waitMin := int64(1000)
-	if !config.RetryWaitMinMs.IsNull() && !config.RetryWaitMinMs.IsUnknown() {
+	if !config.RetryWaitMinMs.IsNull() {
 		waitMin = config.RetryWaitMinMs.ValueInt64()
 	}
 	waitMax := int64(30000)
-	if !config.RetryWaitMaxMs.IsNull() && !config.RetryWaitMaxMs.IsUnknown() {
+	if !config.RetryWaitMaxMs.IsNull() {
 		waitMax = config.RetryWaitMaxMs.ValueInt64()
 	}
 	if waitMin <= 0 || waitMax <= 0 || waitMin > waitMax {

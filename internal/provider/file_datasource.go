@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
@@ -54,14 +55,17 @@ func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, r
 			"project_id": schema.StringAttribute{
 				Description: "Project ID or URL-encoded path.",
 				Required:    true,
+				Validators:  []validator.String{stringNotEmpty()},
 			},
 			"branch": schema.StringAttribute{
 				Description: "Branch (or any ref) to read the file from.",
 				Required:    true,
+				Validators:  []validator.String{stringNotEmpty()},
 			},
 			"file_path": schema.StringAttribute{
 				Description: "Path of the file inside the repository.",
 				Required:    true,
+				Validators:  []validator.String{stringNotEmpty()},
 			},
 			"content": schema.StringAttribute{
 				Description: "Decoded text content of the file. Null when the file is not valid UTF-8 " +
@@ -144,7 +148,15 @@ func (d *fileDataSource) Read(ctx context.Context, req datasource.ReadRequest, r
 		data.Content = types.StringNull()
 	}
 	data.ContentBase64 = types.StringValue(base64.StdEncoding.EncodeToString(raw))
-	data.BlobID = types.StringValue(file.BlobID)
+	// Same hostile-server ceiling as the resource: an absurd blob_id must not
+	// bloat state through the data-source path either.
+	if len(file.BlobID) > maxBlobIDLen {
+		resp.Diagnostics.AddWarning("Ignoring oversized blob_id",
+			fmt.Sprintf("file %q: server returned blob_id of unexpected length %d (max %d); leaving blob_id unset", path, len(file.BlobID), maxBlobIDLen))
+		data.BlobID = types.StringNull()
+	} else {
+		data.BlobID = types.StringValue(file.BlobID)
+	}
 	data.ExecuteFilemode = types.BoolValue(file.ExecuteFilemode)
 	data.LastCommitID = types.StringValue(file.LastCommitID)
 	data.Size = types.Int64Value(file.Size)

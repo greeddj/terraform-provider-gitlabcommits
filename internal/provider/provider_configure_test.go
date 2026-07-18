@@ -97,3 +97,20 @@ func TestConfigure_InvalidRetryBoundsError(t *testing.T) {
 		})
 	}
 }
+
+// TestConfigure_UnknownRetrySettingsError: unknown retry values must be
+// rejected instead of silently replaced with defaults.
+func TestConfigure_UnknownRetrySettingsError(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	for _, attr := range []string{"max_retries", "retry_wait_min_ms", "retry_wait_max_ms"} {
+		t.Run(attr, func(t *testing.T) {
+			resp := runConfigure(t, map[string]tftypes.Value{
+				"token": tftypes.NewValue(tftypes.String, "tok"),
+				attr:    tftypes.NewValue(tftypes.Number, tftypes.UnknownValue),
+			})
+			if !resp.Diagnostics.HasError() {
+				t.Fatalf("expected an error for unknown %s", attr)
+			}
+		})
+	}
+}

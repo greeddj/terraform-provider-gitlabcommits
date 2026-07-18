@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
@@ -45,9 +46,11 @@ func (d *branchHeadDataSource) Schema(_ context.Context, _ datasource.SchemaRequ
 			"populating last_commit_id when bootstrapping optimistic locking.",
 		Attributes: map[string]schema.Attribute{
 			"project_id": schema.StringAttribute{Required: true,
-				Description: "Project ID or URL-encoded path."},
+				Description: "Project ID or URL-encoded path.",
+				Validators:  []validator.String{stringNotEmpty()}},
 			"branch": schema.StringAttribute{Required: true,
-				Description: "Branch name."},
+				Description: "Branch name.",
+				Validators:  []validator.String{stringNotEmpty()}},
 			"commit_sha": schema.StringAttribute{Computed: true,
 				Description: "SHA of the commit at the branch head."},
 			"protected": schema.BoolAttribute{Computed: true,

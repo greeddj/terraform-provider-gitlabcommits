@@ -141,3 +141,26 @@ func TestFileDataSource_DecodeErrorSurfaces(t *testing.T) {
 		t.Errorf("diagnostic should name the unexpected encoding, got: %v", resp.Diagnostics.Errors())
 	}
 }
+
+// TestFileDataSource_OversizedBlobIDIgnored mirrors the resource's hostile
+// blob_id ceiling: an absurd blob_id yields a null attribute plus a warning,
+// never a state entry of unbounded size.
+func TestFileDataSource_OversizedBlobIDIgnored(t *testing.T) {
+	huge := strings.Repeat("a", maxBlobIDLen+1)
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"file_path":"f.bin","size":2,"encoding":"base64","content":"` +
+			base64.StdEncoding.EncodeToString([]byte("ok")) + `","blob_id":"` + huge + `","last_commit_id":"l"}`))
+	})
+
+	resp, out := runFileDataSourceRead(t, client)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if !out.BlobID.IsNull() {
+		t.Error("oversized blob_id must be dropped, not stored")
+	}
+	if resp.Diagnostics.WarningsCount() == 0 {
+		t.Error("expected a warning about the oversized blob_id")
+	}
+}
