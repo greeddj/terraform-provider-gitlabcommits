@@ -217,3 +217,67 @@ func TestUpdate_NoOpProducesNoCommit(t *testing.T) {
 		t.Error("expected no API calls for a no-op update")
 	}
 }
+
+// TestDelete_ProbeErrorFailsLoudly: a non-404 probe failure (revoked token,
+// 5xx, timeout) must fail the destroy instead of skipping the file - an
+// error-free Delete makes the framework drop the resource from state while
+// the files may still exist in the repository.
+func TestDelete_ProbeErrorFailsLoudly(t *testing.T) {
+	postCalled := false
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			postCalled = true
+		}
+		if r.Method == http.MethodHead {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	resp := runDelete(t, client, readState("blob"))
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected destroy to fail when the existence probe errors")
+	}
+	if postCalled {
+		t.Error("expected no commit attempt after a failed probe")
+	}
+}
+
+// TestDelete_PartialProbeErrorFailsLoudly: one 404 (legitimately absent) plus
+// one failing probe must still abort the destroy - a partial failure would
+// otherwise silently omit the failing path from the destroy commit.
+func TestDelete_PartialProbeErrorFailsLoudly(t *testing.T) {
+	postCalled := false
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			postCalled = true
+		}
+		if r.Method == http.MethodHead {
+			if strings.Contains(r.URL.Path, "gone.txt") {
+				http.Error(w, "absent", http.StatusNotFound)
+			} else {
+				http.Error(w, "forbidden", http.StatusForbidden)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	state := readState("blob")
+	state.Files["gone.txt"] = fileModel{
+		Content:         types.StringValue("x"),
+		ContentBase64:   types.StringNull(),
+		BlobID:          types.StringValue("blob2"),
+		LastCommitID:    types.StringValue("lcid2"),
+		ExecuteFilemode: types.BoolValue(false),
+	}
+
+	resp := runDelete(t, client, state)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected destroy to fail when any existence probe errors")
+	}
+	if postCalled {
+		t.Error("expected no commit attempt after a failed probe")
+	}
+}

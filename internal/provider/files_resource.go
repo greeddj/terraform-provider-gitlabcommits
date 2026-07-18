@@ -605,6 +605,19 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 	paths := sortedKeys(state.Files)
 	probes := r.probeRemote(ctx, project, branch, paths)
 
+	// A failed probe must fail the destroy: treating it as "absent" would skip
+	// the delete action and let the framework drop the resource from state
+	// while the file may still exist in the repository, silently orphaned.
+	for _, p := range paths {
+		if err := probes[p].err; err != nil {
+			summary, detail := apiErrorDiag(fmt.Sprintf("probing file %q before destroy", p), project, branch, err)
+			resp.Diagnostics.AddError(summary, detail)
+		}
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	actions := make([]*gitlab.CommitActionOptions, 0, len(state.Files))
 	for _, p := range paths {
 		if !probes[p].exists {
@@ -772,8 +785,14 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 // remoteProbe is the result of a HEAD-style metadata probe for one path:
 // whether the file exists at branch HEAD and, if so, its current
 // last_commit_id. The token lets an adopt-update be guarded by optimistic_lock
-// even though there is no prior state for the file.
+// even though there is no prior state for the file. err is set for any probe
+// failure other than a genuine 404 so callers can tell "absent" from
+// "unknown": the adopt paths deliberately ignore it (a spurious create fails
+// loudly at CreateCommit anyway), but Delete must not - skipping a file
+// because a probe errored would let destroy report success while the file
+// still exists in the repository.
 type remoteProbe struct {
+	err          error
 	lastCommitID string
 	exists       bool
 }
@@ -781,13 +800,19 @@ type remoteProbe struct {
 // probeFile reports whether filePath is present at branch HEAD and returns its
 // last_commit_id. Used to rewrite spurious "create" actions into "update" when
 // adopting existing files, to forward a lock token on that adopt-update, and to
-// skip already-deleted paths during destroy. A transport error is treated as
-// "absent" (same as the sequential code it replaced).
+// skip already-deleted paths during destroy. Only a genuine 404 maps to
+// "absent"; any other failure is carried in err.
 func (r *filesResource) probeFile(ctx context.Context, project, branch, filePath string) remoteProbe {
 	meta, _, err := r.client.RepositoryFiles.GetFileMetaData(project, filePath, &gitlab.GetFileMetaDataOptions{
 		Ref: new(branch),
 	}, gitlab.WithContext(ctx))
-	if err != nil || meta == nil {
+	if err != nil {
+		if errors.Is(err, gitlab.ErrNotFound) {
+			return remoteProbe{}
+		}
+		return remoteProbe{err: err}
+	}
+	if meta == nil {
 		return remoteProbe{}
 	}
 	return remoteProbe{exists: true, lastCommitID: meta.LastCommitID}
