@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
@@ -63,8 +64,9 @@ func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, r
 				Required:    true,
 			},
 			"content": schema.StringAttribute{
-				Description: "Decoded text content of the file. Always set; for binaries use content_base64.",
-				Computed:    true,
+				Description: "Decoded text content of the file. Null when the file is not valid UTF-8 " +
+					"(Terraform strings cannot hold arbitrary bytes without corruption); use content_base64 for binaries.",
+				Computed: true,
 			},
 			"content_base64": schema.StringAttribute{
 				Description: "Base64-encoded raw bytes of the file. Always set.",
@@ -134,7 +136,13 @@ func (d *fileDataSource) Read(ctx context.Context, req datasource.ReadRequest, r
 		return
 	}
 
-	data.Content = types.StringValue(string(raw))
+	// cty silently mangles invalid UTF-8 (bytes become U+FFFD), so a binary
+	// file must surface as a null content, not corrupted-but-plausible text.
+	if utf8.Valid(raw) {
+		data.Content = types.StringValue(string(raw))
+	} else {
+		data.Content = types.StringNull()
+	}
 	data.ContentBase64 = types.StringValue(base64.StdEncoding.EncodeToString(raw))
 	data.BlobID = types.StringValue(file.BlobID)
 	data.ExecuteFilemode = types.BoolValue(file.ExecuteFilemode)

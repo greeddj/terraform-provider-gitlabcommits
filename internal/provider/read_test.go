@@ -187,3 +187,39 @@ func TestRead_OversizedBlobIDIgnored(t *testing.T) {
 		t.Errorf("blob_id = %q, want null (oversized ignored)", f.BlobID.ValueString())
 	}
 }
+
+// TestRead_BinaryDriftIntoContentErrors: a file managed via the text content
+// attribute that drifts to invalid UTF-8 must produce an error diagnostic
+// pointing at content_base64 - cty would silently mangle the bytes to U+FFFD
+// and the diff could never converge.
+func TestRead_BinaryDriftIntoContentErrors(t *testing.T) {
+	binary := []byte{0xff, 0xfe, 0x00, 0x01}
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("X-Gitlab-Blob-Id", "newblob")
+			w.Header().Set("X-Gitlab-Last-Commit-Id", "newlcid")
+			w.Header().Set("X-Gitlab-File-Path", "f.txt")
+			w.Header().Set("X-Gitlab-Ref", "main")
+			w.Header().Set("X-Gitlab-Size", "4")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"file_path":"f.txt","blob_id":"newblob","content":"` +
+			base64.StdEncoding.EncodeToString(binary) + `","encoding":"base64","last_commit_id":"newlcid","size":4}`))
+	})
+
+	resp, _ := runRead(t, client, readState("oldblob"))
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an error diagnostic for binary drift into a text-managed file")
+	}
+	found := false
+	for _, d := range resp.Diagnostics.Errors() {
+		if strings.Contains(d.Detail(), "content_base64") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected the diagnostic to point the user at content_base64")
+	}
+}

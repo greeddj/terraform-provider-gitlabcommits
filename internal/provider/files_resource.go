@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -471,6 +472,14 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 		if !f.ContentBase64.IsNull() {
 			f.ContentBase64 = types.StringValue(base64.StdEncoding.EncodeToString(raw))
 		} else {
+			// cty silently replaces invalid UTF-8 with U+FFFD, so storing
+			// binary drift into the text attribute would corrupt state and
+			// produce a diff that can never converge.
+			if !utf8.Valid(raw) {
+				resp.Diagnostics.AddError("Remote file is not valid UTF-8",
+					fmt.Sprintf("file %q drifted to binary content that cannot be represented in the text `content` attribute; manage this file via `content_base64` instead", p))
+				return
+			}
 			f.Content = types.StringValue(string(raw))
 		}
 		state.Files[p] = f
