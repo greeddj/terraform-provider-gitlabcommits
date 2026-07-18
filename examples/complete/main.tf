@@ -12,7 +12,7 @@ provider "gitlabcommits" {
 }
 
 variable "gitlab_token" {
-  description = "GitLab Personal/Project Access Token with the `api` scope and write_repository permission."
+  description = "GitLab Personal/Project Access Token with the `api` scope."
   type        = string
   sensitive   = true
 }

@@ -1,8 +1,9 @@
 terraform {
   required_providers {
     gitlabcommits = {
-      source  = "greeddj/gitlabcommits"
-      version = "~> 0.2"
+      source = "greeddj/gitlabcommits"
+      # Pin a version once you depend on released behaviour, e.g.:
+      # version = "~> 1.0"
     }
   }
 }

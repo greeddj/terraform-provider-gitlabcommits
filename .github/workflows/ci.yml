@@ -49,6 +49,25 @@ jobs:
       - name: Check terraform fmt (examples)
         run: terraform fmt -check -recursive examples/
 
+      - name: Validate example modules
+        # dev_overrides lets terraform validate resolve the provider from the
+        # local build without terraform init or a published release.
+        run: |
+          mkdir -p /tmp/tf-provider
+          go build -o /tmp/tf-provider/terraform-provider-gitlabcommits .
+          cat > /tmp/dev.tfrc <<'EOF'
+          provider_installation {
+            dev_overrides {
+              "greeddj/gitlabcommits" = "/tmp/tf-provider"
+            }
+            direct {}
+          }
+          EOF
+          for dir in examples/complete examples/for_each examples/provider; do
+            echo "validating $dir"
+            (cd "$dir" && TF_CLI_CONFIG_FILE=/tmp/dev.tfrc terraform validate) || exit 1
+          done
+
       - name: Verify generated docs are in sync
         # git status --porcelain also catches brand-new untracked doc pages,
         # which git diff would silently ignore.

@@ -152,7 +152,7 @@ resource "gitlabcommits_files" "service" {
 
 20 resources → 20 commits per apply → 20 pipeline runs. Not 600.
 
-A complete example lives in [`examples/for_each_example.tf`](examples/for_each_example.tf).
+A complete example lives in [`examples/for_each/main.tf`](examples/for_each/main.tf).
 
 ## Import
 
