@@ -21,7 +21,8 @@ import (
 //	TF_ACC=1
 //	GITLAB_TOKEN=<token with `api` scope; see README Authentication>
 //	GITLAB_TEST_PROJECT_ID=<group/project> (URL-encoded path or numeric ID)
-//	GITLAB_TEST_BRANCH=<branch>             (defaults to a unique throwaway branch)
+//	GITLAB_TEST_BRANCH=<branch>             (defaults to "tf-acc-test"; must pre-exist unless GITLAB_TEST_BRANCH_FROM is set)
+//	GITLAB_TEST_BRANCH_FROM=<ref>           (optional; materialise the branch from this ref and delete it after the test)
 //	GITLAB_BASE_URL=<https://gitlab.example.com>  (optional)
 //
 // Each test is responsible for cleaning up the files it creates so the project
@@ -135,18 +136,41 @@ func TestAccFiles_import(t *testing.T) {
 
 // --- helpers ---
 
+// accBranchFrom returns the source ref the test branch is materialised from
+// (GITLAB_TEST_BRANCH_FROM), or "" when the branch is expected to pre-exist.
+func accBranchFrom() string {
+	return os.Getenv("GITLAB_TEST_BRANCH_FROM")
+}
+
 // accBranch returns the branch to test against, defaulting to a fixed name so
-// repeated test runs are idempotent against the same project.
+// repeated test runs are idempotent against the same project. When the branch
+// is materialised via GITLAB_TEST_BRANCH_FROM it is deleted after the test so
+// unique per-run branches (CI) do not pile up in the test project.
 func accBranch(t *testing.T) string {
 	t.Helper()
-	if b := os.Getenv("GITLAB_TEST_BRANCH"); b != "" {
-		return b
+	branch := os.Getenv("GITLAB_TEST_BRANCH")
+	if branch == "" {
+		branch = "tf-acc-test"
 	}
-	return "tf-acc-test"
+	if accBranchFrom() != "" {
+		t.Cleanup(func() {
+			c, err := accClient()
+			if err != nil {
+				t.Logf("cleanup: cannot build client to delete branch %q: %v", branch, err)
+				return
+			}
+			if _, err := c.Branches.DeleteBranch(os.Getenv("GITLAB_TEST_PROJECT_ID"), branch); err != nil {
+				t.Logf("cleanup: could not delete branch %q: %v", branch, err)
+			}
+		})
+	}
+	return branch
 }
 
 // accConfig renders a minimal HCL config exercising the resource for a given
-// set of (path, content) entries.
+// set of (path, content) entries. When GITLAB_TEST_BRANCH_FROM is set the
+// config carries create_branch_from so the provider materialises the branch
+// on first apply (unique per-run branches in CI never pre-exist).
 func accConfig(project, branch string, files map[string]string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `
@@ -156,8 +180,11 @@ resource "gitlabcommits_files" "test" {
   project_id     = %q
   branch         = %q
   commit_message = "tf-acc-test"
-  files = {
 `, project, branch)
+	if from := accBranchFrom(); from != "" {
+		fmt.Fprintf(&b, "  create_branch_from = %q\n", from)
+	}
+	b.WriteString("  files = {\n")
 	for path, content := range files {
 		fmt.Fprintf(&b, "    %q = { content = %q }\n", path, content)
 	}

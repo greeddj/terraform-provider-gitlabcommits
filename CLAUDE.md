@@ -30,7 +30,8 @@ Acceptance tests hit a real GitLab project and are gated behind env vars (skippe
 TF_ACC=1 \
 GITLAB_TOKEN=<api scope; see README Authentication> \
 GITLAB_TEST_PROJECT_ID=<group/project or numeric id> \
-GITLAB_TEST_BRANCH=tf-acc-test \      # optional; defaults to "tf-acc-test"
+GITLAB_TEST_BRANCH=tf-acc-test \      # optional; defaults to "tf-acc-test"; must pre-exist unless GITLAB_TEST_BRANCH_FROM is set
+GITLAB_TEST_BRANCH_FROM=main \        # optional; materialise the branch from this ref, delete it after the test
 GITLAB_BASE_URL=https://gitlab.example.com \  # optional, for self-hosted
 go test -v ./internal/provider -run TestAccFiles_basic
 ```

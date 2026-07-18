@@ -14,7 +14,8 @@ Acceptance tests in this provider hit a **real GitLab project**. They're gated b
 | `TF_ACC` | yes | — | Must be `1`. Without it, acceptance tests skip. |
 | `GITLAB_TOKEN` | yes | — | Personal, Project, or Group access token with the `api` scope. See README Authentication. |
 | `GITLAB_TEST_PROJECT_ID` | yes | — | Group/project path (e.g. `my-group/sandbox`) or numeric ID. |
-| `GITLAB_TEST_BRANCH` | no | `tf-acc-test` | Branch to run against. It must already exist: the test config does not set `create_branch_from`, and no test code creates or deletes branches. |
+| `GITLAB_TEST_BRANCH` | no | `tf-acc-test` | Branch to run against. Must pre-exist unless `GITLAB_TEST_BRANCH_FROM` is set. |
+| `GITLAB_TEST_BRANCH_FROM` | no | - | When set, `accConfig` renders `create_branch_from` with this ref (the provider materialises the branch on first apply) and `accBranch` deletes the branch after the test. CI sets it to `main` with a unique per-run branch name. |
 | `GITLAB_BASE_URL` | no | gitlab.com | Set for self-hosted GitLab. |
 
 ## Run one test

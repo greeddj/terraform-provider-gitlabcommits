@@ -53,10 +53,18 @@ jobs:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TEST_TOKEN }}
           GITLAB_BASE_URL: ${{ secrets.GITLAB_TEST_BASE_URL }}
           GITLAB_TEST_PROJECT_ID: ${{ secrets.GITLAB_TEST_PROJECT_ID }}
+          # Unique per-run branch: the test config materialises it via
+          # create_branch_from and deletes it in cleanup, so runs never
+          # collide and never leave branches behind.
           GITLAB_TEST_BRANCH: 'tf-acc-test-${{ github.run_id }}'
+          GITLAB_TEST_BRANCH_FROM: 'main'
         run: |
           if [ -z "$GITLAB_TOKEN" ] || [ -z "$GITLAB_TEST_PROJECT_ID" ]; then
-            echo "::warning::GITLAB_TEST_TOKEN / GITLAB_TEST_PROJECT_ID secrets not configured — skipping acceptance tests"
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "::error::GITLAB_TEST_TOKEN / GITLAB_TEST_PROJECT_ID secrets not configured - a manual run cannot silently skip"
+              exit 1
+            fi
+            echo "::warning::GITLAB_TEST_TOKEN / GITLAB_TEST_PROJECT_ID secrets not configured - skipping acceptance tests"
             exit 0
           fi
           go test -v -timeout=20m -run '^TestAcc' ./internal/...
