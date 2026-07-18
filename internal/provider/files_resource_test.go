@@ -454,6 +454,12 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 				BlobID:          types.StringValue("opaque-blob-b"),
 				LastCommitID:    types.StringValue("commit-B"),
 			},
+			"c.sh": {
+				Content:         types.StringValue("#!/bin/sh\n"),
+				ExecuteFilemode: types.BoolValue(false),
+				BlobID:          types.StringValue("opaque-blob-c"),
+				LastCommitID:    types.StringValue("commit-C"),
+			},
 		},
 	}
 
@@ -466,6 +472,10 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 				Content:         types.StringValue("v2"),
 				ExecuteFilemode: types.BoolValue(false),
 			},
+			"c.sh": { // exec bit flipped, content unchanged → chmod only
+				Content:         types.StringValue("#!/bin/sh\n"),
+				ExecuteFilemode: types.BoolValue(true),
+			},
 			// b.yaml gone → delete
 		},
 	}
@@ -477,7 +487,12 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := lastCommitIDs(actions)
-		want := map[string]string{"a.yaml": "commit-A", "b.yaml": "commit-B"}
+		want := map[string]string{"a.yaml": "commit-A", "b.yaml": "commit-B", "c.sh": "commit-C"}
+		for _, a := range actions {
+			if *a.FilePath == "c.sh" && *a.Action != gitlab.FileChmod {
+				t.Errorf("c.sh action = %s, want chmod (content unchanged, exec flipped)", *a.Action)
+			}
+		}
 		for path, wantSHA := range want {
 			if got[path] != wantSHA {
 				t.Errorf("path=%q got last_commit_id=%q want %q", path, got[path], wantSHA)
@@ -715,9 +730,11 @@ func TestStampBlobs_OneProbeFailure(t *testing.T) {
 			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
 			return
 		}
-		// Route by path segment: "bad-path" → 500, "good-path" → 200 with blob header.
+		// Route by path segment: "bad-path" → 403 (a non-retried failure, so
+		// the test is not stalled by the client's backoff schedule),
+		// "good-path" → 200 with blob header.
 		if strings.Contains(r.URL.Path, "bad-path") {
-			http.Error(w, "internal server error", http.StatusInternalServerError)
+			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		if strings.Contains(r.URL.Path, "good-path") {

@@ -75,7 +75,9 @@ func newReadClient(t *testing.T, h http.HandlerFunc) *gitlab.Client {
 	t.Helper()
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+	// Retries off: unit tests assert on single-shot behavior, and a faked 5xx
+	// would otherwise stall every assertion behind the full backoff schedule.
+	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"), gitlab.WithoutRetries())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -268,5 +270,113 @@ func TestRead_BinaryDriftIntoContentErrors(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected the diagnostic to point the user at content_base64")
+	}
+}
+
+// TestRead_UnchangedBlobSkipsGetFile pins the core drift-detection invariant:
+// when the HEAD probe reports the same blob_id and exec bit as state, Read
+// must not download content - and must refresh last_commit_id only from the
+// probe (a delete-then-re-add with identical content moves the commit id
+// while keeping the blob).
+func TestRead_UnchangedBlobSkipsGetFile(t *testing.T) {
+	cases := []struct {
+		name      string
+		probeLCID string
+	}{
+		{"lcid moved is restamped", "moved-lcid"},
+		{"lcid unchanged stays", "oldlcid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead {
+					w.Header().Set("X-Gitlab-Blob-Id", "oldblob")
+					w.Header().Set("X-Gitlab-Last-Commit-Id", tc.probeLCID)
+					w.Header().Set("X-Gitlab-File-Path", "f.txt")
+					w.Header().Set("X-Gitlab-Ref", "main")
+					w.Header().Set("X-Gitlab-Size", "3")
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				t.Errorf("unexpected %s %s: an unchanged blob must not fetch content", r.Method, r.URL.Path)
+				http.Error(w, "no", http.StatusInternalServerError)
+			})
+
+			resp, out := runRead(t, client, readState("oldblob"))
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+			f := out.Files["f.txt"]
+			if f.LastCommitID.ValueString() != tc.probeLCID {
+				t.Errorf("LastCommitID = %q, want %q", f.LastCommitID.ValueString(), tc.probeLCID)
+			}
+			if f.Content.ValueString() != "old" {
+				t.Errorf("content = %q, want untouched %q", f.Content.ValueString(), "old")
+			}
+			if f.BlobID.ValueString() != "oldblob" {
+				t.Errorf("BlobID = %q, want untouched %q", f.BlobID.ValueString(), "oldblob")
+			}
+		})
+	}
+}
+
+// TestRead_DetectDriftFalseNoAPICalls: detect_drift=false makes Read a pure
+// state pass-through with zero API traffic.
+func TestRead_DetectDriftFalseNoAPICalls(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected API call %s %s with detect_drift=false", r.Method, r.URL.Path)
+		http.Error(w, "no", http.StatusInternalServerError)
+	})
+	state := readState("blob")
+	state.DetectDrift = types.BoolValue(false)
+
+	resp, out := runRead(t, client, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	f := out.Files["f.txt"]
+	if f.Content.ValueString() != "old" || f.BlobID.ValueString() != "blob" {
+		t.Errorf("state must be preserved verbatim, got content=%q blob=%q", f.Content.ValueString(), f.BlobID.ValueString())
+	}
+}
+
+// TestRead_Base64FormPreservedOnDrift: a file managed via content_base64 keeps
+// that form on refresh, and binary bytes are legal there.
+func TestRead_Base64FormPreservedOnDrift(t *testing.T) {
+	binary := []byte{0xff, 0xfe, 0x00, 0x01}
+	encoded := base64.StdEncoding.EncodeToString(binary)
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("X-Gitlab-Blob-Id", "newblob")
+			w.Header().Set("X-Gitlab-Last-Commit-Id", "newlcid")
+			w.Header().Set("X-Gitlab-File-Path", "f.txt")
+			w.Header().Set("X-Gitlab-Ref", "main")
+			w.Header().Set("X-Gitlab-Size", "4")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"file_path":"f.txt","blob_id":"newblob","content":"` + encoded + `","encoding":"base64","last_commit_id":"newlcid","size":4}`))
+	})
+
+	state := readState("oldblob")
+	f := state.Files["f.txt"]
+	f.Content = types.StringNull()
+	f.ContentBase64 = types.StringValue(base64.StdEncoding.EncodeToString([]byte("old")))
+	state.Files["f.txt"] = f
+
+	resp, out := runRead(t, client, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	got := out.Files["f.txt"]
+	if !got.Content.IsNull() {
+		t.Errorf("content must stay null for a base64-managed file, got %q", got.Content.ValueString())
+	}
+	if got.ContentBase64.ValueString() != encoded {
+		t.Errorf("content_base64 = %q, want %q", got.ContentBase64.ValueString(), encoded)
+	}
+	if got.BlobID.ValueString() != "newblob" {
+		t.Errorf("BlobID = %q, want %q", got.BlobID.ValueString(), "newblob")
 	}
 }

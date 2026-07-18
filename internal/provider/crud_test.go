@@ -5,6 +5,7 @@ package provider
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -317,5 +318,269 @@ func TestCreate_EmptyRepositoryDiagnostics(t *testing.T) {
 		if !found {
 			t.Errorf("withFrom=%v: diagnostic must explain the repository has no commits, got: %v", withFrom, resp.Diagnostics.Errors())
 		}
+	}
+}
+
+// TestCreate_HappyPathStampsState: a clean create must land one commit and
+// stamp commit_sha, id, blob_id, and last_commit_id in state from the fake
+// server's responses.
+func TestCreate_HappyPathStampsState(t *testing.T) {
+	var commitBody string
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "main":
+			// Adopt probe before the commit: path does not exist yet.
+			http.Error(w, "absent", http.StatusNotFound)
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "newsha":
+			// stampBlobs probe at the created commit.
+			w.Header().Set("X-Gitlab-Blob-Id", "stampedblob")
+			w.Header().Set("X-Gitlab-Last-Commit-Id", "newsha")
+			w.Header().Set("X-Gitlab-File-Path", "f.txt")
+			w.Header().Set("X-Gitlab-Ref", "newsha")
+			w.Header().Set("X-Gitlab-Size", "3")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost:
+			b, _ := io.ReadAll(r.Body)
+			commitBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"newsha"}`))
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	})
+
+	resp := runCreate(t, client, readState("ignored"))
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if !strings.Contains(commitBody, `"action":"create"`) {
+		t.Errorf("commit body must carry a create action, got: %s", commitBody)
+	}
+
+	var out filesResourceModel
+	if d := resp.State.Get(context.Background(), &out); d.HasError() {
+		t.Fatalf("state.Get: %v", d)
+	}
+	if out.CommitSHA.ValueString() != "newsha" {
+		t.Errorf("commit_sha = %q, want %q", out.CommitSHA.ValueString(), "newsha")
+	}
+	if out.ID.ValueString() != "proj::main" {
+		t.Errorf("id = %q, want %q", out.ID.ValueString(), "proj::main")
+	}
+	f := out.Files["f.txt"]
+	if f.BlobID.ValueString() != "stampedblob" || f.LastCommitID.ValueString() != "newsha" {
+		t.Errorf("stamped blob/lcid = %q/%q, want stampedblob/newsha", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+	}
+}
+
+// TestCreate_AdoptRewritesToUpdateEndToEnd: Create's own adopt branch (not the
+// diffActions copy) must rewrite create into update and forward the probed
+// lock token into the commit body.
+func TestCreate_AdoptRewritesToUpdateEndToEnd(t *testing.T) {
+	var commitBody string
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "main":
+			// Adopt probe: the path already exists remotely.
+			w.Header().Set("X-Gitlab-Blob-Id", "remoteblob")
+			w.Header().Set("X-Gitlab-Last-Commit-Id", "adopt-lcid")
+			w.Header().Set("X-Gitlab-File-Path", "f.txt")
+			w.Header().Set("X-Gitlab-Ref", "main")
+			w.Header().Set("X-Gitlab-Size", "3")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "adsha":
+			w.Header().Set("X-Gitlab-Blob-Id", "stampedblob")
+			w.Header().Set("X-Gitlab-Last-Commit-Id", "adsha")
+			w.Header().Set("X-Gitlab-File-Path", "f.txt")
+			w.Header().Set("X-Gitlab-Ref", "adsha")
+			w.Header().Set("X-Gitlab-Size", "3")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost:
+			b, _ := io.ReadAll(r.Body)
+			commitBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"adsha"}`))
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	})
+
+	resp := runCreate(t, client, readState("ignored"))
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if !strings.Contains(commitBody, `"action":"update"`) {
+		t.Errorf("adopt must rewrite create into update, body: %s", commitBody)
+	}
+	if !strings.Contains(commitBody, `"last_commit_id":"adopt-lcid"`) {
+		t.Errorf("adopt-update must carry the probed lock token, body: %s", commitBody)
+	}
+}
+
+// TestUpdate_HappyPathStampsState: a content change pushes one commit and
+// restamps computed fields from the created commit.
+func TestUpdate_HappyPathStampsState(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "upsha":
+			w.Header().Set("X-Gitlab-Blob-Id", "upblob")
+			w.Header().Set("X-Gitlab-Last-Commit-Id", "upsha")
+			w.Header().Set("X-Gitlab-File-Path", "f.txt")
+			w.Header().Set("X-Gitlab-Ref", "upsha")
+			w.Header().Set("X-Gitlab-Size", "7")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"upsha"}`))
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	})
+
+	state := readState("oldblob")
+	plan := readState("oldblob")
+	pf := plan.Files["f.txt"]
+	pf.Content = types.StringValue("changed")
+	plan.Files["f.txt"] = pf
+
+	resp := runUpdate(t, client, plan, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	var out filesResourceModel
+	if d := resp.State.Get(context.Background(), &out); d.HasError() {
+		t.Fatalf("state.Get: %v", d)
+	}
+	if out.CommitSHA.ValueString() != "upsha" {
+		t.Errorf("commit_sha = %q, want %q", out.CommitSHA.ValueString(), "upsha")
+	}
+	f := out.Files["f.txt"]
+	if f.BlobID.ValueString() != "upblob" || f.LastCommitID.ValueString() != "upsha" {
+		t.Errorf("stamped blob/lcid = %q/%q, want upblob/upsha", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+	}
+}
+
+// TestEnsureBranch drives every ensureBranch branch directly: present branch,
+// non-404 lookup failure, absent branch without a source ref, successful
+// creation with the right payload, and a failing creation.
+func TestEnsureBranch(t *testing.T) {
+	t.Run("branch exists", func(t *testing.T) {
+		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		})
+		r := &filesResource{client: client}
+		if err := r.ensureBranch(context.Background(), "proj", "main", ""); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("non-404 lookup failure", func(t *testing.T) {
+		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+		})
+		r := &filesResource{client: client}
+		err := r.ensureBranch(context.Background(), "proj", "main", "")
+		if err == nil || !strings.Contains(err.Error(), "checking branch") {
+			t.Fatalf("want a checking-branch error, got: %v", err)
+		}
+	})
+
+	t.Run("absent without create_branch_from", func(t *testing.T) {
+		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/branches/") {
+				http.Error(w, "no branch", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+		})
+		r := &filesResource{client: client}
+		err := r.ensureBranch(context.Background(), "proj", "feature", "")
+		if err == nil || !strings.Contains(err.Error(), "create_branch_from") {
+			t.Fatalf("want the create_branch_from hint, got: %v", err)
+		}
+	})
+
+	t.Run("creates branch from ref", func(t *testing.T) {
+		var createBody string
+		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+				http.Error(w, "no branch", http.StatusNotFound)
+			case r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/branches"):
+				b, _ := io.ReadAll(r.Body)
+				createBody = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"name":"feature","commit":{"id":"base"}}`))
+			default:
+				t.Errorf("unexpected call %s %s", r.Method, r.URL.Path)
+				http.Error(w, "unexpected", http.StatusInternalServerError)
+			}
+		})
+		r := &filesResource{client: client}
+		if err := r.ensureBranch(context.Background(), "proj", "feature", "main"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(createBody, `"branch":"feature"`) || !strings.Contains(createBody, `"ref":"main"`) {
+			t.Errorf("create-branch payload must carry branch and ref, got: %s", createBody)
+		}
+	})
+
+	t.Run("creation fails", func(t *testing.T) {
+		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+				http.Error(w, "no branch", http.StatusNotFound)
+			case r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+			default:
+				http.Error(w, "bad ref", http.StatusBadRequest)
+			}
+		})
+		r := &filesResource{client: client}
+		err := r.ensureBranch(context.Background(), "proj", "feature", "nope")
+		if err == nil || !strings.Contains(err.Error(), `creating branch "feature" from "nope"`) {
+			t.Fatalf("want a creating-branch error naming the ref, got: %v", err)
+		}
+	})
+}
+
+// TestCommitOptions_AuthorPropagation: author overrides reach the commit
+// options only when set.
+func TestCommitOptions_AuthorPropagation(t *testing.T) {
+	m := filesResourceModel{
+		Branch:        types.StringValue("main"),
+		CommitMessage: types.StringValue("msg"),
+		AuthorEmail:   types.StringValue("a@b.c"),
+		AuthorName:    types.StringValue("Author"),
+	}
+	opts := commitOptions(m, nil)
+	if opts.AuthorEmail == nil || *opts.AuthorEmail != "a@b.c" || opts.AuthorName == nil || *opts.AuthorName != "Author" {
+		t.Errorf("author fields must propagate, got %+v", opts)
+	}
+
+	m.AuthorEmail = types.StringNull()
+	m.AuthorName = types.StringNull()
+	opts = commitOptions(m, nil)
+	if opts.AuthorEmail != nil || opts.AuthorName != nil {
+		t.Error("null author fields must stay unset in commit options")
 	}
 }
