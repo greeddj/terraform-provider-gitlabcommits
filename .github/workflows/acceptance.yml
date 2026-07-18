@@ -27,8 +27,10 @@ jobs:
     name: Acceptance
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # If GITLAB_TOKEN secret is not set the job becomes a no-op so forks /
-    # community contributors don't see red CI for missing secrets.
+    # If GITLAB_TOKEN secret is not set, scheduled/push runs become a no-op so
+    # forks / community contributors don't see red CI for missing secrets; a
+    # manual workflow_dispatch instead fails loudly (see the run step) so it
+    # cannot silently skip.
     if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'greeddj/terraform-provider-gitlabcommits' }}
     steps:
       - name: Checkout code

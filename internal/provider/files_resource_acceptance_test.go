@@ -278,10 +278,10 @@ func TestAccFiles_optimisticLockConflict(t *testing.T) {
 	branch := accBranch(t)
 	path := accTestPathPrefix + "lock/f.txt"
 
-	cfg := func(content string) string {
+	cfg := func(content string, lock bool) string {
 		var b strings.Builder
 		b.WriteString(accResourceHeader(project, branch))
-		b.WriteString("  detect_drift = false\n  files = {\n")
+		fmt.Fprintf(&b, "  detect_drift    = false\n  optimistic_lock = %t\n  files = {\n", lock)
 		fmt.Fprintf(&b, "    %q = { content = %q }\n", path, content)
 		b.WriteString("  }\n}\n")
 		return b.String()
@@ -290,7 +290,7 @@ func TestAccFiles_optimisticLockConflict(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
-			{Config: cfg("v1\n")},
+			{Config: cfg("v1\n", true)},
 			{
 				PreConfig: func() {
 					c, err := accClient()
@@ -306,12 +306,15 @@ func TestAccFiles_optimisticLockConflict(t *testing.T) {
 						t.Fatalf("out-of-band update: %v", err)
 					}
 				},
-				Config:      cfg("v2\n"),
+				Config:      cfg("v2\n", true),
 				ExpectError: regexp.MustCompile(`Concurrent modification detected`),
 			},
-			// Converge again so the destroy step does not trip over the stale
-			// lock token: re-enable drift detection to refresh state first.
-			{Config: strings.Replace(cfg("v2\n"), "detect_drift = false", "detect_drift = true", 1)},
+			// Recovery: the failed apply left the prior state untouched
+			// (stale token, detect_drift=false blocks a refresh from
+			// helping), so re-applying with the lock would 400 forever.
+			// Disabling the lock lets the update land; stampBlobs then
+			// restamps fresh tokens so the automatic destroy converges.
+			{Config: cfg("v2\n", false)},
 		},
 	})
 }
