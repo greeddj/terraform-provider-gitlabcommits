@@ -34,6 +34,14 @@ check-tf-fmt:
 	@echo "===== Check Terraform fmt ====="
 	terraform fmt -check -recursive examples/
 
+check-examples:
+	@echo "===== Validate example modules ====="
+	./scripts/validate-examples.sh
+
+check-deps:
+	@echo "===== Verify go.mod/go.sum are tidy ====="
+	go mod tidy -diff
+
 docs:
 	@echo "===== Regenerate provider docs ====="
 	go generate ./...
@@ -56,5 +64,5 @@ build: check lint test
 	test -f dist/{{PROJECT}} && rm -f dist/{{PROJECT}} || echo "Not exist dist/{{PROJECT}}"
 	CGO_ENABLED=0 go build -trimpath -ldflags="{{LDFLAGS}}" -o ./dist/{{PROJECT}} main.go
 
-ci: check lint test check-tf-fmt docs-check headers-check
+ci: check lint test check-tf-fmt check-examples docs-check headers-check check-deps
 	@echo "===== CI gate passed for {{PROJECT}} ====="

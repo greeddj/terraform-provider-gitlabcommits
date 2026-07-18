@@ -36,7 +36,7 @@ GITLAB_BASE_URL=https://gitlab.example.com \  # optional, for self-hosted
 go test -v ./internal/provider -run TestAccFiles_basic
 ```
 
-`just ci` is the exact aggregate CI runs locally (`check` + `lint` + `test` + `check-tf-fmt` + `docs-check` + `headers-check`). Dependencies are resolved from the module cache (no `vendor/`); CI fails if `go.mod`, `go.sum`, `docs/`, or copywrite headers are out of sync.
+`just ci` is the exact aggregate CI runs locally (`check` + `lint` + `test` + `check-tf-fmt` + `check-examples` + `docs-check` + `headers-check` + `check-deps`). Dependencies are resolved from the module cache (no `vendor/`); CI fails if `go.mod`, `go.sum`, `docs/`, or copywrite headers are out of sync.
 
 ## Architecture
 
@@ -72,7 +72,7 @@ State mutation stays serial: every goroutine writes only into its own slot in a 
 
 ### Optimistic locking
 
-`optimistic_lock = true` (default) sends each action's `last_commit_id` (the commit SHA we last observed touching the file). GitLab rejects the action with HTTP 400 if anything else has touched the file since. [`apiErrorDiag`](internal/provider/files_resource.go) inspects the response body to convert that 400 into a "Concurrent modification detected" diagnostic with actionable guidance, instead of a generic API error. After every successful commit, `stampBlobs` refreshes `blob_id` and `last_commit_id` via a parallel HEAD-style metadata fan-out (same `refreshParallelism` errgroup pattern as `Read`). On probe success `last_commit_id` comes from the server's response, so a writer that raced our commit stays visible to optimistic locking; the commit SHA is only the fallback stamp when a probe fails - `blob_id` is then left null with a warning and the next `Read` repopulates it.
+`optimistic_lock = true` (default) sends each action's `last_commit_id` (the commit SHA we last observed touching the file). GitLab rejects the action with HTTP 400 if anything else has touched the file since. [`apiErrorDiag`](internal/provider/files_resource.go) inspects the response body to convert that 400 into a "Concurrent modification detected" diagnostic with actionable guidance, instead of a generic API error. After every successful commit, `stampBlobs` refreshes `blob_id` and `last_commit_id` via a parallel HEAD-style metadata fan-out (same `refreshParallelism` errgroup pattern as `Read`), probing at `Ref = commitSHA` (the commit just created, NOT branch HEAD) so a racing writer's values never land in state next to our content - the next locked apply still carries our commit SHA and GitLab rejects it with the concurrent-modification 400, while the next `Read` sees the racer's blob differ and surfaces the drift. Per-file `last_commit_id` comes from the probe response, so files the commit did not touch keep their older commit id. The commit SHA is only the fallback stamp when a probe fails - `blob_id` is then left null with a warning and the next `Read` repopulates it.
 
 ### Provider client
 

@@ -212,7 +212,7 @@ just build       # check + lint + test, then a static binary in ./dist
 just test        # unit tests (go test ./...)
 just lint        # golangci-lint
 just check       # go vet + staticcheck + govulncheck + fieldalignment
-just ci          # the full CI gate: check + lint + test + tf-fmt + docs + headers
+just ci          # the full CI gate: check + lint + test + tf-fmt + examples + docs + headers + deps
 ```
 
 Acceptance tests run against a real GitLab project and are gated by env vars:

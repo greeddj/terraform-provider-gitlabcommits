@@ -9,7 +9,7 @@ short — please read all of it.
 git clone https://github.com/greeddj/terraform-provider-gitlabcommits
 cd terraform-provider-gitlabcommits
 
-just ci        # the full CI gate: check + lint + test + tf-fmt + docs + headers
+just ci        # the full CI gate: check + lint + test + tf-fmt + examples + docs + headers + deps
 just docs      # regenerate the docs (uses tfplugindocs)
 just build     # local binary in ./dist (runs check + lint + test first)
 ```
@@ -26,8 +26,9 @@ a one-liner you can run manually — see the `Justfile`.
    - `just check` (`go vet`, `staticcheck`, `govulncheck`, `fieldalignment`)
    - `just lint` (`golangci-lint`, including the `gofmt` formatter)
    - `just test` (`go test ./...`)
-   - `terraform fmt -check` over `examples/`
+   - `terraform fmt -check` and `terraform validate` over `examples/`
    - generated-docs and copywrite-header sync checks
+   - `go mod tidy -diff`
 3. **Regenerate docs** if you changed any schema:
    `just docs` or `go generate ./...`. CI fails if `docs/` is out of sync.
 4. **Use a conventional commit title** (`feat:`, `fix:`, `docs:`, `chore:`,
