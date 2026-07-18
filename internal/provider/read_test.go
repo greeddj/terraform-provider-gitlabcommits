@@ -84,11 +84,17 @@ func newReadClient(t *testing.T, h http.HandlerFunc) *gitlab.Client {
 
 // TestRead_DropsMissingFile covers the drift drop-pass (tests-coverage A): a
 // managed file that 404s on the metadata probe is removed from state so the
-// next plan recreates it.
+// next plan recreates it. The branch itself still exists, so the resource
+// stays in state.
 func TestRead_DropsMissingFile(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			http.Error(w, "gone", http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"head"}}`))
 			return
 		}
 		http.Error(w, "unexpected GET", http.StatusInternalServerError)
@@ -98,8 +104,49 @@ func TestRead_DropsMissingFile(t *testing.T) {
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
 	}
+	if resp.State.Raw.IsNull() {
+		t.Fatal("resource must stay in state while the branch exists")
+	}
 	if _, ok := out.Files["f.txt"]; ok {
 		t.Fatalf("expected f.txt to be dropped from state, still present")
+	}
+}
+
+// TestRead_BranchGoneRemovesResource: when every managed file vanishes AND the
+// branch itself 404s, the resource must be removed from state (with a warning)
+// instead of surviving as a stranded shell with an empty files map.
+func TestRead_BranchGoneRemovesResource(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "gone", http.StatusNotFound)
+	})
+
+	resp, _ := runRead(t, client, readState("oldblob"))
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if !resp.State.Raw.IsNull() {
+		t.Fatal("expected the resource to be removed from state when the branch is gone")
+	}
+	if len(resp.Diagnostics) == 0 {
+		t.Error("expected a warning diagnostic explaining the removal")
+	}
+}
+
+// TestRead_BranchCheckErrorFails: if the confirming branch lookup fails with a
+// non-404, Read must error instead of guessing between "deleted" and
+// "temporarily unreachable".
+func TestRead_BranchCheckErrorFails(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			http.Error(w, "gone", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+
+	resp, _ := runRead(t, client, readState("oldblob"))
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an error when the branch check fails")
 	}
 }
 

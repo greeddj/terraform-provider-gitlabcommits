@@ -424,6 +424,27 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 		return
 	}
 
+	// Every managed file 404-ing at once usually means the container vanished
+	// (branch or project deleted out of band, or the token lost access -
+	// GitLab answers 404 for all three). Silently emptying the files map would
+	// strand the resource with state no apply can fix; drop it from state
+	// instead so the next apply recreates everything from scratch.
+	if allDropped(results) {
+		_, _, err := r.client.Branches.GetBranch(project, branch, gitlab.WithContext(ctx))
+		if err != nil {
+			if errors.Is(err, gitlab.ErrNotFound) {
+				resp.Diagnostics.AddWarning("Branch no longer exists",
+					fmt.Sprintf("branch %q in project %q is gone (deleted out of band, project removed, or the token lost access); "+
+						"removing the resource from state so the next apply can recreate it", branch, project))
+				resp.State.RemoveResource(ctx)
+				return
+			}
+			summary, detail := apiErrorDiag("checking branch after all managed files vanished", project, branch, err)
+			resp.Diagnostics.AddError(summary, detail)
+			return
+		}
+	}
+
 	for i, p := range paths {
 		res := results[i]
 		if res.drop {
@@ -486,6 +507,18 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+func allDropped(results []fileRefreshResult) bool {
+	if len(results) == 0 {
+		return false
+	}
+	for i := range results {
+		if !results[i].drop {
+			return false
+		}
+	}
+	return true
 }
 
 // fileRefreshResult is the per-file outcome of a parallel refresh probe.
