@@ -238,7 +238,7 @@ func TestBuildAction(t *testing.T) {
 		}
 	})
 
-	t.Run("base64-update-with-exec-and-lock", func(t *testing.T) {
+	t.Run("base64-update-with-lock", func(t *testing.T) {
 		enc := base64.StdEncoding.EncodeToString([]byte("hi"))
 		a, err := buildAction("a.bin", fileModel{
 			ContentBase64:   types.StringValue(enc),
@@ -250,11 +250,26 @@ func TestBuildAction(t *testing.T) {
 		if *a.Action != gitlab.FileUpdate || *a.Encoding != "base64" || *a.Content != enc {
 			t.Fatalf("unexpected action: %+v", a)
 		}
-		if a.ExecuteFilemode == nil || !*a.ExecuteFilemode {
-			t.Fatalf("expected exec bit set")
+		// The commits API ignores execute_filemode on update, so buildAction
+		// must not send it there; exec changes travel as separate chmods.
+		if a.ExecuteFilemode != nil {
+			t.Fatalf("ExecuteFilemode must be unset on update actions")
 		}
 		if a.LastCommitID == nil || *a.LastCommitID != "abc123def" {
 			t.Fatalf("expected last_commit_id propagated")
+		}
+	})
+
+	t.Run("create-with-exec", func(t *testing.T) {
+		a, err := buildAction("tool.sh", fileModel{
+			Content:         types.StringValue("#!/bin/sh\n"),
+			ExecuteFilemode: types.BoolValue(true),
+		}, gitlab.FileCreate, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.ExecuteFilemode == nil || !*a.ExecuteFilemode {
+			t.Fatalf("expected exec bit set on create")
 		}
 	})
 

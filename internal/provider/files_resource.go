@@ -297,25 +297,12 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 
 	actions := make([]*gitlab.CommitActionOptions, 0, len(plan.Files))
 	for _, p := range paths {
-		f := plan.Files[p]
-		op := gitlab.FileCreate
-		// On Create there is no prior state. When adopting a file that already
-		// exists remotely, forward its current last_commit_id under
-		// optimistic_lock so the adopt-update fails on a concurrent writer
-		// instead of blindly overwriting it.
-		lastCommitID := ""
-		if probes[p].exists {
-			op = gitlab.FileUpdate
-			if useLock {
-				lastCommitID = probes[p].lastCommitID
-			}
-		}
-		a, err := buildAction(p, f, op, lastCommitID)
+		acts, err := adoptAwareActions(p, plan.Files[p], probes[p], useLock)
 		if err != nil {
 			resp.Diagnostics.AddAttributeError(path.Root("files").AtMapKey(p), "Invalid file", err.Error())
 			return
 		}
-		actions = append(actions, a)
+		actions = append(actions, acts...)
 	}
 
 	tflog.Debug(ctx, "Creating GitLab files commit", map[string]any{
@@ -705,30 +692,18 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 		pf := plan.Files[p]
 		sf, exists := state.Files[p]
 
-		raw, err := pf.rawBytes()
-		if err != nil {
-			return nil, fmt.Errorf("file %q: %w", p, err)
-		}
-
 		if !exists {
-			op := gitlab.FileCreate
-			lastCommitID := ""
-			if probes[p].exists {
-				op = gitlab.FileUpdate
-				// Adopting an existing file: forward the probed last_commit_id
-				// under optimistic_lock so the overwrite still fails on a
-				// concurrent writer instead of blindly clobbering it.
-				if useLock {
-					lastCommitID = probes[p].lastCommitID
-				}
-			}
-			var a *gitlab.CommitActionOptions
-			a, err = buildAction(p, pf, op, lastCommitID)
+			acts, err := adoptAwareActions(p, pf, probes[p], useLock)
 			if err != nil {
 				return nil, fmt.Errorf("file %q: %w", p, err)
 			}
-			actions = append(actions, a)
+			actions = append(actions, acts...)
 			continue
+		}
+
+		raw, err := pf.rawBytes()
+		if err != nil {
+			return nil, fmt.Errorf("file %q: %w", p, err)
 		}
 
 		lastCommitID := ""
@@ -792,9 +767,10 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 // because a probe errored would let destroy report success while the file
 // still exists in the repository.
 type remoteProbe struct {
-	err          error
-	lastCommitID string
-	exists       bool
+	err             error
+	lastCommitID    string
+	exists          bool
+	executeFilemode bool
 }
 
 // probeFile reports whether filePath is present at branch HEAD and returns its
@@ -815,7 +791,44 @@ func (r *filesResource) probeFile(ctx context.Context, project, branch, filePath
 	if meta == nil {
 		return remoteProbe{}
 	}
-	return remoteProbe{exists: true, lastCommitID: meta.LastCommitID}
+	return remoteProbe{exists: true, lastCommitID: meta.LastCommitID, executeFilemode: meta.ExecuteFilemode}
+}
+
+// adoptAwareActions builds the action set for a path with no prior state: a
+// plain create, or - when the path already exists remotely - an adopt-update
+// carrying the probed lock token. The commits API honors execute_filemode only
+// on create and chmod actions, so an adopt-update cannot set the exec bit
+// itself; when the remote bit differs from the plan a companion chmod is
+// emitted into the same commit, keeping one-commit-per-apply intact.
+func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) ([]*gitlab.CommitActionOptions, error) {
+	op := gitlab.FileCreate
+	lastCommitID := ""
+	if probe.exists {
+		op = gitlab.FileUpdate
+		// Forward the probed last_commit_id under optimistic_lock so the
+		// adopt-update still fails on a concurrent writer instead of blindly
+		// overwriting it.
+		if useLock {
+			lastCommitID = probe.lastCommitID
+		}
+	}
+	a, err := buildAction(p, f, op, lastCommitID)
+	if err != nil {
+		return nil, err
+	}
+	actions := []*gitlab.CommitActionOptions{a}
+	if probe.exists && probe.executeFilemode != f.ExecuteFilemode.ValueBool() {
+		chmod := &gitlab.CommitActionOptions{
+			Action:          gitlab.Ptr(gitlab.FileChmod),
+			FilePath:        new(p),
+			ExecuteFilemode: new(f.ExecuteFilemode.ValueBool()),
+		}
+		if lastCommitID != "" {
+			chmod.LastCommitID = new(lastCommitID)
+		}
+		actions = append(actions, chmod)
+	}
+	return actions, nil
 }
 
 // probeRemote fans probeFile out across paths at refreshParallelism. Errors are
@@ -1022,7 +1035,10 @@ func buildAction(filePath string, f fileModel, op gitlab.FileActionValue, lastCo
 	default:
 		return nil, errors.New("either content or content_base64 must be set")
 	}
-	if f.ExecuteFilemode.ValueBool() {
+	// The commits API honors execute_filemode only on create and chmod
+	// actions; on update it is silently ignored, so sending it there would
+	// just mislead a reader into thinking it takes effect.
+	if op == gitlab.FileCreate && f.ExecuteFilemode.ValueBool() {
 		a.ExecuteFilemode = new(true)
 	}
 	if lastCommitID != "" {

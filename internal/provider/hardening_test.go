@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -202,6 +203,98 @@ func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
 		}
 		if actions[0].LastCommitID != nil {
 			t.Errorf("LastCommitID = %q, want nil (lock disabled)", *actions[0].LastCommitID)
+		}
+	})
+}
+
+// TestDiffActions_AdoptEmitsChmodOnExecMismatch: the commits API ignores
+// execute_filemode on update actions, so adopting an existing file whose
+// remote exec bit differs from the plan must add a companion chmod to the
+// same action set; matching bits must not.
+func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
+	const probedLCID = "abc123probed"
+	remoteExec := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("X-Gitlab-Blob-Id", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+		w.Header().Set("X-Gitlab-Last-Commit-Id", probedLCID)
+		w.Header().Set("X-Gitlab-File-Path", "tool.sh")
+		w.Header().Set("X-Gitlab-Ref", "main")
+		w.Header().Set("X-Gitlab-Size", "5")
+		w.Header().Set("X-Gitlab-Execute-Filemode", strconv.FormatBool(remoteExec))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res := &filesResource{client: client}
+
+	plan := func(exec bool) filesResourceModel {
+		return filesResourceModel{
+			ProjectID:      types.StringValue("proj"),
+			Branch:         types.StringValue("main"),
+			OptimisticLock: types.BoolValue(true),
+			AdoptExisting:  types.BoolValue(true),
+			Files: map[string]fileModel{"tool.sh": {
+				Content:         types.StringValue("#!/bin/sh\n"),
+				ExecuteFilemode: types.BoolValue(exec),
+			}},
+		}
+	}
+	emptyState := filesResourceModel{Files: map[string]fileModel{}}
+
+	t.Run("mismatch adds chmod with lock token", func(t *testing.T) {
+		actions, err := res.diffActions(context.Background(), plan(true), emptyState)
+		if err != nil {
+			t.Fatalf("diffActions: %v", err)
+		}
+		if len(actions) != 2 {
+			t.Fatalf("want update+chmod, got %d actions", len(actions))
+		}
+		if *actions[0].Action != gitlab.FileUpdate {
+			t.Errorf("first action = %s, want update", *actions[0].Action)
+		}
+		chmod := actions[1]
+		if *chmod.Action != gitlab.FileChmod {
+			t.Fatalf("second action = %s, want chmod", *chmod.Action)
+		}
+		if chmod.ExecuteFilemode == nil || !*chmod.ExecuteFilemode {
+			t.Error("chmod must set execute_filemode=true")
+		}
+		if chmod.LastCommitID == nil || *chmod.LastCommitID != probedLCID {
+			t.Errorf("chmod LastCommitID = %v, want %q", chmod.LastCommitID, probedLCID)
+		}
+	})
+
+	t.Run("matching bit emits no chmod", func(t *testing.T) {
+		actions, err := res.diffActions(context.Background(), plan(false), emptyState)
+		if err != nil {
+			t.Fatalf("diffActions: %v", err)
+		}
+		if len(actions) != 1 {
+			t.Fatalf("want a single update, got %d actions", len(actions))
+		}
+	})
+
+	t.Run("remote exec true plan false adds chmod false", func(t *testing.T) {
+		remoteExec = true
+		defer func() { remoteExec = false }()
+		actions, err := res.diffActions(context.Background(), plan(false), emptyState)
+		if err != nil {
+			t.Fatalf("diffActions: %v", err)
+		}
+		if len(actions) != 2 {
+			t.Fatalf("want update+chmod, got %d actions", len(actions))
+		}
+		chmod := actions[1]
+		if *chmod.Action != gitlab.FileChmod || chmod.ExecuteFilemode == nil || *chmod.ExecuteFilemode {
+			t.Error("chmod must clear execute_filemode when the remote bit is set and the plan wants it off")
 		}
 	})
 }
