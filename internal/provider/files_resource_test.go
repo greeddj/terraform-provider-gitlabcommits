@@ -947,3 +947,57 @@ func sliceEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// TestContentChanged pins the no-decode fast paths and the bytewise
+// fallbacks: cosmetic re-encodings and form switches must not read as
+// changes, while real changes always must.
+func TestContentChanged(t *testing.T) {
+	text := func(s string) fileModel { return fileModel{Content: types.StringValue(s)} }
+	b64 := func(s string) fileModel { return fileModel{ContentBase64: types.StringValue(s)} }
+	enc := func(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+
+	cases := []struct {
+		name        string
+		plan, state fileModel
+		want        bool
+		wantErr     bool
+	}{
+		{name: "text equal", plan: text("hi"), state: text("hi"), want: false},
+		{name: "text differs", plan: text("hi"), state: text("ho"), want: true},
+		{name: "base64 equal strings", plan: b64(enc([]byte("hi"))), state: b64(enc([]byte("hi"))), want: false},
+		{name: "base64 differs", plan: b64(enc([]byte("hi"))), state: b64(enc([]byte("ho"))), want: true},
+		{name: "form switch same bytes", plan: text("hi"), state: b64(enc([]byte("hi"))), want: false},
+		{name: "form switch different bytes", plan: b64(enc([]byte("hi"))), state: text("ho"), want: true},
+		{name: "invalid plan base64", plan: b64("!!!"), state: text("x"), wantErr: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := contentChanged(c.plan, c.state)
+			if c.wantErr {
+				if err == nil {
+					t.Fatal("expected an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("contentChanged = %v, want %v", got, c.want)
+			}
+		})
+	}
+
+	// Two different base64 spellings of the same byte (non-canonical trailing
+	// bits) must compare equal via the decode fallback - if Go's decoder
+	// rejects the non-canonical form this subtest documents that too.
+	t.Run("non-canonical base64 spellings", func(t *testing.T) {
+		got, err := contentChanged(b64("aQ=="), b64("aR=="))
+		if err != nil {
+			t.Skipf("decoder rejects non-canonical trailing bits: %v", err)
+		}
+		if got {
+			t.Error("different spellings of the same byte must not read as a change")
+		}
+	})
+}

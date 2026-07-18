@@ -736,21 +736,16 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 			continue
 		}
 
-		raw, err := pf.rawBytes()
-		if err != nil {
-			return nil, fmt.Errorf("file %q: %w", p, err)
-		}
-
 		lastCommitID := ""
 		if useLock {
 			lastCommitID = sf.LastCommitID.ValueString()
 		}
 
-		stateRaw, err := sf.rawBytes()
+		changed, err := contentChanged(pf, sf)
 		if err != nil {
 			return nil, fmt.Errorf("file %q: %w", p, err)
 		}
-		if !bytes.Equal(raw, stateRaw) {
+		if changed {
 			a, err := buildAction(p, pf, gitlab.FileUpdate, lastCommitID)
 			if err != nil {
 				return nil, fmt.Errorf("file %q: %w", p, err)
@@ -954,6 +949,33 @@ func (m filesResourceModel) optimisticLock() bool {
 		return true
 	}
 	return m.OptimisticLock.ValueBool()
+}
+
+// contentChanged reports whether plan content differs from state without
+// decoding in the common no-change case: equal text strings ARE the bytes,
+// unequal text strings differ bytewise, and equal base64 strings decode to
+// equal bytes. Only unequal base64 strings (two encodings with non-canonical
+// trailing bits can still describe identical bytes) and a form switch between
+// content and content_base64 fall back to a full bytewise comparison, so a
+// cosmetic re-encoding never produces a spurious commit.
+func contentChanged(pf, sf fileModel) (bool, error) {
+	switch {
+	case !pf.Content.IsNull() && !pf.Content.IsUnknown() && !sf.Content.IsNull():
+		return pf.Content.ValueString() != sf.Content.ValueString(), nil
+	case !pf.ContentBase64.IsNull() && !pf.ContentBase64.IsUnknown() && !sf.ContentBase64.IsNull():
+		if pf.ContentBase64.ValueString() == sf.ContentBase64.ValueString() {
+			return false, nil
+		}
+	}
+	raw, err := pf.rawBytes()
+	if err != nil {
+		return false, err
+	}
+	stateRaw, err := sf.rawBytes()
+	if err != nil {
+		return false, err
+	}
+	return !bytes.Equal(raw, stateRaw), nil
 }
 
 // rawBytes returns the file's raw content regardless of whether the user
