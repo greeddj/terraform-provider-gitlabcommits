@@ -333,10 +333,11 @@ func TestDecodeRemoteContent(t *testing.T) {
 }
 
 // TestStampBlobsAfterCommit_FetchesMetadata verifies that stampBlobs issues
-// parallel HEAD probes and populates BlobID from the X-Gitlab-Blob-Id header.
-// LastCommitID must come from the probe's X-Gitlab-Last-Commit-Id, not the
-// commitSHA argument, so that a concurrent writer between CreateCommit and the
-// HEAD probe is reflected in state.
+// parallel HEAD probes at the created commit and populates BlobID from the
+// X-Gitlab-Blob-Id header. LastCommitID must come from the probe's
+// X-Gitlab-Last-Commit-Id, not the commitSHA argument verbatim, so files the
+// commit did not touch keep their older commit id instead of a token that
+// would trip a false optimistic-lock conflict.
 //
 // The test is parameterised on blob-id format to prove that stampBlobs is
 // opaque to blob-id length: both 40-char SHA-1 and 64-char SHA-256 IDs must
@@ -374,6 +375,9 @@ func TestStampBlobsAfterCommit_FetchesMetadata(t *testing.T) {
 				if r.Method != http.MethodHead {
 					http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
 					return
+				}
+				if got := r.URL.Query().Get("ref"); got != "deadbeef" {
+					t.Errorf("probe ref = %q, want %q (the created commit)", got, "deadbeef")
 				}
 				// URL pattern: /api/v4/projects/proj/repository/files/<encoded-path>
 				for p, m := range metaByPath {
@@ -837,14 +841,18 @@ func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
 	}
 }
 
-// TestStampBlobs_RaceDetectedViaServerLastCommitID is the directly-falsifying
-// test for the security fix: if another writer commits between our CreateCommit
-// and the HEAD probe, the server returns their LastCommitID. stampBlobs must
-// preserve that server value in state (not overwrite it with our commitSHA) so
-// optimistic_lock catches the race on the next apply.
-func TestStampBlobs_RaceDetectedViaServerLastCommitID(t *testing.T) {
+// TestStampBlobs_ProbesAtCreatedCommit is the directly-falsifying test for
+// the anti-race semantics: probes must run at the commit stampBlobs was
+// handed, not at branch HEAD. The stub serves the racer's blob and commit id
+// for every ref except ours; if stampBlobs asked for branch HEAD it would
+// stamp the racer's values next to our content, blinding drift detection and
+// handing the next locked apply the racer's token. State must end up with the
+// values visible at OUR commit.
+func TestStampBlobs_ProbesAtCreatedCommit(t *testing.T) {
 	const (
 		ourCommitSHA      = "ours"
+		ourLastCommitID   = "ours"
+		ourBlobID         = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"
 		racerLastCommitID = "raced-by-someone-else"
 		racerBlobID       = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"
 	)
@@ -854,11 +862,13 @@ func TestStampBlobs_RaceDetectedViaServerLastCommitID(t *testing.T) {
 			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
 			return
 		}
-		// Simulate the racer's commit being visible at HEAD: different blob
-		// and last_commit_id from what we just committed.
-		w.Header().Set("X-Gitlab-Blob-Id", racerBlobID)
-		w.Header().Set("X-Gitlab-Last-Commit-Id", racerLastCommitID)
-		w.Header().Set("X-Gitlab-Commit-Id", racerLastCommitID)
+		blob, lcid := racerBlobID, racerLastCommitID
+		if r.URL.Query().Get("ref") == ourCommitSHA {
+			blob, lcid = ourBlobID, ourLastCommitID
+		}
+		w.Header().Set("X-Gitlab-Blob-Id", blob)
+		w.Header().Set("X-Gitlab-Last-Commit-Id", lcid)
+		w.Header().Set("X-Gitlab-Commit-Id", lcid)
 		w.Header().Set("X-Gitlab-File-Path", "file.txt")
 		w.Header().Set("X-Gitlab-Ref", "main")
 		w.Header().Set("X-Gitlab-Size", "5")
@@ -883,12 +893,11 @@ func TestStampBlobs_RaceDetectedViaServerLastCommitID(t *testing.T) {
 	}
 
 	f := files["file.txt"]
-	// The racer's LastCommitID must be preserved, not our commitSHA.
-	if f.LastCommitID.ValueString() != racerLastCommitID {
-		t.Errorf("LastCommitID = %q, want %q (racer's server value)", f.LastCommitID.ValueString(), racerLastCommitID)
+	if f.BlobID.ValueString() != ourBlobID {
+		t.Errorf("BlobID = %q, want %q (value at our commit, not branch HEAD)", f.BlobID.ValueString(), ourBlobID)
 	}
-	if f.BlobID.ValueString() != racerBlobID {
-		t.Errorf("BlobID = %q, want %q (racer's blob)", f.BlobID.ValueString(), racerBlobID)
+	if f.LastCommitID.ValueString() != ourLastCommitID {
+		t.Errorf("LastCommitID = %q, want %q (value at our commit, not the racer's)", f.LastCommitID.ValueString(), ourLastCommitID)
 	}
 }
 

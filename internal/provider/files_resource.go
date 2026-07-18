@@ -932,12 +932,17 @@ func (f fileModel) rawBytes() ([]byte, error) {
 // GetFileMetaData probes (HEAD-style) so state reflects what GitLab
 // returns — including any future blob-id format (SHA-256 repos).
 //
-// When a probe succeeds, LastCommitID is taken from the probe response
-// (meta.LastCommitID) rather than commitSHA so that a concurrent writer
-// between our CreateCommit and the HEAD probe is not silently invisible:
-// the racing writer's LastCommitID is preserved in state and will trigger
-// optimistic-lock protection on the next apply. commitSHA is used as
-// LastCommitID only when the probe fails (fail-soft path).
+// Probes run at Ref = commitSHA (the commit just created), NOT at branch
+// HEAD: a writer landing between our CreateCommit and the probe would
+// otherwise have their blob_id and last_commit_id stamped into state next
+// to OUR content, permanently blinding drift detection (Read sees the
+// blob match) and handing the next locked apply a token that matches the
+// racer's commit. Probing our own commit keeps state self-consistent; the
+// racer is then caught by the next Read (their blob differs) and by the
+// optimistic lock (our commit id no longer matches the file's last
+// commit). Per-file LastCommitID still comes from the probe response, not
+// commitSHA verbatim: files this commit did not touch keep their older
+// commit id, avoiding false lock conflicts.
 //
 // Fail-soft covers two shapes: probe error AND a server-returned blob_id
 // longer than 256 bytes (generous ceiling above SHA-512 hex; anything
@@ -962,6 +967,11 @@ func (r *filesResource) stampBlobs(
 		files[p] = f
 	}
 
+	ref := commitSHA
+	if ref == "" {
+		ref = branch
+	}
+
 	paths := sortedKeys(files)
 	type probeResult struct {
 		err          error
@@ -975,7 +985,7 @@ func (r *filesResource) stampBlobs(
 	for i, p := range paths {
 		g.Go(func() error {
 			meta, _, err := r.client.RepositoryFiles.GetFileMetaData(project, p, &gitlab.GetFileMetaDataOptions{
-				Ref: new(branch),
+				Ref: new(ref),
 			}, gitlab.WithContext(gctx))
 			if err != nil {
 				results[i].err = err
