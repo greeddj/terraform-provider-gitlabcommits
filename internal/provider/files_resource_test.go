@@ -829,9 +829,9 @@ func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
 // optimistic_lock catches the race on the next apply.
 func TestStampBlobs_RaceDetectedViaServerLastCommitID(t *testing.T) {
 	const (
-		ourCommitSHA       = "ours"
-		racerLastCommitID  = "raced-by-someone-else"
-		racerBlobID        = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"
+		ourCommitSHA      = "ours"
+		racerLastCommitID = "raced-by-someone-else"
+		racerBlobID       = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
