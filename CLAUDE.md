@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The canonical entry point is `just`; each target is a thin wrapper over a Go/Terraform invocation in the `Justfile`.
 
 ```bash
-just build       # check + lint + test, then CGO-disabled static build into ./dist (version from `git describe`, falls back to branch name when no tags exist)
+just build       # check + lint + test, then CGO-disabled static build into ./dist (version from `git describe`, falls back to 0.0.0-dev when no tags exist)
 just test        # unit tests (go test ./...)
 just lint        # golangci-lint over the whole module
 just check       # go vet + staticcheck + govulncheck + fieldalignment
