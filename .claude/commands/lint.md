@@ -7,4 +7,4 @@ allowed-tools: Bash
 just lint
 ```
 
-Group findings by linter (govet, staticcheck, gosec, fieldalignment, etc.). If gosec flags G401/G505 anywhere outside the documented SHA-1 use in `gitBlobSHA`, raise that as a problem — that exclusion is narrowly intentional.
+Group findings by linter (govet, staticcheck, gosec, revive, etc.). If gosec flags G401/G505 anywhere, raise it as a real problem - this provider has no local hashing and no gosec exclusions; do not silence the finding.

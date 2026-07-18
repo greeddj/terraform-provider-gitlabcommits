@@ -14,7 +14,7 @@ Acceptance tests in this provider hit a **real GitLab project**. They're gated b
 | `TF_ACC` | yes | — | Must be `1`. Without it, acceptance tests skip. |
 | `GITLAB_TOKEN` | yes | — | Personal, Project, or Group access token with the `api` scope. See README Authentication. |
 | `GITLAB_TEST_PROJECT_ID` | yes | — | Group/project path (e.g. `my-group/sandbox`) or numeric ID. |
-| `GITLAB_TEST_BRANCH` | no | `tf-acc-test` | Throwaway branch. Tests create/reset/delete it. |
+| `GITLAB_TEST_BRANCH` | no | `tf-acc-test` | Branch to run against. It must already exist: the test config does not set `create_branch_from`, and no test code creates or deletes branches. |
 | `GITLAB_BASE_URL` | no | gitlab.com | Set for self-hosted GitLab. |
 
 ## Run one test
@@ -62,26 +62,27 @@ If you can verify it without a real GitLab, **keep it in unit tests** — they'r
 
 ## Acceptance test structure
 
-Use `resource.Test` from `github.com/hashicorp/terraform-plugin-testing/helper/resource`:
+Use `resource.Test` from `github.com/hashicorp/terraform-plugin-testing/helper/resource`, mirroring the existing helpers (`testAccPreCheck`, `accBranch`, `accConfig`, `accCheckFileExists` / `accCheckFileGone`):
 
 ```go
 func TestAccFiles_basic(t *testing.T) {
+    testAccPreCheck(t)
+    project := os.Getenv("GITLAB_TEST_PROJECT_ID")
+    branch := accBranch(t)
     resource.Test(t, resource.TestCase{
-        PreCheck:                 func() { testAccPreCheck(t) },
         ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
         Steps: []resource.TestStep{
-            { Config: testAccFilesConfig_basic(...), Check: resource.ComposeTestCheckFunc(...) },
-            { ResourceName: "gitlabcommits_files.test", ImportState: true, ImportStateVerify: true },
+            { Config: accConfig(project, branch, files), Check: resource.ComposeAggregateTestCheckFunc(...) },
         },
     })
 }
 ```
 
-`testAccPreCheck` enforces required env vars and skips with a clear message if missing.
+`testAccPreCheck` skips the test when `TF_ACC` is unset and fails (`t.Fatal`) when `GITLAB_TOKEN` or `GITLAB_TEST_PROJECT_ID` is missing.
 
 ## Convergence assertion after import
 
-`testAccCheckFilesConverged` (added in commit `51dc6c9`) asserts that running `terraform plan` after `terraform import` produces no diff. Any new acceptance test that exercises import **should** call this.
+There is no dedicated convergence helper; the pattern lives in `TestAccFiles_import`: a create step, an `ImportState: true` step with `ImportStateId "<project>::<branch>"` and `ImportStateVerify: false` (the files map is intentionally empty right after import), then a re-apply of the same config - `adopt_existing` rewrites the spurious creates into updates and the framework's automatic plan-after-apply check enforces zero drift. New import-related tests should follow that shape.
 
 ## Don't
 

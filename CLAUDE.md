@@ -7,10 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The canonical entry point is `just`; each target is a thin wrapper over a Go/Terraform invocation in the `Justfile`.
 
 ```bash
-just build       # CGO-disabled static build into ./dist (version stamped from `git describe`)
+just build       # check + lint + test, then CGO-disabled static build into ./dist (version from `git describe`, falls back to branch name when no tags exist)
 just test        # unit tests (go test ./...)
-just lint        # go vet + staticcheck + golangci-lint
-just check       # check-tf-fmt + check-vet + check-staticcheck + check-govulncheck + check-fieldalignment
+just lint        # golangci-lint over the whole module
+just check       # go vet + staticcheck + govulncheck + fieldalignment
 just docs        # regenerate docs/ via tfplugindocs (go generate ./...)
 just docs-check  # regenerate docs and fail if anything changed
 just headers     # apply copywrite license headers
@@ -35,7 +35,7 @@ GITLAB_BASE_URL=https://gitlab.example.com \  # optional, for self-hosted
 go test -v ./internal/provider -run TestAccFiles_basic
 ```
 
-`just ci` is the exact aggregate CI runs locally (`check` + `docs-check` + `headers-check`). Dependencies are resolved from the module cache (no `vendor/`); CI fails if `go.mod`, `go.sum`, `docs/`, or copywrite headers are out of sync.
+`just ci` is the exact aggregate CI runs locally (`check` + `lint` + `test` + `check-tf-fmt` + `docs-check` + `headers-check`). Dependencies are resolved from the module cache (no `vendor/`); CI fails if `go.mod`, `go.sum`, `docs/`, or copywrite headers are out of sync.
 
 ## Architecture
 
@@ -65,13 +65,13 @@ The whole point of the provider is **one commit per `terraform apply` per resour
 
 ### Drift detection without re-downloading content
 
-`Read` probes each managed file with `RepositoryFiles.GetFileMetaData` (HEAD-style, no body), fanned out at `refreshParallelism` through an `errgroup`. The provider treats GitLab's returned `blob_id` as opaque — string-equal to what was stamped in state on the last commit. Only when `blob_id` has actually drifted does Read pull the full payload via `GetFile` and decode it. Setting `detect_drift = false` makes Read a no-op (the resource becomes opaque after creation).
+`Read` probes each managed file with `RepositoryFiles.GetFileMetaData` (HEAD-style, no body), fanned out at `refreshParallelism` through an `errgroup`. The provider treats GitLab's returned `blob_id` as opaque — string-equal to what was stamped in state on the last commit. Only when the probe shows drift (`blob_id` or the exec bit differs from state) does Read pull the full payload via `GetFile` and decode it. Setting `detect_drift = false` makes Read a no-op (the resource becomes opaque after creation).
 
 State mutation stays serial: every goroutine writes only into its own slot in a pre-sized `[]fileRefreshResult`, and a second pass over the slice deletes / updates `state.Files` in path order. No locks, no map writes from goroutines.
 
 ### Optimistic locking
 
-`optimistic_lock = true` (default) sends each action's `last_commit_id` (the commit SHA we last observed touching the file). GitLab rejects the action with HTTP 400 if anything else has touched the file since. [`apiErrorDiag`](internal/provider/files_resource.go) inspects the response body to convert that 400 into a "Concurrent modification detected" diagnostic with actionable guidance, instead of a generic API error. After every successful commit, `stampBlobs` stamps `last_commit_id` on every entry from the commit SHA and refreshes `blob_id` via a parallel HEAD-style metadata fan-out (same `refreshParallelism` errgroup pattern as `Read`). If a metadata probe fails, the file's `blob_id` is left null with a warning; the next `Read` repopulates it.
+`optimistic_lock = true` (default) sends each action's `last_commit_id` (the commit SHA we last observed touching the file). GitLab rejects the action with HTTP 400 if anything else has touched the file since. [`apiErrorDiag`](internal/provider/files_resource.go) inspects the response body to convert that 400 into a "Concurrent modification detected" diagnostic with actionable guidance, instead of a generic API error. After every successful commit, `stampBlobs` refreshes `blob_id` and `last_commit_id` via a parallel HEAD-style metadata fan-out (same `refreshParallelism` errgroup pattern as `Read`). On probe success `last_commit_id` comes from the server's response, so a writer that raced our commit stays visible to optimistic locking; the commit SHA is only the fallback stamp when a probe fails - `blob_id` is then left null with a warning and the next `Read` repopulates it.
 
 ### Provider client
 
@@ -84,7 +84,7 @@ State mutation stays serial: every goroutine writes only into its own slot in a 
 
 ### Validators and defaults
 
-Custom schema helpers live in [schema_validators.go](internal/provider/schema_validators.go) (regex, non-empty, mutually-exclusive siblings, map-key regex) and [schema_defaults.go](internal/provider/schema_defaults.go) (static bool defaults). The Plugin Framework lacks built-in regex / mutual-exclusion validators, hence these.
+Custom schema helpers live in [schema_validators.go](internal/provider/schema_validators.go) (regex, non-empty, mutually-exclusive siblings, at-least-one-of file content, map-key regex). The Plugin Framework lacks built-in regex / mutual-exclusion validators, hence these. Defaults use the framework's built-in `booldefault.StaticBool`, declared inline in the schema - there are no local default helpers.
 
 The `files` map has a `mapNonEmpty()` validator on purpose — an empty map at update time would translate to "delete everything", which is almost never what the user means. Use `terraform destroy` for that.
 
@@ -138,7 +138,10 @@ Justfile wrappers (each delegates to the matching `just` target):
 
 - `/build`, `/test [pattern]`, `/lint`, `/check`, `/fix`, `/ci`
 - `/docs`, `/docs-check`, `/tf-fmt [check]`, `/headers`, `/deps`
-- `/acc-test [pattern]` — gated by `TF_ACC=1 GITLAB_TOKEN=... GITLAB_TEST_PROJECT_ID=...`
+
+Not a Justfile wrapper:
+
+- `/acc-test [pattern]` — runs `go test` directly, gated by `TF_ACC=1 GITLAB_TOKEN=... GITLAB_TEST_PROJECT_ID=...`
 
 Workflow entry points:
 

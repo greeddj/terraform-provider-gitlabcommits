@@ -16,7 +16,7 @@ Per-tick allocations matter — the provider runs inside Terraform processes tha
   ```
 - **Preallocate map capacity** when you know the upper bound:
   ```go
-  m := make(map[string]fileModel, len(plan.Files.Elements()))
+  m := make(map[string]fileModel, len(plan.Files))
   ```
 - **Use `strconv.*` instead of `fmt.Sprintf` for numbers.** `strconv.Itoa(n)` allocates one string; `fmt.Sprintf("%d", n)` allocates several intermediate things.
 - **Avoid building paths with `+`** in loops; use `path.Join` once or a `strings.Builder` if joining many.
@@ -30,14 +30,16 @@ Per-tick allocations matter — the provider runs inside Terraform processes tha
   ```go
   g, gctx := errgroup.WithContext(ctx)
   g.SetLimit(refreshParallelism)
-  for i, f := range state.Files {
-      i, f := i, f
+  paths := sortedKeys(state.Files)
+  for i, p := range paths {
       g.Go(func() error {
-          results[i] = probe(gctx, f)
+          results[i] = probe(gctx, p)
           return nil
       })
   }
   if err := g.Wait(); err != nil { ... }
+  // No `i, p := i, p` copy: go.mod targets go 1.26 (per-iteration loop vars)
+  // and the copyloopvar linter rejects the redundant copy.
   ```
 - **No map writes from goroutines** — each goroutine writes its own slice slot; serial pass after `g.Wait()` rebuilds the map. This is a load-bearing invariant in this repo.
 

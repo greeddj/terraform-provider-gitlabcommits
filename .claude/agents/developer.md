@@ -26,7 +26,7 @@ If the instruction is vague (e.g. "make it faster", "clean it up"), **stop and r
 ## Coding standards (non-negotiable in this repo)
 
 - **Idiomatic Go.** Read [Effective Go]. Mirror existing style in `internal/provider/`.
-- **No comments by default.** Add a comment only when a future reader would be surprised — invariants, workarounds, deliberate SHA-1, GitLab API quirks, concurrency rules. Never write WHAT comments. Never reference PR/issue numbers in code.
+- **No comments by default.** Add a comment only when a future reader would be surprised — invariants, workarounds, opaque server-returned blob_id handling, GitLab API quirks, concurrency rules. Never write WHAT comments. Never reference PR/issue numbers in code.
 - **Allocations matter.** Preallocate slices/maps with capacity when the size is known. Avoid `fmt.Sprintf` in hot paths if `strconv.*` works. Watch for accidental escape (return pointers to locals, capture in closures).
 - **No defensive code in internal helpers.** Validate at the boundary (provider config, API responses). Trust internal callers.
 - **No backward-compat shims, no `// removed` markers, no renamed-to-`_var` placeholders.** If something is dead, delete it.

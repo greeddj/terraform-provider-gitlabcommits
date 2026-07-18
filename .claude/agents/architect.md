@@ -39,7 +39,7 @@ If any of these are missing or contradictory, **return to main thread with speci
 - The request asks for an abstraction with one caller.
 - The request asks for code "in case we later need it."
 - The request would push N commits per apply (the entire design point is **one commit per apply**).
-- The request would re-download file bodies during drift detection (the design point is HEAD-style metadata probes + local blob SHA).
+- The request would re-download file bodies during drift detection (the design point is HEAD-style metadata probes compared via the opaque server-returned `blob_id`), or would compute blob hashes locally (breaks SHA-256 object-format repositories).
 - The request adds map writes from goroutines, or other concurrency that breaks the documented serial state-mutation invariant.
 - The request expands schema without acknowledging that `docs/` must be regenerated.
 - The request introduces dependencies for trivial helpers.

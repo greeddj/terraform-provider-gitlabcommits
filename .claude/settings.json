@@ -30,9 +30,9 @@
       "Bash(gh issue view*)",
       "Bash(gh issue list*)"
     ],
-    "ask": [
-      "Bash(rm:*)"
-    ],
+    // "ask": [
+    //   "Bash(rm:*)"
+    // ],
     "deny": [
       "Bash(git push *)"
     ]

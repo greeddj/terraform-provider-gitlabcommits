@@ -1,6 +1,6 @@
 ---
 name: gitlab-provider-conventions
-description: Repo-specific invariants for this Terraform GitLab provider — one-commit-per-apply, action-diffing, HEAD-style drift probes, serial state mutation, optimistic locking, intentional SHA-1 use. Load before designing or editing internal/provider/ code, especially files_resource.go.
+description: Repo-specific invariants for this Terraform GitLab provider - one-commit-per-apply, action-diffing, HEAD-style drift probes with opaque server-returned blob_id, serial state mutation, optimistic locking. Load before designing or editing internal/provider/ code, especially files_resource.go.
 ---
 
 # GitLab Commits provider — invariants
@@ -25,7 +25,7 @@ Any change to either forces a recreate. Composite ID is `<project_id>::<branch>`
 |---|---|
 | new path in plan | `create` (or `update` if `adopt_existing` and path already exists in repo) |
 | gone path in state | `delete` |
-| content blob changed | `update` |
+| content changed (bytewise, plan vs state) | `update` |
 | `execute_filemode` flipped | separate `chmod` action |
 | nothing changed | **no commit** — Update returns early, preserving computed fields |
 
@@ -35,13 +35,13 @@ Any change to either forces a recreate. Composite ID is `<project_id>::<branch>`
 
 ## 4. Drift detection without re-downloading
 
-`Read` probes each managed file via `RepositoryFiles.GetFileMetaData` (HEAD-style, no body), fanned out at `refreshParallelism` through an `errgroup`. Blob IDs are computed locally with `gitBlobSHA(content) = sha1("blob <size>\0<content>")` — the exact form git uses. Only when the blob actually drifted does Read pull the full payload via `GetFile`.
+`Read` probes each managed file via `RepositoryFiles.GetFileMetaData` (HEAD-style, no body), fanned out at `refreshParallelism` through an `errgroup`. `blob_id` is an **opaque server-returned identifier**: the probe's value is string-compared against what was stamped in state after the last commit. It is never computed locally - GitLab may serve SHA-1 or SHA-256 object formats, and the schema documents the format as GitLab-specific. Only when the blob actually drifted does Read pull the full payload via `GetFile`.
 
 `detect_drift = false` makes Read a no-op.
 
-## 5. SHA-1 is intentional
+## 5. blob_id is opaque - never hash locally
 
-`gitBlobSHA` uses SHA-1 because git does. `.golangci.yml` excludes `gosec` G401/G505 narrowly for this reason. **Do not** switch to SHA-256 — it would break blob comparison.
+There is no local blob hashing anywhere in this provider, and there must not be: a locally computed git-style SHA-1 would break on SHA-256 object-format repositories and would couple the provider to git internals GitLab does not guarantee. Drift comparison stays hash-algorithm-agnostic string equality on the server-returned `blob_id`. `.golangci.yml` carries no gosec G401/G505 exclusions; if one ever seems necessary, the change that needs it is wrong.
 
 ## 6. Serial state mutation
 
@@ -53,7 +53,7 @@ Every goroutine in Read writes only into its own slot in a pre-sized `[]fileRefr
 
 ## 8. Validate at the boundary
 
-Provider config and GitLab API responses get validated. Internal helpers don't. Custom validators live in `schema_validators.go`. Static defaults live in `schema_defaults.go`. The `files` map has a `mapNonEmpty()` validator — an empty map at update time would mean "delete everything," which is almost never the intent; use `terraform destroy` for that.
+Provider config and GitLab API responses get validated. Internal helpers don't. Custom validators live in `schema_validators.go`. Defaults are the framework's built-in `booldefault.StaticBool`, declared inline in the schema - there is no local defaults helper file. The `files` map has a `mapNonEmpty()` validator - an empty map at update time would mean "delete everything," which is almost never the intent; use `terraform destroy` for that.
 
 ## 9. Schema changes require doc regen
 

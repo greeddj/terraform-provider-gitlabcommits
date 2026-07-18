@@ -26,7 +26,7 @@ The `.claude/agents/` directory defines five roles. They run as **subagents**: t
 | User wants "are the tests still green?" / coverage report | **tester** directly |
 | User wants a security review of branch | **security** directly |
 | User wants docs / comments cleaned up only | **techwriter** directly |
-| User says "ultrareview" | **explain** — `/ultrareview` is user-triggered |
+| User says "ultrareview" | **explain** - it is the user-triggered `/code-review ultra` command (`/ultrareview` is its deprecated alias); agents cannot launch it |
 
 For everything ambiguous or with > 1 file in scope, start with **architect**. The architect's job is to refuse fuzzy work and to keep the design honest.
 

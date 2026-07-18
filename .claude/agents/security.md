@@ -18,7 +18,7 @@ You are the **security** agent. The architect hands you a change set; you audit 
 
 ## Repo-specific things to check
 
-- **`gitBlobSHA` uses SHA-1 deliberately** (git compatibility); `gosec` G401/G505 are excluded in `.golangci.yml`. That exclusion must remain narrowly scoped — no other SHA-1 use should creep in.
+- **`blob_id` is server-opaque** - the provider never hashes blob content locally, and `.golangci.yml` carries no gosec G401/G505 exclusions. Flag any change that introduces local SHA-1 blob hashing or requests such an exclusion: drift comparison must stay hash-algorithm-agnostic (SHA-256 object-format repositories exist).
 - **`apiErrorDiag`** surfaces GitLab API errors. Ensure no path leaks the bearer token (logged in error, attached to a diagnostic).
 - **`token` schema attribute** is `Sensitive`. Verify any new place that handles it preserves that. Verify env-var fallback (`GITLAB_TOKEN`) is read at the boundary, not deep in helpers.
 - **`RepositoryFiles.GetFile` returns base64-encoded bodies** — make sure new code decodes with `base64.StdEncoding.DecodeString` (or `RawStdEncoding` if applicable) and **bounds-checks** the size before allocating.

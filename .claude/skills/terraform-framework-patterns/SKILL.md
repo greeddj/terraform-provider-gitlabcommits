@@ -10,7 +10,7 @@ This provider is built on **terraform-plugin-framework**, not SDKv2. Behavior di
 ## Schema basics
 
 - Use the `schema` package from `github.com/hashicorp/terraform-plugin-framework/resource/schema` (resources) or `.../datasource/schema` (data sources).
-- Every attribute carries `MarkdownDescription` — it's the source of truth for generated docs.
+- Every attribute carries a `Description` (`MarkdownDescription` also works) - it's the source of truth for generated docs.
 - `Required`, `Optional`, `Computed` are exclusive in the usual way; `Optional + Computed` means "user can set, otherwise we fill in."
 - `Sensitive: true` redacts values from plan output and logs (`token` uses this).
 
@@ -22,17 +22,18 @@ This provider is built on **terraform-plugin-framework**, not SDKv2. Behavior di
 
 ## Defaults
 
-Plugin Framework's built-in defaults (`booldefault.StaticBool`, `stringdefault.StaticString`, etc.) are fine for simple cases. We have a couple of local helpers in `schema_defaults.go` where the built-ins didn't fit.
+Plugin Framework's built-in defaults (`booldefault.StaticBool`, `stringdefault.StaticString`, etc.) cover every default this provider needs; they are declared inline in the schema. There are no local default helpers - do not create a defaults file for a case a built-in already handles.
 
 ## Validators
 
 The framework lacks built-in regex and mutual-exclusion validators. Ours live in `schema_validators.go`:
 
-- `regexMatch(pattern, message)` — for path/branch validation.
-- `nonEmpty()` — strings must be non-zero.
-- `mutuallyExclusive(siblings...)` — content vs content_base64 vs source_file.
-- `mapKeyRegex(pattern)` — keys in the `files` map.
-- `mapNonEmpty()` — the `files` map can't be empty at update time.
+- `stringMatchesRegex(pattern, msg)` - project_id / branch shape validation.
+- `stringNotEmpty()` - rejects empty and whitespace-only strings.
+- `stringConflictsWithSibling(name)` - content vs content_base64 mutual exclusion (each side names the other).
+- `objectFileContentRequired()` - plan-time "at least one of content / content_base64" per file object.
+- `mapKeysMatchRegex(pattern, msg)` - keys in the `files` map (repository paths).
+- `mapNonEmpty()` - the `files` map can't be empty at update time.
 
 Add validators here rather than scattering them.
 
@@ -49,32 +50,27 @@ Add validators here rather than scattering them.
 ## ImportState
 
 ```go
-func (r *FilesResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-    // parses "<project_id>::<branch>" → sets project_id and branch
+func (r *filesResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+    // parses "<project_id>::<branch>" -> sets project_id, branch, and id
 }
 ```
 
-After import, the next `apply` runs `Read` which fills `files` from the live branch. The `adopt_existing = true` default makes this idempotent.
+After import only `project_id`, `branch`, and `id` are in state - the `files` map is empty, and `Read` never fills it from the branch on its own. Convergence happens on the next plan/apply: the plan treats every HCL file as new, and `adopt_existing = true` (default) rewrites those create actions into updates for paths already present in the repo, forwarding the probed `last_commit_id` under `optimistic_lock`.
 
 ## State types vs config types
 
-Use the framework's typed values: `types.String`, `types.Bool`, `types.Int64`, `types.Map`, `types.Object`. For nested objects in a map use `types.MapType{ElemType: types.ObjectType{AttrTypes: ...}}`.
-
-When reading nested maps in CRUD:
+Use the framework's typed values for scalars: `types.String`, `types.Bool`, `types.Int64`. For the nested `files` map the model uses a plain Go map with `tfsdk` tags (`Files map[string]fileModel`), so `Get` populates it directly - no `types.Map` + `ElementsAs` conversion step exists or is needed:
 
 ```go
-var plan FilesResourceModel
-diags := req.Plan.Get(ctx, &plan)
-resp.Diagnostics.Append(diags...)
+var plan filesResourceModel
+resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 if resp.Diagnostics.HasError() { return }
 ```
-
-Convert `types.Map` of objects to Go maps with `plan.Files.ElementsAs(ctx, &goMap, false)`.
 
 ## CRUD return contract
 
 - `Create`: set the full state at the end via `resp.State.Set(ctx, &state)`.
-- `Read`: if the resource no longer exists upstream, call `resp.State.RemoveResource(ctx)` and return (no error). Otherwise set full state.
+- `Read`: files that vanished upstream are dropped from the `files` map (the next plan recreates them); full state is always written back. The resource itself is never removed from state - `RemoveResource` is not called anywhere in this provider, even when the whole branch is gone.
 - `Update`: set full state at the end. If nothing changed (action-diffing yielded zero actions), still write the state back unchanged so computed fields are preserved.
 - `Delete`: no state write needed.
 
@@ -89,7 +85,7 @@ Convert `types.Map` of objects to Go maps with `plan.Files.ElementsAs(ctx, &goMa
 `tfplugindocs` reads:
 - `MarkdownDescription` from schema → `docs/resources/<name>.md` and `docs/data-sources/<name>.md`.
 - `examples/resources/<resource>/resource.tf` → docs example block.
-- `examples/data-sources/<ds>/data-source.tf` → docs example block.
+- `examples/data-sources/<ds>/data-source.tf` → docs example block (none exist yet; adding them is what gives the data-source pages an Example Usage section).
 - `examples/provider/provider.tf` → provider config block.
 
 Edit schemas + examples, then `just docs`. Never hand-edit `docs/`.

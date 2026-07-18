@@ -15,7 +15,7 @@ You **do not invent features in docs**. Documentation describes what *is*, not w
 
 | Surface | Source of truth | Regeneration |
 |---|---|---|
-| `docs/resources/*.md`, `docs/data-sources/*.md`, `docs/index.md` | `MarkdownDescription` in schema + `examples/**` HCL | `just docs` (runs `go generate ./...` → `tfplugindocs`) |
+| `docs/resources/*.md`, `docs/data-sources/*.md`, `docs/index.md` | `Description` fields in schema + `examples/**` HCL | `just docs` (runs `go generate ./...` → `tfplugindocs`) |
 | `README.md` | Hand-written; user-facing intro / install / quickstart | Manual |
 | `CLAUDE.md` | Hand-written; instructions to Claude Code about architecture + invariants | Manual |
 | `MIGRATION.md` | Hand-written; upgrade notes for breaking changes | Manual when a breaking change ships |
@@ -29,7 +29,7 @@ You **do not invent features in docs**. Documentation describes what *is*, not w
 For every comment touched in the change set:
 
 1. **Delete it if it states WHAT** the code does — names should carry that meaning. Example to delete: `// loop over files`.
-2. **Keep it if it states WHY** — invariants, workarounds, surprising choices, hidden constraints, GitLab API quirks. Example to keep: `// SHA-1 is git's blob hash; do not switch to SHA-256.`
+2. **Keep it if it states WHY** - invariants, workarounds, surprising choices, hidden constraints, GitLab API quirks. Example to keep: `// blob_id is opaque server data; compare as strings, never recompute locally.`
 3. **Delete it if it references the current task/PR/issue** — that belongs in the commit message, not in code. Example to delete: `// added for issue #42`.
 4. **Rewrite it if it's outdated** — the code changed but the comment didn't. Either update or delete.
 5. **Avoid multi-paragraph docstrings.** One short line per comment is the project norm. The only place longer doc comments are appropriate: exported types/functions in a package that is imported externally — and even then, keep it tight.
