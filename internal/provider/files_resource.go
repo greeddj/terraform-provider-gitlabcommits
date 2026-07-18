@@ -281,10 +281,6 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 		plan.CreateBranchFrom.ValueString(),
 	); err != nil {
 		summary, detail := apiErrorDiag("ensuring branch exists", plan.ProjectID.ValueString(), plan.Branch.ValueString(), err)
-		if summary == "" {
-			summary = "Branch unavailable"
-			detail = err.Error()
-		}
 		resp.Diagnostics.AddError(summary, detail)
 		return
 	}
@@ -1136,6 +1132,15 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 	summary := fmt.Sprintf("GitLab API error: %s", action)
 	prefix := fmt.Sprintf("project=%q branch=%q", project, branch)
 
+	// client-go collapses every 404 into the bare ErrNotFound sentinel (no
+	// *ErrorResponse survives), so 404 must be recognised here - a status
+	// switch below would never see it.
+	if errors.Is(err, gitlab.ErrNotFound) {
+		summary = "GitLab resource not found (HTTP 404)"
+		return summary, fmt.Sprintf("%s: the project, branch, or file does not exist, or the token cannot see it "+
+			"(GitLab answers 404 for missing access as well).", prefix)
+	}
+
 	var resp *gitlab.ErrorResponse
 	if errors.As(err, &resp) && resp.Response != nil {
 		status := resp.Response.StatusCode
@@ -1152,9 +1157,6 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 					"(2) the token's user has the Developer role on the project, or Maintainer for a protected branch; "+
 					"(3) if you are using CI_JOB_TOKEN, switch to a Personal / Project / Group access token — job tokens cannot POST to /repository/commits.",
 				body)
-		case 404:
-			summary = "GitLab resource not found (HTTP 404)"
-			return summary, fmt.Sprintf("%s: project or branch does not exist. Body: %s", prefix, body)
 		case 400, 409:
 			// 400 with optimistic-lock failure: GitLab 18 returns
 			//   "You are attempting to update a file that has changed since you

@@ -615,7 +615,15 @@ func TestApiErrorDiag(t *testing.T) {
 			contains:    []string{"api", "Developer", "CI_JOB_TOKEN"},
 		},
 		{
-			name: "404", err: mkErr(404, "not found", nil),
+			// client-go never delivers a 404 as *ErrorResponse - CheckResponse
+			// collapses it into the bare sentinel, so that is what the
+			// diagnostic must recognise.
+			name: "404-sentinel", err: gitlab.ErrNotFound,
+			wantSummary: "GitLab resource not found (HTTP 404)",
+			contains:    []string{"does not exist"},
+		},
+		{
+			name: "404-wrapped", err: fmt.Errorf("checking branch %q: %w", "main", gitlab.ErrNotFound),
 			wantSummary: "GitLab resource not found (HTTP 404)",
 			contains:    []string{"does not exist"},
 		},
