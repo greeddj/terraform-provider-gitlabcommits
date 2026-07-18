@@ -1,5 +1,5 @@
 PROJECT := "terraform-provider-gitlabcommits"
-VERSION := `sh -c 'git describe --tags --abbrev=0 2>/dev/null || git rev-parse --abbrev-ref HEAD'`
+VERSION := `sh -c 'git describe --tags --abbrev=0 2>/dev/null || echo 0.0.0-dev'`
 LDFLAGS := "-s -w -X main.version=" + VERSION
 
 deps:

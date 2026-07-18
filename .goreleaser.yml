@@ -16,13 +16,15 @@ builds:
     goos:
       - linux
       - darwin
+      - windows
+      - freebsd
     goarch:
       - amd64
       - arm64
     binary: '{{ .ProjectName }}_v{{ .Version }}'
 
 archives:
-  - format: zip
+  - formats: ['zip']
     name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
 
 checksum:
@@ -57,6 +59,12 @@ changelog:
   sort: asc
   abbrev: 0
   groups:
+    # Groups are matched in definition order, so the deps group must come
+    # before Features/Bug Fixes or fix(deps) commits land under Bug Fixes;
+    # the order field only controls display position.
+    - title: 'Dependency Updates'
+      regexp: "^.*(feat|fix)\\(deps\\)*:+.*$"
+      order: 3
     - title: 'Features'
       regexp: "^.*feat[(\\w)]*:+.*$"
       order: 0
@@ -66,9 +74,6 @@ changelog:
     - title: 'Documentation'
       regexp: "^.*docs[(\\w)]*:+.*$"
       order: 2
-    - title: 'Dependency Updates'
-      regexp: "^.*(feat|fix)\\(deps\\)*:+.*$"
-      order: 3
     - title: 'Other Work'
       order: 999
   filters:
