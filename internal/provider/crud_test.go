@@ -281,3 +281,41 @@ func TestDelete_PartialProbeErrorFailsLoudly(t *testing.T) {
 		t.Error("expected no commit attempt after a failed probe")
 	}
 }
+
+// TestCreate_EmptyRepositoryDiagnostics: on a project with zero commits every
+// branch lookup 404s and no ref exists to branch from, so the usual "set
+// create_branch_from" advice is a dead end. Create must say what actually
+// helps, with or without create_branch_from configured.
+func TestCreate_EmptyRepositoryDiagnostics(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			http.Error(w, "no branch", http.StatusNotFound)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":1,"empty_repo":true}`))
+		default:
+			http.Error(w, "unexpected call", http.StatusInternalServerError)
+		}
+	})
+
+	for _, withFrom := range []bool{false, true} {
+		plan := readState("blob")
+		if withFrom {
+			plan.CreateBranchFrom = types.StringValue("main")
+		}
+		resp := runCreate(t, client, plan)
+		if !resp.Diagnostics.HasError() {
+			t.Fatalf("withFrom=%v: expected an error on an empty repository", withFrom)
+		}
+		found := false
+		for _, d := range resp.Diagnostics.Errors() {
+			if strings.Contains(d.Detail(), "no commits") || strings.Contains(d.Summary(), "no commits") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("withFrom=%v: diagnostic must explain the repository has no commits, got: %v", withFrom, resp.Diagnostics.Errors())
+		}
+	}
+}

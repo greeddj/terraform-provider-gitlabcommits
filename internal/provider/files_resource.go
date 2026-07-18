@@ -908,6 +908,13 @@ func (r *filesResource) ensureBranch(ctx context.Context, project, branch, creat
 	if !errors.Is(err, gitlab.ErrNotFound) {
 		return fmt.Errorf("checking branch %q: %w", branch, err)
 	}
+	// On a repository with zero commits every branch lookup 404s and no ref
+	// exists to branch from, so the create_branch_from advice below would be
+	// a dead end; detect that case and say what actually helps.
+	if proj, _, perr := r.client.Projects.GetProject(project, nil, gitlab.WithContext(ctx)); perr == nil && proj != nil && proj.EmptyRepo {
+		return fmt.Errorf("repository %q has no commits, so branch %q cannot exist and create_branch_from has no ref to start from; "+
+			"create an initial commit first (for example initialize the project with a README)", project, branch)
+	}
 	if createFrom == "" {
 		return fmt.Errorf("branch %q does not exist; set create_branch_from to materialise it", branch)
 	}
