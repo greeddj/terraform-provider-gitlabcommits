@@ -53,7 +53,7 @@ func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, r
 			"comparison against rendered HCL, or wiring up other resources with the file's commit metadata.",
 		Attributes: map[string]schema.Attribute{
 			"project_id": schema.StringAttribute{
-				Description: "Project ID or URL-encoded path.",
+				Description: "Numeric project ID or the plain project path (e.g. \"group/subgroup/project\"); do not URL-encode it, the provider escapes it.",
 				Required:    true,
 				Validators:  []validator.String{stringNotEmpty()},
 			},

@@ -42,7 +42,7 @@ variable "gitlab_token" {
 ### Optional
 
 - `base_url` (String) GitLab base URL for self-hosted instances. Defaults to https://gitlab.com. May also be provided via GITLAB_BASE_URL environment variable.
-- `max_retries` (Number) Maximum number of retries on transient failures (5xx, 429). Default 5. Set to 0 to disable retries entirely.
-- `retry_wait_max_ms` (Number) Upper bound (ms) of the exponential backoff between retries. Default 30000.
-- `retry_wait_min_ms` (Number) Lower bound (ms) of the exponential backoff between retries. Default 1000.
+- `max_retries` (Number) Maximum number of retries on transient failures (5xx, 429) for read and probe requests. The commit request (POST /repository/commits) is retried only on 429 and on connection failures that happen before the request is sent, never on 5xx, so one apply cannot land two commits. Default 5. Set to 0 to disable retries entirely.
+- `retry_wait_max_ms` (Number) Bounds (ms) the random jitter added to each rate-limited (429) retry wait; the wait itself is the growing base plus that jitter and can exceed this value. Default 30000.
+- `retry_wait_min_ms` (Number) Base wait (ms) between rate-limited (429) retries; it doubles with each attempt and the Ratelimit-Reset header extends it when GitLab sends one. 5xx retries use the client's fixed 700-900 ms schedule instead. Default 1000.
 - `token` (String, Sensitive) GitLab token used for REST API calls. Must have the `api` scope. Personal, Project, or Group access tokens are supported; CI_JOB_TOKEN is not (its allowlist excludes POST /repository/commits). May also be provided via the GITLAB_TOKEN environment variable. See the provider documentation's Authentication section for details.

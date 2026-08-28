@@ -46,7 +46,7 @@ func (d *branchHeadDataSource) Schema(_ context.Context, _ datasource.SchemaRequ
 			"populating last_commit_id when bootstrapping optimistic locking.",
 		Attributes: map[string]schema.Attribute{
 			"project_id": schema.StringAttribute{Required: true,
-				Description: "Project ID or URL-encoded path.",
+				Description: "Numeric project ID or the plain project path (e.g. \"group/subgroup/project\"); do not URL-encode it, the provider escapes it.",
 				Validators:  []validator.String{stringNotEmpty()}},
 			"branch": schema.StringAttribute{Required: true,
 				Description: "Branch name.",

@@ -38,7 +38,7 @@ output "renovate_content" {
 
 - `branch` (String) Branch (or any ref) to read the file from.
 - `file_path` (String) Path of the file inside the repository.
-- `project_id` (String) Project ID or URL-encoded path.
+- `project_id` (String) Numeric project ID or the plain project path (e.g. "group/subgroup/project"); do not URL-encode it, the provider escapes it.
 
 ### Read-Only
 

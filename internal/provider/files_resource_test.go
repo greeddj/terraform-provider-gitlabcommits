@@ -4,7 +4,6 @@
 package provider
 
 import (
-	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -164,7 +163,7 @@ func TestDiffActions(t *testing.T) {
 				Branch:    types.StringValue("main"),
 				Files:     c.state,
 			}
-			actions, err := r.diffActions(context.Background(), plan, state)
+			actions, err := r.diffActions(t.Context(), plan, state)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -208,7 +207,7 @@ func TestDiffActions_ContentEqualBytewise(t *testing.T) {
 		},
 	}
 
-	actions, err := r.diffActions(context.Background(), plan, state)
+	actions, err := r.diffActions(t.Context(), plan, state)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -408,7 +407,7 @@ func TestStampBlobsAfterCommit_FetchesMetadata(t *testing.T) {
 				"b.txt": {Content: types.StringValue("world"), BlobID: types.StringNull()},
 			}
 
-			diags := res.stampBlobs(context.Background(), "proj", "main", files, "deadbeef")
+			diags := res.stampBlobs(t.Context(), "proj", "main", files, "deadbeef")
 			for _, d := range diags {
 				if d.Severity() == 1 { // error
 					t.Errorf("unexpected error diagnostic: %s: %s", d.Summary(), d.Detail())
@@ -482,7 +481,7 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 
 	t.Run("enabled-default", func(t *testing.T) {
 		// OptimisticLock null → defaults to true.
-		actions, err := r.diffActions(context.Background(), plan, state)
+		actions, err := r.diffActions(t.Context(), plan, state)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -503,7 +502,7 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		planNoLock := plan
 		planNoLock.OptimisticLock = types.BoolValue(false)
-		actions, err := r.diffActions(context.Background(), planNoLock, state)
+		actions, err := r.diffActions(t.Context(), planNoLock, state)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -662,6 +661,14 @@ func TestApiErrorDiag(t *testing.T) {
 			contains:    []string{"HTTP 400", "validation failed"},
 		},
 		{
+			// Verbatim Gitaly text when the branch tip moved under the commit
+			// (a writer outside this terraform run).
+			name:        "400-ref-race",
+			err:         mkErr(400, "9:reference update: reference does not point to expected object.", nil),
+			wantSummary: "Branch changed while the commit was being created",
+			contains:    []string{"another writer", "re-run terraform apply"},
+		},
+		{
 			name: "409-conflict", err: mkErr(409, "last commit changed", nil),
 			wantSummary: "Concurrent modification detected (optimistic_lock)",
 			contains:    []string{"refresh-only"},
@@ -684,9 +691,21 @@ func TestApiErrorDiag(t *testing.T) {
 			contains:    []string{"300 MB", "for_each"},
 		},
 		{
-			name: "500-default", err: mkErr(500, "boom", nil),
+			// 5xx: the commit request is never replayed, so the user must be
+			// told the commit may or may not have landed.
+			name: "500-server", err: mkErr(500, "boom", nil),
+			wantSummary: "GitLab server error (HTTP 500)",
+			contains:    []string{"terraform plan", "boom"},
+		},
+		{
+			name: "502-server", err: mkErr(502, "bad gateway", nil),
+			wantSummary: "GitLab server error (HTTP 502)",
+			contains:    []string{"may or may not have landed", "bad gateway"},
+		},
+		{
+			name: "422-default", err: mkErr(422, "unprocessable", nil),
 			wantSummary: "GitLab API error: act",
-			contains:    []string{"HTTP 500", "boom"},
+			contains:    []string{"HTTP 422", "unprocessable"},
 		},
 		{
 			name: "plain-error", err: errors.New("connection refused"),
@@ -772,7 +791,7 @@ func TestStampBlobs_OneProbeFailure(t *testing.T) {
 		"good-path": {Content: types.StringValue("good"), BlobID: types.StringNull()},
 	}
 
-	diags := res.stampBlobs(context.Background(), "proj", "main", files, "deadbeef")
+	diags := res.stampBlobs(t.Context(), "proj", "main", files, "deadbeef")
 
 	if diags.HasError() {
 		t.Fatalf("expected no errors, got: %v", diags.Errors())
@@ -841,7 +860,7 @@ func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
 		"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
 	}
 
-	diags := res.stampBlobs(context.Background(), "proj", "main", files, "deadbeef")
+	diags := res.stampBlobs(t.Context(), "proj", "main", files, "deadbeef")
 
 	if diags.HasError() {
 		t.Fatalf("expected no errors, got: %v", diags.Errors())
@@ -913,7 +932,7 @@ func TestStampBlobs_ProbesAtCreatedCommit(t *testing.T) {
 		"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
 	}
 
-	diags := res.stampBlobs(context.Background(), "proj", "main", files, ourCommitSHA)
+	diags := res.stampBlobs(t.Context(), "proj", "main", files, ourCommitSHA)
 	if diags.HasError() {
 		t.Fatalf("unexpected error: %v", diags.Errors())
 	}

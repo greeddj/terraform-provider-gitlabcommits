@@ -9,8 +9,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"sort"
+	"net"
+	"net/http"
+	"slices"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -44,7 +47,73 @@ func NewFilesResource() resource.Resource {
 }
 
 type filesResource struct {
-	client *gitlab.Client
+	client       *gitlab.Client
+	locks        *branchLocks
+	retryCommits bool
+}
+
+// resourceDeps is what the provider hands every resource through
+// ResourceData: the shared client, the per-branch commit locks shared by all
+// resource instances in this process, and whether the commit request may be
+// retried at all (false when max_retries = 0: a per-request retry policy
+// would otherwise bypass client-go's WithoutRetries).
+type resourceDeps struct {
+	client       *gitlab.Client
+	locks        *branchLocks
+	retryCommits bool
+}
+
+// branchLocks serialises commits per (project, branch) within one provider
+// process. Terraform applies resource instances concurrently (-parallelism),
+// and two CreateCommit calls racing on the same branch tip make GitLab reject
+// the loser with "reference update: reference does not point to expected
+// object"; holding the branch lock around the commit removes that race
+// without merging or splitting commits, so every resource still lands exactly
+// one. Writers outside this process are not covered and surface through
+// apiErrorDiag.
+type branchLocks struct {
+	locks map[string]chan struct{}
+	mu    sync.Mutex
+}
+
+func newBranchLocks() *branchLocks {
+	return &branchLocks{locks: map[string]chan struct{}{}}
+}
+
+// acquire blocks until the (project, branch) lock is free or ctx is done and
+// returns the matching release func. The key is the verbatim project_id, so
+// resources sharing a branch must spell it the same way. release is
+// idempotent so a caller can defer it for the error paths and still call it
+// early once the critical section is over.
+func (b *branchLocks) acquire(ctx context.Context, project, branch string) (func(), error) {
+	key := buildID(project, branch)
+	b.mu.Lock()
+	ch, ok := b.locks[key]
+	if !ok {
+		ch = make(chan struct{}, 1)
+		b.locks[key] = ch
+	}
+	b.mu.Unlock()
+	select {
+	case ch <- struct{}{}:
+		return sync.OnceFunc(func() { <-ch }), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// isCommitSHA reports whether s is a full SHA-1 or SHA-256 hex object id, the
+// one shape create_branch_from can take besides a branch name.
+func isCommitSHA(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 type filesResourceModel struct {
@@ -80,7 +149,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 		Description: "Manages a set of files in a single GitLab repository on a single branch. " +
 			"Every change (create / update / delete / chmod) is batched into ONE commit per terraform apply, " +
 			"which means one CI pipeline run per resource. Use one resource per logical bundle " +
-			"(typically per service) so each apply produces exactly one commit per service.",
+			"(typically per service) so each apply produces exactly one commit per service. " +
+			"Commits are serialised per branch within one provider configuration, so for_each resources sharing one " +
+			"branch never race on its tip, and the commit request is retried only on HTTP 429, never on 5xx, " +
+			"so one apply can never land two commits.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Description: "Composite identifier: \"<project_id>::<branch>\".",
@@ -90,8 +162,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 			},
 			"project_id": schema.StringAttribute{
-				Description: "Project ID or URL-encoded path (e.g. \"group/project\" or \"12345\").",
-				Required:    true,
+				Description: "Numeric project ID or the plain project path (e.g. \"group/subgroup/project\"); do not URL-encode it, " +
+					"the provider escapes it. Changing it forces replacement: with the default delete_on_destroy = true the " +
+					"replacement first pushes a commit deleting every managed file from the old project and branch.",
+				Required: true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
 				},
@@ -106,8 +180,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 			},
 			"branch": schema.StringAttribute{
-				Description: "Target branch. Must already exist, or set create_branch_from to materialise it.",
-				Required:    true,
+				Description: "Target branch. Must already exist, or set create_branch_from to materialise it. " +
+					"Changing it forces replacement: with the default delete_on_destroy = true the replacement first pushes " +
+					"a commit deleting every managed file from the old branch before creating them on the new one.",
+				Required: true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
 				},
@@ -149,7 +225,9 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			},
 			"delete_on_destroy": schema.BoolAttribute{
 				Description: "If true (default), terraform destroy creates one commit that removes every managed file. " +
-					"Set to false to keep files in place when the resource is removed from state.",
+					"Set to false to keep files in place when the resource is removed from state. " +
+					"Terraform does not evaluate configuration during destroy, so this value is read from the state " +
+					"written by the last apply: a change made in HCL must be applied before terraform destroy honours it.",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
@@ -166,16 +244,19 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			},
 			"create_branch_from": schema.StringAttribute{
 				Description: "If set and `branch` does not yet exist, the provider creates it from this " +
-					"source ref (typically \"main\") on first apply. Only consulted by Create; once " +
-					"the branch exists, changing or removing this value is a state-only no-op " +
-					"(no destroy / recreate).",
+					"branch name or full commit SHA (typically \"main\"; tags are not supported) together with " +
+					"the first commit, as one push event. " +
+					"Only consulted by Create; once the branch exists, changing or removing this value is a " +
+					"state-only no-op (no destroy / recreate). A branch created this way is not deleted by " +
+					"terraform destroy; only the managed files are.",
 				Optional: true,
 			},
 			"optimistic_lock": schema.BoolAttribute{
 				Description: "If true (default), update / delete / chmod actions send the file's last_commit_id to GitLab. " +
 					"GitLab rejects the action with HTTP 400 if the file has been modified by anyone else since " +
 					"this resource last touched it, preventing silent overwrites in concurrent pipelines. " +
-					"Set to false to opt out (useful when an external process intentionally co-edits the same files).",
+					"Set to false to opt out (useful when an external process intentionally co-edits the same files). " +
+					"Like delete_on_destroy, the destroy commit uses the value recorded by the last apply.",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
@@ -244,15 +325,17 @@ func (r *filesResource) Configure(_ context.Context, req resource.ConfigureReque
 	if req.ProviderData == nil {
 		return
 	}
-	client, ok := req.ProviderData.(*gitlab.Client)
+	deps, ok := req.ProviderData.(*resourceDeps)
 	if !ok {
 		resp.Diagnostics.AddError(
 			"Unexpected Resource Configure Type",
-			fmt.Sprintf("Expected *gitlab.Client, got: %T. Please report this to the provider developers.", req.ProviderData),
+			fmt.Sprintf("Expected *resourceDeps, got: %T. Please report this to the provider developers.", req.ProviderData),
 		)
 		return
 	}
-	r.client = client
+	r.client = deps.client
+	r.locks = deps.locks
+	r.retryCommits = deps.retryCommits
 }
 
 // Create pushes one commit that materialises every file in the plan. If
@@ -275,6 +358,16 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 	project := plan.ProjectID.ValueString()
 	branch := plan.Branch.ValueString()
 	createFrom := plan.CreateBranchFrom.ValueString()
+
+	// The lock spans from the branch check through the commit: two instances
+	// materialising the same branch must see each other's work, or the second
+	// one would try to create a branch that by then exists.
+	release, lockErr := r.locks.acquire(ctx, project, branch)
+	if lockErr != nil {
+		resp.Diagnostics.AddError("Cancelled while waiting for the branch lock", lockErr.Error())
+		return
+	}
+	defer release()
 
 	branchExists, existsErr := r.branchExists(ctx, project, branch)
 	if existsErr != nil {
@@ -315,30 +408,36 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 		actions = append(actions, acts...)
 	}
 
-	// The branch is created only after every action validated: failing on a
-	// bad file before touching the repository avoids orphaning a freshly
-	// created branch that the failed Create will never commit to.
+	opts := commitOptions(plan, actions)
+	action := "creating commit"
 	if !branchExists {
-		if err := r.createBranch(ctx, project, branch, createFrom); err != nil {
-			summary, detail := apiErrorDiag("ensuring branch exists", project, branch, err)
-			resp.Diagnostics.AddError(summary, detail)
-			return
+		// start_branch / start_sha make GitLab create the branch and land the
+		// commit in one operation: a server-side rejection (push rule,
+		// pre-receive hook) leaves no empty orphaned branch behind, and CI
+		// sees one push event instead of a branch creation followed by a
+		// commit. The commits API keeps the two apart where the branches API
+		// took either as "ref".
+		if isCommitSHA(createFrom) {
+			opts.StartSHA = new(createFrom)
+		} else {
+			opts.StartBranch = new(createFrom)
 		}
+		action = fmt.Sprintf("creating branch %q from create_branch_from ref %q with the first commit", branch, createFrom)
 	}
 
 	tflog.Debug(ctx, "Creating GitLab files commit", map[string]any{
-		"project_id": plan.ProjectID.ValueString(),
-		"branch":     plan.Branch.ValueString(),
-		"actions":    len(actions),
+		"project_id":    project,
+		"branch":        branch,
+		"actions":       len(actions),
+		"create_branch": !branchExists,
 	})
 
-	commit, _, err := r.client.Commits.CreateCommit(
-		plan.ProjectID.ValueString(),
-		commitOptions(plan, actions),
-		gitlab.WithContext(ctx),
-	)
+	commit, _, err := r.client.Commits.CreateCommit(project, opts, r.commitRequestOptions(ctx)...)
+	// stampBlobs probes the immutable commit just created, so it needs no
+	// lock; release here rather than at the deferred return.
+	release()
 	if err != nil {
-		summary, detail := apiErrorDiag("creating commit", plan.ProjectID.ValueString(), plan.Branch.ValueString(), err)
+		summary, detail := apiErrorDiag(action, project, branch, err)
 		resp.Diagnostics.AddError(summary, detail)
 		return
 	}
@@ -598,11 +697,18 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 		"actions":    len(actions),
 	})
 
+	release, err := r.locks.acquire(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Cancelled while waiting for the branch lock", err.Error())
+		return
+	}
+	defer release()
 	commit, _, err := r.client.Commits.CreateCommit(
 		plan.ProjectID.ValueString(),
 		commitOptions(plan, actions),
-		gitlab.WithContext(ctx),
+		r.commitRequestOptions(ctx)...,
 	)
+	release()
 	if err != nil {
 		summary, detail := apiErrorDiag("pushing update commit", plan.ProjectID.ValueString(), plan.Branch.ValueString(), err)
 		resp.Diagnostics.AddError(summary, detail)
@@ -672,7 +778,7 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 			continue
 		}
 		a := &gitlab.CommitActionOptions{
-			Action:   gitlab.Ptr(gitlab.FileDelete),
+			Action:   new(gitlab.FileDelete),
 			FilePath: new(p),
 		}
 		if useLock {
@@ -687,7 +793,14 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 		return
 	}
 
-	_, _, err := r.client.Commits.CreateCommit(project, commitOptions(state, actions), gitlab.WithContext(ctx))
+	release, err := r.locks.acquire(ctx, project, branch)
+	if err != nil {
+		resp.Diagnostics.AddError("Cancelled while waiting for the branch lock", err.Error())
+		return
+	}
+	defer release()
+	_, _, err = r.client.Commits.CreateCommit(project, commitOptions(state, actions), r.commitRequestOptions(ctx)...)
+	release()
 	if err != nil {
 		summary, detail := apiErrorDiag("pushing destroy commit", project, branch, err)
 		resp.Diagnostics.AddError(summary, detail)
@@ -789,7 +902,7 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 		stateExec := sf.ExecuteFilemode.ValueBool()
 		if planExec != stateExec {
 			chmod := &gitlab.CommitActionOptions{
-				Action:          gitlab.Ptr(gitlab.FileChmod),
+				Action:          new(gitlab.FileChmod),
 				FilePath:        new(p),
 				ExecuteFilemode: new(planExec),
 			}
@@ -805,7 +918,7 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 			continue
 		}
 		del := &gitlab.CommitActionOptions{
-			Action:   gitlab.Ptr(gitlab.FileDelete),
+			Action:   new(gitlab.FileDelete),
 			FilePath: new(p),
 		}
 		if useLock {
@@ -881,7 +994,7 @@ func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) (
 	actions := []*gitlab.CommitActionOptions{a}
 	if probe.exists && probe.executeFilemode != f.ExecuteFilemode.ValueBool() {
 		chmod := &gitlab.CommitActionOptions{
-			Action:          gitlab.Ptr(gitlab.FileChmod),
+			Action:          new(gitlab.FileChmod),
 			FilePath:        new(p),
 			ExecuteFilemode: new(f.ExecuteFilemode.ValueBool()),
 		}
@@ -944,22 +1057,6 @@ func (r *filesResource) missingBranchPreflight(ctx context.Context, project, bra
 	if createFrom == "" {
 		return fmt.Errorf("branch %q does not exist; set create_branch_from to materialise it", branch)
 	}
-	return nil
-}
-
-func (r *filesResource) createBranch(ctx context.Context, project, branch, createFrom string) error {
-	_, _, err := r.client.Branches.CreateBranch(project, &gitlab.CreateBranchOptions{
-		Branch: new(branch),
-		Ref:    new(createFrom),
-	}, gitlab.WithContext(ctx))
-	if err != nil {
-		return fmt.Errorf("creating branch %q from create_branch_from ref %q: %w", branch, createFrom, err)
-	}
-	tflog.Info(ctx, "Created GitLab branch", map[string]any{
-		"project_id": project,
-		"branch":     branch,
-		"from":       createFrom,
-	})
 	return nil
 }
 
@@ -1203,8 +1300,7 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			"(GitLab answers 404 for missing access as well).", prefix)
 	}
 
-	var resp *gitlab.ErrorResponse
-	if errors.As(err, &resp) && resp.Response != nil {
+	if resp, ok := errors.AsType[*gitlab.ErrorResponse](err); ok && resp.Response != nil {
 		status := resp.Response.StatusCode
 		body := truncateForDiag(resp.Message)
 		switch status {
@@ -1235,6 +1331,19 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 				return summary, fmt.Sprintf("%s: a file was modified by someone else since this resource last touched it. "+
 					"Run `terraform apply -refresh-only` to pull current state, then re-plan. Body: %s", prefix, body)
 			}
+			// Gitaly refuses to move the ref when the branch tip changed between
+			// reading it and writing the commit: "reference update: reference
+			// does not point to expected object". Commits are serialised per
+			// branch inside this process, so this means a writer outside this
+			// terraform run.
+			if strings.Contains(lower, "expected object") {
+				summary = "Branch changed while the commit was being created"
+				return summary, fmt.Sprintf("%s: another writer pushed to the branch while GitLab was building this commit, "+
+					"so the ref update was refused and nothing was committed. This provider serialises its own commits per "+
+					"branch within one provider configuration (each provider block runs in its own process), so the other "+
+					"writer is another process: a different pipeline, a manual push, a bot, or a second provider block "+
+					"(alias) targeting the same branch. Wait for it to finish and re-run terraform apply. Body: %s", prefix, body)
+			}
 			return summary, fmt.Sprintf("%s: HTTP %d. Body: %s", prefix, status, body)
 		case 413:
 			// GitLab rejects a commit request whose body exceeds a cap (default
@@ -1255,11 +1364,58 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			}
 			return summary, fmt.Sprintf("%s: retry after %s seconds. Body: %s", prefix, retryAfter, body)
 		default:
+			if status >= 500 {
+				// A commit request is deliberately never replayed on 5xx (see
+				// commitRetryPolicy), so the user has to find out whether it
+				// landed; reads were already retried by the client.
+				summary = fmt.Sprintf("GitLab server error (HTTP %d)", status)
+				return summary, fmt.Sprintf("%s: GitLab did not complete the request. A commit request is not retried by "+
+					"this provider (a replay could land a second commit), so if this was one the commit may or may not "+
+					"have landed: run `terraform plan` to see the repository state before applying again. Body: %s", prefix, body)
+			}
 			return summary, fmt.Sprintf("%s: HTTP %d. Body: %s", prefix, status, body)
 		}
 	}
 
 	return summary, fmt.Sprintf("%s: %s", prefix, err.Error())
+}
+
+// commitRequestOptions returns the request options for POST /repository/commits:
+// the context plus, when retries are enabled, the commit-specific retry policy.
+func (r *filesResource) commitRequestOptions(ctx context.Context) []gitlab.RequestOptionFunc {
+	opts := []gitlab.RequestOptionFunc{gitlab.WithContext(ctx)}
+	if r.retryCommits {
+		opts = append(opts, gitlab.WithRequestRetry(commitRetryPolicy))
+	}
+	return opts
+}
+
+// commitRetryPolicy replaces client-go's default retry check for the commit
+// request only. The default retries every 5xx regardless of method, and a
+// 502/504 from a proxy after GitLab already landed the commit would replay
+// the POST and produce a second commit for the same apply. Retry only a 429
+// (rejected before processing) and failures that provably happened before
+// anything reached the wire (DNS, dial); everything else fails loudly and the
+// user reconciles with terraform plan.
+func commitRetryPolicy(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if err != nil {
+		if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
+			return !dnsErr.IsNotFound, nil
+		}
+		if opErr, ok := errors.AsType[*net.OpError](err); ok {
+			return opErr.Op == "dial", nil
+		}
+		// net/http reports a handshake timeout as a plain error string; the
+		// handshake precedes the request body, so it is pre-wire as well.
+		if strings.Contains(err.Error(), "net/http: TLS handshake timeout") {
+			return true, nil
+		}
+		return false, nil
+	}
+	return resp.StatusCode == http.StatusTooManyRequests, nil
 }
 
 // commitOptions assembles CreateCommitOptions from the shared resource fields
@@ -1306,7 +1462,7 @@ func sortedKeys[V any](m map[string]V) []string {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	return keys
 }
 

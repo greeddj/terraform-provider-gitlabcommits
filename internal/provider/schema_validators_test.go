@@ -4,7 +4,6 @@
 package provider
 
 import (
-	"context"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
@@ -21,7 +20,7 @@ import (
 // synthetic flat config stands in for the nested file object, so no
 // resource.Test machinery is needed.
 func TestStringConflictsWithSibling(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	sch := rschema.Schema{Attributes: map[string]rschema.Attribute{
 		"content":        rschema.StringAttribute{Optional: true},
 		"content_base64": rschema.StringAttribute{Optional: true},
@@ -98,7 +97,7 @@ func TestObjectFileContentRequired(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			resp := &validator.ObjectResponse{}
-			objectFileContentRequired().ValidateObject(context.Background(),
+			objectFileContentRequired().ValidateObject(t.Context(),
 				validator.ObjectRequest{Path: path.Root("files").AtMapKey("x"), ConfigValue: c.obj}, resp)
 			if c.wantErr != resp.Diagnostics.HasError() {
 				t.Fatalf("wantErr=%v, got diags=%v", c.wantErr, resp.Diagnostics)
@@ -126,7 +125,7 @@ func TestStringNotEmpty(t *testing.T) {
 				Path:        path.Root("attr"),
 			}
 			resp := &validator.StringResponse{}
-			stringNotEmpty().ValidateString(context.Background(), req, resp)
+			stringNotEmpty().ValidateString(t.Context(), req, resp)
 			if got := resp.Diagnostics.HasError(); got != c.wantErr {
 				t.Fatalf("hasError=%v want %v; diags=%v", got, c.wantErr, resp.Diagnostics)
 			}
@@ -154,7 +153,7 @@ func TestStringMatchesRegex(t *testing.T) {
 				Path:        path.Root("attr"),
 			}
 			resp := &validator.StringResponse{}
-			v.ValidateString(context.Background(), req, resp)
+			v.ValidateString(t.Context(), req, resp)
 			if got := resp.Diagnostics.HasError(); got != c.wantErr {
 				t.Fatalf("hasError=%v want %v", got, c.wantErr)
 			}
@@ -190,7 +189,7 @@ func TestMapNonEmpty(t *testing.T) {
 				Path:        path.Root("files"),
 			}
 			resp := &validator.MapResponse{}
-			mapNonEmpty().ValidateMap(context.Background(), req, resp)
+			mapNonEmpty().ValidateMap(t.Context(), req, resp)
 			if got := resp.Diagnostics.HasError(); got != c.wantErr {
 				t.Fatalf("hasError=%v want %v", got, c.wantErr)
 			}
@@ -233,7 +232,7 @@ func TestMapKeysValidRepoPath(t *testing.T) {
 				Path:        path.Root("files"),
 			}
 			resp := &validator.MapResponse{}
-			v.ValidateMap(context.Background(), req, resp)
+			v.ValidateMap(t.Context(), req, resp)
 			if got := resp.Diagnostics.HasError(); got != c.wantErr {
 				t.Fatalf("hasError=%v want %v; diags=%v", got, c.wantErr, resp.Diagnostics)
 			}

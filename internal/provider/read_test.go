@@ -4,12 +4,12 @@
 package provider
 
 import (
-	"context"
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -48,8 +48,8 @@ func readState(blobID string) filesResourceModel {
 // response and (on success) the resulting state model.
 func runRead(t *testing.T, client *gitlab.Client, state filesResourceModel) (*resource.ReadResponse, filesResourceModel) {
 	t.Helper()
-	ctx := context.Background()
-	res := &filesResource{client: client}
+	ctx := t.Context()
+	res := newTestResource(client)
 
 	sresp := &resource.SchemaResponse{}
 	res.Schema(ctx, resource.SchemaRequest{}, sresp)
@@ -82,6 +82,28 @@ func newReadClient(t *testing.T, h http.HandlerFunc) *gitlab.Client {
 		t.Fatalf("NewClient: %v", err)
 	}
 	return client
+}
+
+// newTestResource mirrors what Configure wires for max_retries = 0: the
+// client, fresh branch locks, and no commit retry policy.
+func newTestResource(client *gitlab.Client) *filesResource {
+	return &filesResource{client: client, locks: newBranchLocks()}
+}
+
+// newRetryingResource mirrors the max_retries > 0 wiring: a client that
+// retries (bounded, with a millisecond backoff so a faked 429 does not stall
+// the test) and the commit-specific retry policy on the commit request.
+func newRetryingResource(t *testing.T, h http.HandlerFunc) *filesResource {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"),
+		gitlab.WithCustomRetryMax(2),
+		gitlab.WithCustomRetryWaitMinMax(time.Millisecond, 2*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	return &filesResource{client: client, locks: newBranchLocks(), retryCommits: true}
 }
 
 // TestRead_DropsMissingFile covers the drift drop-pass (tests-coverage A): a

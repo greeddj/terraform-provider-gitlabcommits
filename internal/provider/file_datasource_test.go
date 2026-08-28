@@ -4,7 +4,6 @@
 package provider
 
 import (
-	"context"
 	"encoding/base64"
 	"net/http"
 	"strings"
@@ -22,7 +21,7 @@ import (
 func runFileDataSourceRead(t *testing.T, client *gitlab.Client) (*datasource.ReadResponse, fileDataSourceModel) {
 	t.Helper()
 	d := &fileDataSource{client: client}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	schemaResp := &datasource.SchemaResponse{}
 	d.Schema(ctx, datasource.SchemaRequest{}, schemaResp)

@@ -35,7 +35,7 @@ output "main_is_protected" {
 ### Required
 
 - `branch` (String) Branch name.
-- `project_id` (String) Project ID or URL-encoded path.
+- `project_id` (String) Numeric project ID or the plain project path (e.g. "group/subgroup/project"); do not URL-encode it, the provider escapes it.
 
 ### Read-Only
 

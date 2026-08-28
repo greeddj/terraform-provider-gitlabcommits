@@ -3,12 +3,12 @@
 page_title: "gitlabcommits_files Resource - gitlabcommits"
 subcategory: ""
 description: |-
-  Manages a set of files in a single GitLab repository on a single branch. Every change (create / update / delete / chmod) is batched into ONE commit per terraform apply, which means one CI pipeline run per resource. Use one resource per logical bundle (typically per service) so each apply produces exactly one commit per service.
+  Manages a set of files in a single GitLab repository on a single branch. Every change (create / update / delete / chmod) is batched into ONE commit per terraform apply, which means one CI pipeline run per resource. Use one resource per logical bundle (typically per service) so each apply produces exactly one commit per service. Commits are serialised per branch within one provider configuration, so for_each resources sharing one branch never race on its tip, and the commit request is retried only on HTTP 429, never on 5xx, so one apply can never land two commits.
 ---
 
 # gitlabcommits_files (Resource)
 
-Manages a set of files in a single GitLab repository on a single branch. Every change (create / update / delete / chmod) is batched into ONE commit per terraform apply, which means one CI pipeline run per resource. Use one resource per logical bundle (typically per service) so each apply produces exactly one commit per service.
+Manages a set of files in a single GitLab repository on a single branch. Every change (create / update / delete / chmod) is batched into ONE commit per terraform apply, which means one CI pipeline run per resource. Use one resource per logical bundle (typically per service) so each apply produces exactly one commit per service. Commits are serialised per branch within one provider configuration, so for_each resources sharing one branch never race on its tip, and the commit request is retried only on HTTP 429, never on 5xx, so one apply can never land two commits.
 
 ## Example Usage
 
@@ -59,20 +59,20 @@ resource "gitlabcommits_files" "service" {
 
 ### Required
 
-- `branch` (String) Target branch. Must already exist, or set create_branch_from to materialise it.
+- `branch` (String) Target branch. Must already exist, or set create_branch_from to materialise it. Changing it forces replacement: with the default delete_on_destroy = true the replacement first pushes a commit deleting every managed file from the old branch before creating them on the new one.
 - `commit_message` (String) Message used for any commit (create / update / destroy) the resource produces. Only takes effect on an apply that actually changes file content, mode, or set; editing just commit_message or the author fields produces no commit, so the new value applies to the next change.
 - `files` (Attributes Map) Map of repository_path → file definition. The map key is the path inside the repo. (see [below for nested schema](#nestedatt--files))
-- `project_id` (String) Project ID or URL-encoded path (e.g. "group/project" or "12345").
+- `project_id` (String) Numeric project ID or the plain project path (e.g. "group/subgroup/project"); do not URL-encode it, the provider escapes it. Changing it forces replacement: with the default delete_on_destroy = true the replacement first pushes a commit deleting every managed file from the old project and branch.
 
 ### Optional
 
 - `adopt_existing` (Boolean) If true (default), files that exist in the repository but are not yet in state are adopted on the next apply: a create-action targeting an existing path is silently rewritten as an update. When optimistic_lock is enabled, that adopt-update carries the file's current commit, so a concurrent external modification is still detected instead of being overwritten. Required for terraform import to converge cleanly.
 - `author_email` (String) Optional override for commit author email.
 - `author_name` (String) Optional override for commit author name.
-- `create_branch_from` (String) If set and `branch` does not yet exist, the provider creates it from this source ref (typically "main") on first apply. Only consulted by Create; once the branch exists, changing or removing this value is a state-only no-op (no destroy / recreate).
-- `delete_on_destroy` (Boolean) If true (default), terraform destroy creates one commit that removes every managed file. Set to false to keep files in place when the resource is removed from state.
+- `create_branch_from` (String) If set and `branch` does not yet exist, the provider creates it from this branch name or full commit SHA (typically "main"; tags are not supported) together with the first commit, as one push event. Only consulted by Create; once the branch exists, changing or removing this value is a state-only no-op (no destroy / recreate). A branch created this way is not deleted by terraform destroy; only the managed files are.
+- `delete_on_destroy` (Boolean) If true (default), terraform destroy creates one commit that removes every managed file. Set to false to keep files in place when the resource is removed from state. Terraform does not evaluate configuration during destroy, so this value is read from the state written by the last apply: a change made in HCL must be applied before terraform destroy honours it.
 - `detect_drift` (Boolean) If true (default), Read fetches each managed file from GitLab and updates state when the remote blob differs, so terraform plan reflects the real repository state.
-- `optimistic_lock` (Boolean) If true (default), update / delete / chmod actions send the file's last_commit_id to GitLab. GitLab rejects the action with HTTP 400 if the file has been modified by anyone else since this resource last touched it, preventing silent overwrites in concurrent pipelines. Set to false to opt out (useful when an external process intentionally co-edits the same files).
+- `optimistic_lock` (Boolean) If true (default), update / delete / chmod actions send the file's last_commit_id to GitLab. GitLab rejects the action with HTTP 400 if the file has been modified by anyone else since this resource last touched it, preventing silent overwrites in concurrent pipelines. Set to false to opt out (useful when an external process intentionally co-edits the same files). Like delete_on_destroy, the destroy commit uses the value recorded by the last apply.
 
 ### Read-Only
 

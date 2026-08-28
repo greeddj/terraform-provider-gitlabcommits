@@ -5,10 +5,16 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -18,8 +24,12 @@ import (
 
 func runDelete(t *testing.T, client *gitlab.Client, state filesResourceModel) *resource.DeleteResponse {
 	t.Helper()
-	ctx := context.Background()
-	res := &filesResource{client: client}
+	return runDeleteOn(t, newTestResource(client), state)
+}
+
+func runDeleteOn(t *testing.T, res *filesResource, state filesResourceModel) *resource.DeleteResponse {
+	t.Helper()
+	ctx := t.Context()
 
 	sresp := &resource.SchemaResponse{}
 	res.Schema(ctx, resource.SchemaRequest{}, sresp)
@@ -36,8 +46,22 @@ func runDelete(t *testing.T, client *gitlab.Client, state filesResourceModel) *r
 
 func runUpdate(t *testing.T, client *gitlab.Client, plan, state filesResourceModel) *resource.UpdateResponse {
 	t.Helper()
-	ctx := context.Background()
-	res := &filesResource{client: client}
+	return runUpdateOn(t, newTestResource(client), plan, state)
+}
+
+func runUpdateOn(t *testing.T, res *filesResource, plan, state filesResourceModel) *resource.UpdateResponse {
+	t.Helper()
+	req, resp := updateRequest(t, res, plan, state)
+	res.Update(t.Context(), req, resp)
+	return resp
+}
+
+// updateRequest builds the plan/state pair for res.Update. Kept apart from
+// runUpdateOn so concurrency tests build requests on the test goroutine
+// (t.Fatalf must not run anywhere else) and only call Update from workers.
+func updateRequest(t *testing.T, res *filesResource, plan, state filesResourceModel) (resource.UpdateRequest, *resource.UpdateResponse) {
+	t.Helper()
+	ctx := t.Context()
 
 	sresp := &resource.SchemaResponse{}
 	res.Schema(ctx, resource.SchemaRequest{}, sresp)
@@ -51,15 +75,25 @@ func runUpdate(t *testing.T, client *gitlab.Client, plan, state filesResourceMod
 	if d := st.Set(ctx, &state); d.HasError() {
 		t.Fatalf("state.Set: %v", d)
 	}
-	resp := &resource.UpdateResponse{State: tfsdk.State{Schema: sch}}
-	res.Update(ctx, resource.UpdateRequest{Plan: pl, State: st}, resp)
-	return resp
+	return resource.UpdateRequest{Plan: pl, State: st}, &resource.UpdateResponse{State: tfsdk.State{Schema: sch}}
 }
 
 func runCreate(t *testing.T, client *gitlab.Client, plan filesResourceModel) *resource.CreateResponse {
 	t.Helper()
-	ctx := context.Background()
-	res := &filesResource{client: client}
+	return runCreateOn(t, newTestResource(client), plan)
+}
+
+func runCreateOn(t *testing.T, res *filesResource, plan filesResourceModel) *resource.CreateResponse {
+	t.Helper()
+	req, resp := createRequest(t, res, plan)
+	res.Create(t.Context(), req, resp)
+	return resp
+}
+
+// createRequest is the Create counterpart of updateRequest.
+func createRequest(t *testing.T, res *filesResource, plan filesResourceModel) (resource.CreateRequest, *resource.CreateResponse) {
+	t.Helper()
+	ctx := t.Context()
 
 	sresp := &resource.SchemaResponse{}
 	res.Schema(ctx, resource.SchemaRequest{}, sresp)
@@ -69,9 +103,7 @@ func runCreate(t *testing.T, client *gitlab.Client, plan filesResourceModel) *re
 	if d := pl.Set(ctx, &plan); d.HasError() {
 		t.Fatalf("plan.Set: %v", d)
 	}
-	resp := &resource.CreateResponse{State: tfsdk.State{Schema: sch}}
-	res.Create(ctx, resource.CreateRequest{Plan: pl}, resp)
-	return resp
+	return resource.CreateRequest{Plan: pl}, &resource.CreateResponse{State: tfsdk.State{Schema: sch}}
 }
 
 // TestCreate_NullCommitBodyErrors pins the DOS-1 guard in Create: a 2xx
@@ -363,7 +395,7 @@ func TestCreate_HappyPathStampsState(t *testing.T) {
 	}
 
 	var out filesResourceModel
-	if d := resp.State.Get(context.Background(), &out); d.HasError() {
+	if d := resp.State.Get(t.Context(), &out); d.HasError() {
 		t.Fatalf("state.Get: %v", d)
 	}
 	if out.CommitSHA.ValueString() != "newsha" {
@@ -460,7 +492,7 @@ func TestUpdate_HappyPathStampsState(t *testing.T) {
 		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
 	}
 	var out filesResourceModel
-	if d := resp.State.Get(context.Background(), &out); d.HasError() {
+	if d := resp.State.Get(t.Context(), &out); d.HasError() {
 		t.Fatalf("state.Get: %v", d)
 	}
 	if out.CommitSHA.ValueString() != "upsha" {
@@ -472,17 +504,16 @@ func TestUpdate_HappyPathStampsState(t *testing.T) {
 	}
 }
 
-// TestBranchHelpers drives the branch lifecycle helpers directly: existence
-// check outcomes, the missing-branch preflight, and branch creation with the
-// right payload.
+// TestBranchHelpers drives the branch helpers directly: existence check
+// outcomes and the missing-branch preflight.
 func TestBranchHelpers(t *testing.T) {
 	t.Run("branchExists true", func(t *testing.T) {
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
 		})
-		r := &filesResource{client: client}
-		ok, err := r.branchExists(context.Background(), "proj", "main")
+		r := newTestResource(client)
+		ok, err := r.branchExists(t.Context(), "proj", "main")
 		if err != nil || !ok {
 			t.Fatalf("want (true, nil), got (%v, %v)", ok, err)
 		}
@@ -492,8 +523,8 @@ func TestBranchHelpers(t *testing.T) {
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no branch", http.StatusNotFound)
 		})
-		r := &filesResource{client: client}
-		ok, err := r.branchExists(context.Background(), "proj", "feature")
+		r := newTestResource(client)
+		ok, err := r.branchExists(t.Context(), "proj", "feature")
 		if err != nil || ok {
 			t.Fatalf("want (false, nil), got (%v, %v)", ok, err)
 		}
@@ -503,8 +534,8 @@ func TestBranchHelpers(t *testing.T) {
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 		})
-		r := &filesResource{client: client}
-		_, err := r.branchExists(context.Background(), "proj", "main")
+		r := newTestResource(client)
+		_, err := r.branchExists(t.Context(), "proj", "main")
 		if err == nil || !strings.Contains(err.Error(), "checking branch") {
 			t.Fatalf("want a checking-branch error, got: %v", err)
 		}
@@ -515,8 +546,8 @@ func TestBranchHelpers(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":1,"empty_repo":true}`))
 		})
-		r := &filesResource{client: client}
-		err := r.missingBranchPreflight(context.Background(), "proj", "feature", "main")
+		r := newTestResource(client)
+		err := r.missingBranchPreflight(t.Context(), "proj", "feature", "main")
 		if err == nil || !strings.Contains(err.Error(), "no commits") {
 			t.Fatalf("want the empty-repository diagnostic, got: %v", err)
 		}
@@ -527,52 +558,62 @@ func TestBranchHelpers(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
 		})
-		r := &filesResource{client: client}
-		err := r.missingBranchPreflight(context.Background(), "proj", "feature", "")
+		r := newTestResource(client)
+		err := r.missingBranchPreflight(t.Context(), "proj", "feature", "")
 		if err == nil || !strings.Contains(err.Error(), "create_branch_from") {
 			t.Fatalf("want the create_branch_from hint, got: %v", err)
 		}
 	})
 
-	t.Run("createBranch sends branch and ref", func(t *testing.T) {
-		var createBody string
-		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-			b, _ := io.ReadAll(r.Body)
-			createBody = string(b)
+}
+
+// TestCreate_StartBranchRejectionNamesRef: when GitLab rejects the first
+// commit that was to materialise the branch, the diagnostic names the branch
+// and the create_branch_from ref, since that pairing is the usual culprit.
+func TestCreate_StartBranchRejectionNamesRef(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			http.Error(w, "no branch yet", http.StatusNotFound)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusCreated)
-			_, _ = w.Write([]byte(`{"name":"feature","commit":{"id":"base"}}`))
-		})
-		r := &filesResource{client: client}
-		if err := r.createBranch(context.Background(), "proj", "feature", "main"); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !strings.Contains(createBody, `"branch":"feature"`) || !strings.Contains(createBody, `"ref":"main"`) {
-			t.Errorf("create-branch payload must carry branch and ref, got: %s", createBody)
+			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+		case r.Method == http.MethodHead:
+			http.Error(w, "absent", http.StatusNotFound)
+		case r.Method == http.MethodPost:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"message":"You can only create or edit files when you are on a branch"}`))
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
 		}
 	})
 
-	t.Run("createBranch failure names the attribute and ref", func(t *testing.T) {
-		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "bad ref", http.StatusBadRequest)
-		})
-		r := &filesResource{client: client}
-		err := r.createBranch(context.Background(), "proj", "feature", "nope")
-		if err == nil || !strings.Contains(err.Error(), `creating branch "feature" from create_branch_from ref "nope"`) {
-			t.Fatalf("want a creating-branch error naming the attribute and ref, got: %v", err)
-		}
-	})
+	plan := readState("ignored")
+	plan.Branch = types.StringValue("feature")
+	plan.ID = types.StringValue("proj::feature")
+	plan.CreateBranchFrom = types.StringValue("nope")
+
+	resp := runCreate(t, client, plan)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected the rejected first commit to fail Create")
+	}
+	summary := resp.Diagnostics.Errors()[0].Summary()
+	if !strings.Contains(summary, `creating branch "feature" from create_branch_from ref "nope"`) {
+		t.Errorf("summary must name the branch and ref, got: %q", summary)
+	}
 }
 
 // TestCreate_AdoptsFromCreateBranchFromRef is the regression test for
 // adoption across branch materialisation: when the branch does not exist yet
 // and create_branch_from points at a ref that already contains a managed
 // path, the adopt probe must resolve against that source ref - the new
-// branch will inherit the file, so a plain create would die with "already
-// exists" right after the branch was created.
+// branch inherits the file, so a plain create would die with "already
+// exists". The branch itself is materialised by start_branch on the commit,
+// never by a separate branch-creation call.
 func TestCreate_AdoptsFromCreateBranchFromRef(t *testing.T) {
 	var commitBody string
-	branchCreated := false
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
@@ -596,14 +637,9 @@ func TestCreate_AdoptsFromCreateBranchFromRef(t *testing.T) {
 			w.Header().Set("X-Gitlab-Size", "3")
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/branches"):
-			branchCreated = true
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusCreated)
-			_, _ = w.Write([]byte(`{"name":"feature","commit":{"id":"base"}}`))
+			t.Error("the branch must be created by start_branch on the commit, not by a separate call")
+			http.Error(w, "unexpected", http.StatusInternalServerError)
 		case r.Method == http.MethodPost:
-			if !branchCreated {
-				t.Error("commit must not be attempted before the branch is created")
-			}
 			b, _ := io.ReadAll(r.Body)
 			commitBody = string(b)
 			w.Header().Set("Content-Type", "application/json")
@@ -624,8 +660,8 @@ func TestCreate_AdoptsFromCreateBranchFromRef(t *testing.T) {
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
 	}
-	if !branchCreated {
-		t.Error("expected the branch to be created")
+	if !strings.Contains(commitBody, `"start_branch":"main"`) {
+		t.Errorf("the first commit must materialise the branch via start_branch, body: %s", commitBody)
 	}
 	if !strings.Contains(commitBody, `"action":"update"`) {
 		t.Errorf("inherited path must be adopted as an update, body: %s", commitBody)
@@ -654,5 +690,447 @@ func TestCommitOptions_AuthorPropagation(t *testing.T) {
 	opts = commitOptions(m, nil)
 	if opts.AuthorEmail != nil || opts.AuthorName != nil {
 		t.Error("null author fields must stay unset in commit options")
+	}
+}
+
+// TestCreate_ExistingBranchSendsNoStartBranch: start_branch is only for
+// materialising a missing branch; on an existing branch GitLab would reject
+// it ("A branch called ... already exists").
+func TestCreate_ExistingBranchSendsNoStartBranch(t *testing.T) {
+	var commitBody string
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "main":
+			http.Error(w, "absent", http.StatusNotFound)
+		case r.Method == http.MethodHead:
+			stampHeaders(w, "newsha")
+		case r.Method == http.MethodPost:
+			b, _ := io.ReadAll(r.Body)
+			commitBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"newsha"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	plan := readState("ignored")
+	plan.CreateBranchFrom = types.StringValue("main")
+	if resp := runCreate(t, client, plan); resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if strings.Contains(commitBody, "start_branch") {
+		t.Errorf("start_branch must not be sent when the branch exists, body: %s", commitBody)
+	}
+}
+
+// stampHeaders answers a metadata probe (HEAD) with the fields stampBlobs
+// reads after a commit.
+func stampHeaders(w http.ResponseWriter, commitSHA string) {
+	w.Header().Set("X-Gitlab-Blob-Id", "blob-"+commitSHA)
+	w.Header().Set("X-Gitlab-Last-Commit-Id", commitSHA)
+	w.Header().Set("X-Gitlab-File-Path", "f.txt")
+	w.Header().Set("X-Gitlab-Ref", commitSHA)
+	w.Header().Set("X-Gitlab-Size", "7")
+	w.WriteHeader(http.StatusOK)
+}
+
+// changedPlan returns a plan/state pair whose only difference is the content
+// of f.txt, i.e. exactly one update action.
+func changedPlan() (plan, state filesResourceModel) {
+	state = readState("oldblob")
+	plan = readState("oldblob")
+	pf := plan.Files["f.txt"]
+	pf.Content = types.StringValue("changed")
+	plan.Files["f.txt"] = pf
+	return plan, state
+}
+
+// TestCommitRetryPolicy pins which failures may replay the commit POST: rate
+// limiting and connection failures that happen before the request is sent,
+// nothing else - a replay after GitLab already landed the commit would be a
+// second commit for one apply.
+func TestCommitRetryPolicy(t *testing.T) {
+	cases := []struct {
+		err   error
+		resp  *http.Response
+		name  string
+		retry bool
+	}{
+		{name: "429", resp: &http.Response{StatusCode: http.StatusTooManyRequests}, retry: true},
+		{name: "503", resp: &http.Response{StatusCode: http.StatusServiceUnavailable}, retry: false},
+		{name: "502", resp: &http.Response{StatusCode: http.StatusBadGateway}, retry: false},
+		{name: "201", resp: &http.Response{StatusCode: http.StatusCreated}, retry: false},
+		{name: "dial refused", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "dial", Err: errors.New("connection refused")}}, retry: true},
+		{name: "read reset", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "read", Err: errors.New("connection reset by peer")}}, retry: false},
+		// net/dial wraps a resolver failure as OpError{Op: "dial"} around the
+		// DNSError, so the DNS check must win over the dial check.
+		{name: "dns temporary", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "dial", Err: &net.DNSError{Err: "timeout", IsTemporary: true}}}, retry: true},
+		{name: "dns nxdomain", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}}, retry: false},
+		{name: "tls handshake timeout", err: &url.Error{Op: "Post", Err: errors.New("net/http: TLS handshake timeout")}, retry: true},
+		{name: "unexpected eof", err: &url.Error{Op: "Post", Err: io.ErrUnexpectedEOF}, retry: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := commitRetryPolicy(t.Context(), c.resp, c.err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.retry {
+				t.Errorf("retry = %v, want %v", got, c.retry)
+			}
+		})
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if got, err := commitRetryPolicy(ctx, &http.Response{StatusCode: http.StatusTooManyRequests}, nil); got || !errors.Is(err, context.Canceled) {
+		t.Errorf("a cancelled ctx must stop retrying, got (%v, %v)", got, err)
+	}
+}
+
+// TestUpdate_CommitIsNotRetriedOn5xx: with retries enabled, a 5xx on the
+// commit POST is surfaced after exactly one attempt.
+func TestUpdate_CommitIsNotRetriedOn5xx(t *testing.T) {
+	var posts atomic.Int32
+	res := newRetryingResource(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			posts.Add(1)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		case http.MethodHead:
+			stampHeaders(w, "upsha")
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	plan, state := changedPlan()
+	resp := runUpdateOn(t, res, plan, state)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected the 502 to fail the update")
+	}
+	if got := posts.Load(); got != 1 {
+		t.Errorf("commit POST attempts = %d, want exactly 1 (a replay could land a second commit)", got)
+	}
+	d := resp.Diagnostics.Errors()[0]
+	if !strings.Contains(d.Summary(), "HTTP 502") || !strings.Contains(d.Detail(), "terraform plan") {
+		t.Errorf("diagnostic must carry the status and the reconcile advice, got: %s / %s", d.Summary(), d.Detail())
+	}
+}
+
+// TestUpdate_CommitIsRetriedOn429: rate limiting rejects the request before
+// it is processed, so a retry is safe and expected.
+func TestUpdate_CommitIsRetriedOn429(t *testing.T) {
+	var posts atomic.Int32
+	res := newRetryingResource(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			if posts.Add(1) == 1 {
+				http.Error(w, "rate limited", http.StatusTooManyRequests)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"upsha"}`))
+		case http.MethodHead:
+			stampHeaders(w, "upsha")
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	plan, state := changedPlan()
+	resp := runUpdateOn(t, res, plan, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if got := posts.Load(); got != 2 {
+		t.Errorf("commit POST attempts = %d, want 2 (one 429, one success)", got)
+	}
+}
+
+// TestUpdate_CommitHonoursDisabledRetries: with max_retries = 0 the commit
+// request must not get a retry policy of its own, or the per-request policy
+// would bypass WithoutRetries and replay a 429 anyway.
+func TestUpdate_CommitHonoursDisabledRetries(t *testing.T) {
+	var posts atomic.Int32
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts.Add(1)
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	plan, state := changedPlan()
+	resp := runUpdate(t, client, plan, state)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected the 429 to fail the update when retries are disabled")
+	}
+	if got := posts.Load(); got != 1 {
+		t.Errorf("commit POST attempts = %d, want exactly 1 with retries disabled", got)
+	}
+}
+
+// TestBranchLocks_SerialisesPerBranch: a held (project, branch) lock blocks a
+// second acquire until released, honours ctx while waiting, and leaves other
+// branches independent.
+func TestBranchLocks_SerialisesPerBranch(t *testing.T) {
+	locks := newBranchLocks()
+	release, err := locks.acquire(t.Context(), "proj", "main")
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if _, waitErr := locks.acquire(ctx, "proj", "main"); !errors.Is(waitErr, context.DeadlineExceeded) {
+		t.Fatalf("acquire on a held lock must return the ctx error, got %v", waitErr)
+	}
+
+	otherRelease, err := locks.acquire(t.Context(), "proj", "other")
+	if err != nil {
+		t.Fatalf("a different branch must not be held back: %v", err)
+	}
+	otherRelease()
+
+	// release is idempotent: call sites defer it and also call it early.
+	release()
+	release()
+	again, err := locks.acquire(t.Context(), "proj", "main")
+	if err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	again()
+}
+
+// TestUpdate_ConcurrentSameBranchCommitsAreSerialised: resource instances
+// sharing one branch (the for_each layout under terraform -parallelism) must
+// never have two commit POSTs in flight at once - that is the ref race GitLab
+// rejects with HTTP 400 "reference does not point to expected object".
+func TestUpdate_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
+	var inFlight, maxInFlight atomic.Int32
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			n := inFlight.Add(1)
+			for {
+				m := maxInFlight.Load()
+				if n <= m || maxInFlight.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			// Long enough that unserialised goroutines provably overlap.
+			time.Sleep(20 * time.Millisecond)
+			inFlight.Add(-1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"sha"}`))
+		case http.MethodHead:
+			stampHeaders(w, "sha")
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	locks := newBranchLocks()
+
+	var wg sync.WaitGroup
+	for range 4 {
+		// One filesResource per instance, sharing the provider's locks,
+		// exactly as Configure wires them.
+		res := &filesResource{client: client, locks: locks}
+		plan, state := changedPlan()
+		req, resp := updateRequest(t, res, plan, state)
+		wg.Go(func() {
+			res.Update(t.Context(), req, resp)
+			if resp.Diagnostics.HasError() {
+				t.Errorf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+		})
+	}
+	wg.Wait()
+	if got := maxInFlight.Load(); got != 1 {
+		t.Fatalf("commits to one branch overlapped: max in flight = %d, want 1", got)
+	}
+}
+
+// TestCreate_ConcurrentBranchMaterialisationIsSerialised: several instances
+// creating on the same missing branch must not all try to materialise it.
+// Create holds the branch lock from the existence check through the commit,
+// so the first instance creates the branch with start_branch and the others
+// then see it and commit plainly.
+func TestCreate_ConcurrentBranchMaterialisationIsSerialised(t *testing.T) {
+	var branchCreated atomic.Bool
+	var startBranchCommits, commits atomic.Int32
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			if !branchCreated.Load() {
+				http.Error(w, "no branch yet", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"feature","commit":{"id":"base"}}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "sha":
+			stampHeaders(w, "sha")
+		case r.Method == http.MethodHead:
+			http.Error(w, "absent", http.StatusNotFound)
+		case r.Method == http.MethodPost:
+			b, _ := io.ReadAll(r.Body)
+			commits.Add(1)
+			if strings.Contains(string(b), `"start_branch"`) {
+				if branchCreated.Swap(true) {
+					t.Error("start_branch sent for a branch that already exists")
+				}
+				startBranchCommits.Add(1)
+			} else if !branchCreated.Load() {
+				t.Error("plain commit attempted before the branch was materialised")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"sha"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	locks := newBranchLocks()
+
+	var wg sync.WaitGroup
+	for range 4 {
+		res := &filesResource{client: client, locks: locks}
+		plan := readState("ignored")
+		plan.Branch = types.StringValue("feature")
+		plan.ID = types.StringValue("proj::feature")
+		plan.CreateBranchFrom = types.StringValue("main")
+		req, resp := createRequest(t, res, plan)
+		wg.Go(func() {
+			res.Create(t.Context(), req, resp)
+			if resp.Diagnostics.HasError() {
+				t.Errorf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+		})
+	}
+	wg.Wait()
+	if got := startBranchCommits.Load(); got != 1 {
+		t.Errorf("start_branch commits = %d, want exactly 1", got)
+	}
+	if got := commits.Load(); got != 4 {
+		t.Errorf("commits = %d, want one per instance", got)
+	}
+}
+
+// TestCreate_CommitSHASourceUsesStartSHA: the commits API separates
+// start_branch from start_sha, so a create_branch_from that is a full commit
+// SHA must travel as start_sha.
+func TestCreate_CommitSHASourceUsesStartSHA(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	var commitBody string
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			http.Error(w, "no branch yet", http.StatusNotFound)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "newsha":
+			stampHeaders(w, "newsha")
+		case r.Method == http.MethodHead:
+			http.Error(w, "absent", http.StatusNotFound)
+		case r.Method == http.MethodPost:
+			b, _ := io.ReadAll(r.Body)
+			commitBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"newsha"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	plan := readState("ignored")
+	plan.Branch = types.StringValue("feature")
+	plan.ID = types.StringValue("proj::feature")
+	plan.CreateBranchFrom = types.StringValue(sha)
+	if resp := runCreate(t, client, plan); resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if !strings.Contains(commitBody, `"start_sha":"`+sha+`"`) || strings.Contains(commitBody, "start_branch") {
+		t.Errorf("a SHA source must be sent as start_sha only, body: %s", commitBody)
+	}
+}
+
+func TestIsCommitSHA(t *testing.T) {
+	cases := map[string]bool{
+		"main": false,
+		"0123456789abcdef0123456789abcdef01234567":                         true,
+		"0123456789ABCDEF0123456789abcdef01234567":                         true,
+		"0123456789abcdef0123456789abcdef0123456":                          false,
+		"0123456789abcdef0123456789abcdef0123456g":                         false,
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef": true,
+	}
+	for in, want := range cases {
+		if got := isCommitSHA(in); got != want {
+			t.Errorf("isCommitSHA(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// TestCreate_CommitIsNotRetriedOn5xx and TestDelete_CommitIsNotRetriedOn5xx
+// pin the retry policy on the two commit sites the Update tests do not reach.
+func TestCreate_CommitIsNotRetriedOn5xx(t *testing.T) {
+	var posts atomic.Int32
+	res := newRetryingResource(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead:
+			http.Error(w, "absent", http.StatusNotFound)
+		case r.Method == http.MethodPost:
+			posts.Add(1)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	resp := runCreateOn(t, res, readState("ignored"))
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected the 502 to fail the create")
+	}
+	if got := posts.Load(); got != 1 {
+		t.Errorf("commit POST attempts = %d, want exactly 1", got)
+	}
+}
+
+func TestDelete_CommitIsNotRetriedOn5xx(t *testing.T) {
+	var posts atomic.Int32
+	res := newRetryingResource(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			stampHeaders(w, "sha")
+		case http.MethodPost:
+			posts.Add(1)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	resp := runDeleteOn(t, res, readState("blob"))
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected the 502 to fail the destroy")
+	}
+	if got := posts.Load(); got != 1 {
+		t.Errorf("commit POST attempts = %d, want exactly 1", got)
 	}
 }

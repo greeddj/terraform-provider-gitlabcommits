@@ -20,6 +20,9 @@ branch of one project. The provider:
 - **Create** — pushes one commit that creates every file. If `adopt_existing`
   is true (default) and a path already exists in the repo, the action is
   silently rewritten from `create` to `update`, so the apply does not fail.
+  When the branch does not exist yet and `create_branch_from` is set, the
+  branch is created from that ref in the same operation as the commit (one
+  push event).
 - **Read** — probes each managed file via a HEAD-style metadata call
   (`GetFileMetaData`) and compares the GitLab-returned `blob_id` with the
   one in state. Only when the blob has actually drifted does it pull the
@@ -40,6 +43,9 @@ files map starts empty and is reconciled on the next plan + apply.
 - Terraform >= 1.5
 - GitLab >= 18.x (older versions may work for basic operations but are not supported)
 - A token that can call the GitLab REST API on the target project (see Authentication below)
+- On macOS and Windows, `SSL_CERT_FILE` / `SSL_CERT_DIR`, when set, replace the
+  system certificate store for the provider's TLS connections (Go 1.27 default);
+  unset them if your GitLab's CA lives only in the system store
 - Go >= 1.27 (development only)
 
 ## Provider configuration
@@ -87,16 +93,16 @@ attribute on the provider block. In CI, prefer a CI variable such as
 
 | Argument | Type | Required | Description |
 | --- | --- | --- | --- |
-| `project_id` | string | yes | Project ID or URL-encoded path. ForceNew. |
-| `branch` | string | yes | Target branch (must exist, or set `create_branch_from`). ForceNew. |
+| `project_id` | string | yes | Numeric project ID or plain project path (`group/subgroup/project`, not URL-encoded). Changing it forces replacement; see Caveats. |
+| `branch` | string | yes | Target branch (must exist, or set `create_branch_from`). Changing it forces replacement; see Caveats. |
 | `commit_message` | string | yes | Used for any commit produced (create / update / destroy). |
 | `author_name` | string | no | Override commit author name. |
 | `author_email` | string | no | Override commit author email. |
-| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this source ref (typically `main`) on first apply. |
+| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit. The branch is not deleted on destroy. |
 | `detect_drift` | bool | no | Default `true`. If false, Read is a no-op. |
-| `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. |
+| `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. Read from the state of the last apply; see Caveats. |
 | `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist (needed for clean import). |
-| `optimistic_lock` | bool | no | Default `true`. Send each file's `last_commit_id` so GitLab rejects concurrent updates with HTTP 400. Set to `false` to opt out. |
+| `optimistic_lock` | bool | no | Default `true`. Send each file's `last_commit_id` so GitLab rejects concurrent updates with HTTP 400. Set to `false` to opt out. For the destroy commit, read from the state of the last apply. |
 | `files` | map of object | yes | See below. |
 | `id` | string | computed | Composite identifier `<project_id>::<branch>`. |
 | `commit_sha` | string | computed | SHA of the most recent commit produced by this resource. |
@@ -170,6 +176,27 @@ apply converges without manual surgery.
 
 - **One resource = one branch = one project**. To target multiple branches or
   repos, use multiple resources (typically via `for_each`).
+- **Many resources on one branch are safe within one apply.** Terraform runs
+  resources in parallel, and concurrent commits to the same branch would race
+  on its tip (GitLab rejects the loser with HTTP 400 "reference does not point
+  to expected object"). The provider serialises its commits per branch within
+  one provider configuration, so the `for_each` layout above never hits that;
+  each resource still lands exactly one commit. Two things stay outside that
+  guarantee: resources sharing a branch must spell `project_id` the same way
+  (a numeric ID and a path are different lock keys), and a second provider
+  block (alias) runs in its own process. Any other writer (another pipeline,
+  a manual push, an aliased provider) is reported as "Branch changed while
+  the commit was being created" and you re-run the apply.
+- **Changing `branch` or `project_id` replaces the resource.** Replacement is
+  destroy-then-create, and with the default `delete_on_destroy = true` the
+  destroy pushes a commit deleting every managed file from the OLD branch
+  before the files are created on the new one. To re-point without emptying
+  the old branch, set `delete_on_destroy = false` and apply first, or use a
+  new resource address.
+- **`delete_on_destroy` and `optimistic_lock` apply as last applied.**
+  Terraform does not evaluate configuration during `terraform destroy`, so the
+  destroy commit uses the values recorded in state by the last apply. Change
+  the flag in HCL, run `terraform apply`, then destroy.
 - **State holds your file content.** If you set `content_base64` to the bytes
   of a 10 MB binary, those bytes live in `terraform.tfstate`. Use a secrets
   backend and avoid committing huge binaries through this provider.
@@ -192,24 +219,30 @@ apply converges without manual surgery.
   a very large bundle can hit that cap; the provider surfaces the 413 with
   advice to split the bundle across multiple resources (`for_each`), or raise
   `GITLAB_COMMITS_MAX_REQUEST_SIZE_BYTES` on self-managed GitLab.
-- **Rate limits.** 429 and transient 5xx responses are retried with
-  exponential backoff (`max_retries`, `retry_wait_min_ms`,
-  `retry_wait_max_ms` on the provider block). GitLab.com additionally
-  throttles writes above ~20 MB.
-- **Commits are not idempotent.** `POST /repository/commits` has no request
-  deduplication, so if the network fails after GitLab accepted the commit but
-  before the response arrived, a retry replays the request. With
-  `optimistic_lock = true` (default) the replay fails loudly as a
-  "Concurrent modification detected" conflict while the original commit
-  stands - run `terraform plan` to reconcile. With the lock disabled a replay
-  can land a duplicate commit. If your pipeline is sensitive to duplicate
-  pipelines per apply, keep the lock on.
+- **Rate limits.** Read and probe requests are retried on 429 and transient
+  5xx (`max_retries`, default 5). `retry_wait_min_ms` is the base wait between
+  429 retries (it doubles per attempt and GitLab's `Ratelimit-Reset` header
+  extends it); `retry_wait_max_ms` bounds the random jitter added on top, not
+  the total wait. 5xx retries use the client's fixed 700-900 ms schedule. On
+  GitLab.com, commit requests above 20 MB (3 per 30 s) and reads of blobs
+  above 10 MB (5 per minute) are throttled separately; self-managed instances
+  configure such limits independently. Those limits send no rate-limit
+  headers, so a 429 without `Retry-After` can mean one of them.
+- **Commits are not idempotent, so the commit request is never replayed on
+  5xx.** `POST /repository/commits` has no request deduplication: if a proxy
+  answered 502/504 after GitLab had already accepted the commit, a retry
+  would land a second commit for the same apply. The provider therefore
+  retries the commit request only on 429 (rejected before processing) and on
+  connection failures that happen before the request is sent. A 5xx or a
+  dropped connection fails the apply with the status in the diagnostic; run
+  `terraform plan` to see whether the commit landed, and apply again if it
+  did not.
 
 ## Development
 
 ```bash
 just build       # check + lint + test, then a static binary in ./dist
-just test        # unit tests (go test ./...)
+just test        # unit tests (go test -race ./...)
 just lint        # golangci-lint
 just check       # go vet + staticcheck + govulncheck + fieldalignment
 just ci          # the full CI gate: check + lint + test + tf-fmt + examples + docs + headers + deps

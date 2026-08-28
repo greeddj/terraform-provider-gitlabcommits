@@ -21,7 +21,7 @@ import (
 //
 //	TF_ACC=1
 //	GITLAB_TOKEN=<token with `api` scope; see README Authentication>
-//	GITLAB_TEST_PROJECT_ID=<group/project> (URL-encoded path or numeric ID)
+//	GITLAB_TEST_PROJECT_ID=<group/project> (plain path, not URL-encoded, or numeric ID)
 //	GITLAB_TEST_BRANCH=<branch>             (defaults to "tf-acc-test"; must pre-exist unless GITLAB_TEST_BRANCH_FROM is set)
 //	GITLAB_TEST_BRANCH_FROM=<ref>           (optional; materialise the branch from this ref and delete it after the test)
 //	GITLAB_BASE_URL=<https://gitlab.example.com>  (optional)

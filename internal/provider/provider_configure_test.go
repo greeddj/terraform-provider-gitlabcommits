@@ -4,7 +4,6 @@
 package provider
 
 import (
-	"context"
 	"maps"
 	"math/big"
 	"testing"
@@ -19,7 +18,7 @@ import (
 // overrides (any attribute not supplied defaults to null).
 func runConfigure(t *testing.T, attrs map[string]tftypes.Value) *provider.ConfigureResponse {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	p := New("test")()
 
 	sresp := &provider.SchemaResponse{}
@@ -66,12 +65,42 @@ func TestConfigure_PlaintextHTTPWarnsAndWiresRedirectGuard(t *testing.T) {
 	if resp.Diagnostics.WarningsCount() == 0 {
 		t.Error("expected a plaintext-HTTP warning")
 	}
-	client, ok := resp.ResourceData.(*gitlab.Client)
-	if !ok || client == nil {
-		t.Fatalf("expected a configured *gitlab.Client, got %T", resp.ResourceData)
+	deps, ok := resp.ResourceData.(*resourceDeps)
+	if !ok || deps == nil || deps.client == nil {
+		t.Fatalf("expected configured *resourceDeps with a client, got %T", resp.ResourceData)
 	}
-	if client.HTTPClient().CheckRedirect == nil {
+	if deps.client.HTTPClient().CheckRedirect == nil {
 		t.Error("expected the cross-host redirect guard to be installed on the client")
+	}
+	if deps.locks == nil {
+		t.Error("expected the branch locks to be wired for resources")
+	}
+	if !deps.retryCommits {
+		t.Error("expected commit retries to be enabled with the default max_retries")
+	}
+	if client, ok := resp.DataSourceData.(*gitlab.Client); !ok || client == nil {
+		t.Errorf("expected data sources to receive the *gitlab.Client, got %T", resp.DataSourceData)
+	}
+}
+
+// TestConfigure_ZeroRetriesDisablesCommitRetryPolicy: max_retries = 0 must
+// switch the commit-specific retry policy off too, or it would bypass
+// WithoutRetries on the shared client.
+func TestConfigure_ZeroRetriesDisablesCommitRetryPolicy(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	resp := runConfigure(t, map[string]tftypes.Value{
+		"token":       tftypes.NewValue(tftypes.String, "tok"),
+		"max_retries": tftypes.NewValue(tftypes.Number, big.NewFloat(0)),
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	deps, ok := resp.ResourceData.(*resourceDeps)
+	if !ok {
+		t.Fatalf("expected *resourceDeps, got %T", resp.ResourceData)
+	}
+	if deps.retryCommits {
+		t.Error("max_retries = 0 must disable the commit retry policy")
 	}
 }
 

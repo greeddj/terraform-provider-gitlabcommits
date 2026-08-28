@@ -4,7 +4,6 @@
 package provider
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -118,7 +117,7 @@ func TestBranchHeadDataSource_NilCommitNoPanic(t *testing.T) {
 	}
 
 	d := &branchHeadDataSource{client: client}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	schemaResp := &datasource.SchemaResponse{}
 	d.Schema(ctx, datasource.SchemaRequest{}, schemaResp)
@@ -179,7 +178,7 @@ func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
 	}
 
 	t.Run("lock on forwards probed token", func(t *testing.T) {
-		actions, err := res.diffActions(context.Background(), plan(true), emptyState())
+		actions, err := res.diffActions(t.Context(), plan(true), emptyState())
 		if err != nil {
 			t.Fatalf("diffActions: %v", err)
 		}
@@ -196,7 +195,7 @@ func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
 	})
 
 	t.Run("lock off omits token", func(t *testing.T) {
-		actions, err := res.diffActions(context.Background(), plan(false), emptyState())
+		actions, err := res.diffActions(t.Context(), plan(false), emptyState())
 		if err != nil {
 			t.Fatalf("diffActions: %v", err)
 		}
@@ -252,7 +251,7 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	emptyState := filesResourceModel{Files: map[string]fileModel{}}
 
 	t.Run("mismatch adds chmod with lock token", func(t *testing.T) {
-		actions, err := res.diffActions(context.Background(), plan(true), emptyState)
+		actions, err := res.diffActions(t.Context(), plan(true), emptyState)
 		if err != nil {
 			t.Fatalf("diffActions: %v", err)
 		}
@@ -275,7 +274,7 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	})
 
 	t.Run("matching bit emits no chmod", func(t *testing.T) {
-		actions, err := res.diffActions(context.Background(), plan(false), emptyState)
+		actions, err := res.diffActions(t.Context(), plan(false), emptyState)
 		if err != nil {
 			t.Fatalf("diffActions: %v", err)
 		}
@@ -287,7 +286,7 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	t.Run("remote exec true plan false adds chmod false", func(t *testing.T) {
 		remoteExec = true
 		defer func() { remoteExec = false }()
-		actions, err := res.diffActions(context.Background(), plan(false), emptyState)
+		actions, err := res.diffActions(t.Context(), plan(false), emptyState)
 		if err != nil {
 			t.Fatalf("diffActions: %v", err)
 		}

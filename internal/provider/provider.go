@@ -70,16 +70,22 @@ func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaReque
 				Optional:    true,
 			},
 			"max_retries": schema.Int64Attribute{
-				Description: "Maximum number of retries on transient failures (5xx, 429). Default 5. Set to 0 to disable retries entirely.",
-				Optional:    true,
+				Description: "Maximum number of retries on transient failures (5xx, 429) for read and probe requests. " +
+					"The commit request (POST /repository/commits) is retried only on 429 and on connection failures that " +
+					"happen before the request is sent, never on 5xx, so one apply cannot land two commits. " +
+					"Default 5. Set to 0 to disable retries entirely.",
+				Optional: true,
 			},
 			"retry_wait_min_ms": schema.Int64Attribute{
-				Description: "Lower bound (ms) of the exponential backoff between retries. Default 1000.",
-				Optional:    true,
+				Description: "Base wait (ms) between rate-limited (429) retries; it doubles with each attempt and the " +
+					"Ratelimit-Reset header extends it when GitLab sends one. 5xx retries use the client's fixed 700-900 ms " +
+					"schedule instead. Default 1000.",
+				Optional: true,
 			},
 			"retry_wait_max_ms": schema.Int64Attribute{
-				Description: "Upper bound (ms) of the exponential backoff between retries. Default 30000.",
-				Optional:    true,
+				Description: "Bounds (ms) the random jitter added to each rate-limited (429) retry wait; the wait itself " +
+					"is the growing base plus that jitter and can exceed this value. Default 30000.",
+				Optional: true,
 			},
 		},
 	}
@@ -110,16 +116,19 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	}
 	// Unknown retry settings must not silently become defaults: the user set
 	// them to something, and guessing here would hide a config wiring mistake.
-	for name, v := range map[string]types.Int64{
-		"max_retries":       config.MaxRetries,
-		"retry_wait_min_ms": config.RetryWaitMinMs,
-		"retry_wait_max_ms": config.RetryWaitMaxMs,
+	for _, a := range []struct {
+		name  string
+		value types.Int64
+	}{
+		{"max_retries", config.MaxRetries},
+		{"retry_wait_min_ms", config.RetryWaitMinMs},
+		{"retry_wait_max_ms", config.RetryWaitMaxMs},
 	} {
-		if v.IsUnknown() {
+		if a.value.IsUnknown() {
 			resp.Diagnostics.AddAttributeError(
-				path.Root(name),
+				path.Root(a.name),
 				"Unknown retry configuration",
-				name+" must be a known value at provider configure time.",
+				a.name+" must be a known value at provider configure time.",
 			)
 		}
 	}
@@ -211,7 +220,11 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	})
 
 	resp.DataSourceData = client
-	resp.ResourceData = client
+	resp.ResourceData = &resourceDeps{
+		client:       client,
+		locks:        newBranchLocks(),
+		retryCommits: maxRetries > 0,
+	}
 }
 
 func (p *gitlabCommitsProvider) DataSources(_ context.Context) []func() datasource.DataSource {
