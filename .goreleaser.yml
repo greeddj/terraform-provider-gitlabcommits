@@ -21,6 +21,16 @@ builds:
     goarch:
       - amd64
       - arm64
+      - '386'
+      - arm
+    # 32-bit targets the Go toolchain does not ship (go tool dist list).
+    ignore:
+      - goos: darwin
+        goarch: '386'
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
     binary: '{{ .ProjectName }}_v{{ .Version }}'
 
 archives:

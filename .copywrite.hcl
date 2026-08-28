@@ -10,6 +10,7 @@ project {
     ".github/**",
     "docs/**",
     "vendor/**",
+    "dist/**",
     ".goreleaser.yml",
   ]
 }
