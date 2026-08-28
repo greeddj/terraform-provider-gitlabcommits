@@ -4,10 +4,13 @@
 package provider
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -26,8 +29,9 @@ func TestDecodeRemoteContent_NilFile(t *testing.T) {
 }
 
 // TestCrossHostRedirectGuard verifies the token-exfiltration guard: same-host
-// redirects (any scheme) pass, off-host redirects are refused, and the chain is
-// capped at 10.
+// redirects (any scheme) pass, off-host redirects and https->http downgrades
+// are refused by handing back the 3xx (ErrUseLastResponse, so the client
+// neither follows nor retries), and the chain is capped at 10.
 func TestCrossHostRedirectGuard(t *testing.T) {
 	mk := func(raw string) *http.Request {
 		u, err := url.Parse(raw)
@@ -39,10 +43,10 @@ func TestCrossHostRedirectGuard(t *testing.T) {
 	orig := mk("https://gitlab.example.com/api/v4/x")
 
 	cases := []struct {
-		name    string
-		req     *http.Request
-		via     []*http.Request
-		wantErr bool
+		name        string
+		req         *http.Request
+		via         []*http.Request
+		wantRefused bool
 	}{
 		{"first request", mk("https://gitlab.example.com/y"), nil, false},
 		{"same host", mk("https://gitlab.example.com/redir"), []*http.Request{orig}, false},
@@ -54,8 +58,11 @@ func TestCrossHostRedirectGuard(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			err := crossHostRedirectGuard(c.req, c.via)
-			if c.wantErr != (err != nil) {
-				t.Fatalf("wantErr=%v, got err=%v", c.wantErr, err)
+			if c.wantRefused != errors.Is(err, http.ErrUseLastResponse) {
+				t.Fatalf("wantRefused=%v, got err=%v", c.wantRefused, err)
+			}
+			if !c.wantRefused && err != nil {
+				t.Fatalf("allowed redirect must not error, got %v", err)
 			}
 		})
 	}
@@ -65,10 +72,52 @@ func TestCrossHostRedirectGuard(t *testing.T) {
 		for i := range via {
 			via[i] = orig
 		}
-		if err := crossHostRedirectGuard(mk("https://gitlab.example.com/z"), via); err == nil {
-			t.Fatal("expected error after 10 redirects")
+		if err := crossHostRedirectGuard(mk("https://gitlab.example.com/z"), via); !errors.Is(err, http.ErrUseLastResponse) {
+			t.Fatalf("expected the chain to stop after 10 redirects, got %v", err)
 		}
 	})
+}
+
+// TestCrossHostRedirect_EndToEnd drives a real redirect through the
+// configured client: the 3xx is surfaced as a refused-redirect diagnostic
+// after exactly one request, and the token never reaches the other host.
+func TestCrossHostRedirect_EndToEnd(t *testing.T) {
+	var hits atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("PRIVATE-TOKEN") != "" {
+			t.Error("the token must never be sent to the redirect target")
+		}
+		t.Error("the redirect target must not be contacted at all")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(other.Close)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Redirect(w, r, other.URL+"/api/v4/projects/proj/repository/branches/main", http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	t.Setenv("GITLAB_TOKEN", "")
+	resp := runConfigure(t, map[string]tftypes.Value{
+		"token":    tftypes.NewValue(tftypes.String, "tok"),
+		"base_url": tftypes.NewValue(tftypes.String, srv.URL),
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("configure: %v", resp.Diagnostics.Errors())
+	}
+	deps := resp.ResourceData.(*resourceDeps)
+
+	_, _, err := deps.client.Branches.GetBranch("proj", "main", gitlab.WithContext(t.Context()))
+	if err == nil {
+		t.Fatal("expected the refused redirect to surface as an error")
+	}
+	summary, detail := apiErrorDiag("reading branch", "proj", "main", err)
+	if !strings.Contains(summary, "Refused to follow a GitLab redirect") || !strings.Contains(detail, other.URL) {
+		t.Errorf("unexpected diagnostic: %s / %s", summary, detail)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("requests to GitLab = %d, want 1 (a refused redirect must not be retried)", got)
+	}
 }
 
 // TestNullBodyDecodesToNilCommit documents the precondition the Create/Update
@@ -140,6 +189,44 @@ func TestBranchHeadDataSource_NilCommitNoPanic(t *testing.T) {
 	}
 }
 
+// TestBranchHeadDataSource_HappyPath: commit_sha and protected come straight
+// from the branch response.
+func TestBranchHeadDataSource_HappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"name":"main","protected":true,"commit":{"id":"abc123"}}`))
+	}))
+	defer srv.Close()
+	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	d := &branchHeadDataSource{client: client}
+	ctx := t.Context()
+	schemaResp := &datasource.SchemaResponse{}
+	d.Schema(ctx, datasource.SchemaRequest{}, schemaResp)
+	sch := schemaResp.Schema
+	raw := tftypes.NewValue(sch.Type().TerraformType(ctx), map[string]tftypes.Value{
+		"project_id": tftypes.NewValue(tftypes.String, "proj"),
+		"branch":     tftypes.NewValue(tftypes.String, "main"),
+		"commit_sha": tftypes.NewValue(tftypes.String, nil),
+		"protected":  tftypes.NewValue(tftypes.Bool, nil),
+	})
+	resp := &datasource.ReadResponse{State: tfsdk.State{Schema: sch}}
+	d.Read(ctx, datasource.ReadRequest{Config: tfsdk.Config{Schema: sch, Raw: raw}}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	var out branchHeadModel
+	if diags := resp.State.Get(ctx, &out); diags.HasError() {
+		t.Fatalf("state.Get: %v", diags)
+	}
+	if out.CommitSHA.ValueString() != "abc123" || !out.Protected.ValueBool() {
+		t.Errorf("commit_sha/protected = %q/%v, want abc123/true", out.CommitSHA.ValueString(), out.Protected.ValueBool())
+	}
+}
+
 // TestDiffActions_AdoptForwardsLockToken pins CRU-1: when adopt_existing rewrites
 // a new-to-state path that already exists remotely into an update, the probed
 // last_commit_id is forwarded under optimistic_lock so the overwrite is still
@@ -147,6 +234,12 @@ func TestBranchHeadDataSource_NilCommitNoPanic(t *testing.T) {
 func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
 	const probedLCID = "abc123probed"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// Adopt content compare: remote differs from the plan.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(fileJSON("adopted.txt", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", probedLCID, []byte("remote")))
+			return
+		}
 		if r.Method != http.MethodHead {
 			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
 			return
@@ -178,7 +271,7 @@ func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
 	}
 
 	t.Run("lock on forwards probed token", func(t *testing.T) {
-		actions, err := res.diffActions(t.Context(), plan(true), emptyState())
+		actions, _, err := res.diffActions(t.Context(), plan(true), emptyState())
 		if err != nil {
 			t.Fatalf("diffActions: %v", err)
 		}
@@ -195,7 +288,7 @@ func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
 	})
 
 	t.Run("lock off omits token", func(t *testing.T) {
-		actions, err := res.diffActions(t.Context(), plan(false), emptyState())
+		actions, _, err := res.diffActions(t.Context(), plan(false), emptyState())
 		if err != nil {
 			t.Fatalf("diffActions: %v", err)
 		}
@@ -216,6 +309,11 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	const probedLCID = "abc123probed"
 	remoteExec := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(fileJSON("tool.sh", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", probedLCID, []byte("remote")))
+			return
+		}
 		if r.Method != http.MethodHead {
 			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
 			return
@@ -251,7 +349,7 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	emptyState := filesResourceModel{Files: map[string]fileModel{}}
 
 	t.Run("mismatch adds chmod with lock token", func(t *testing.T) {
-		actions, err := res.diffActions(t.Context(), plan(true), emptyState)
+		actions, _, err := res.diffActions(t.Context(), plan(true), emptyState)
 		if err != nil {
 			t.Fatalf("diffActions: %v", err)
 		}
@@ -274,7 +372,7 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	})
 
 	t.Run("matching bit emits no chmod", func(t *testing.T) {
-		actions, err := res.diffActions(t.Context(), plan(false), emptyState)
+		actions, _, err := res.diffActions(t.Context(), plan(false), emptyState)
 		if err != nil {
 			t.Fatalf("diffActions: %v", err)
 		}
@@ -286,7 +384,7 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	t.Run("remote exec true plan false adds chmod false", func(t *testing.T) {
 		remoteExec = true
 		defer func() { remoteExec = false }()
-		actions, err := res.diffActions(t.Context(), plan(false), emptyState)
+		actions, _, err := res.diffActions(t.Context(), plan(false), emptyState)
 		if err != nil {
 			t.Fatalf("diffActions: %v", err)
 		}

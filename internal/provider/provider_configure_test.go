@@ -6,6 +6,9 @@ package provider
 import (
 	"maps"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/provider"
@@ -80,6 +83,119 @@ func TestConfigure_PlaintextHTTPWarnsAndWiresRedirectGuard(t *testing.T) {
 	}
 	if client, ok := resp.DataSourceData.(*gitlab.Client); !ok || client == nil {
 		t.Errorf("expected data sources to receive the *gitlab.Client, got %T", resp.DataSourceData)
+	}
+}
+
+// tokenCapture is a fake GitLab that records the token of the last request
+// and answers a branch lookup.
+func tokenCapture(t *testing.T) (*httptest.Server, *string) {
+	t.Helper()
+	var seen string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Get("PRIVATE-TOKEN")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"head"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &seen
+}
+
+func configuredClient(t *testing.T, attrs map[string]tftypes.Value) *gitlab.Client {
+	t.Helper()
+	resp := runConfigure(t, attrs)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("configure: %v", resp.Diagnostics.Errors())
+	}
+	return resp.ResourceData.(*resourceDeps).client
+}
+
+func TestConfigure_TokenSourcing(t *testing.T) {
+	t.Run("from environment", func(t *testing.T) {
+		srv, seen := tokenCapture(t)
+		t.Setenv("GITLAB_TOKEN", "envtok")
+		t.Setenv("GITLAB_BASE_URL", "")
+		client := configuredClient(t, map[string]tftypes.Value{
+			"base_url": tftypes.NewValue(tftypes.String, srv.URL),
+		})
+		if _, _, err := client.Branches.GetBranch("proj", "main", gitlab.WithContext(t.Context())); err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		if *seen != "envtok" {
+			t.Errorf("token sent = %q, want the environment token", *seen)
+		}
+	})
+	t.Run("config beats environment", func(t *testing.T) {
+		srv, seen := tokenCapture(t)
+		t.Setenv("GITLAB_TOKEN", "envtok")
+		client := configuredClient(t, map[string]tftypes.Value{
+			"token":    tftypes.NewValue(tftypes.String, "cfgtok"),
+			"base_url": tftypes.NewValue(tftypes.String, srv.URL),
+		})
+		if _, _, err := client.Branches.GetBranch("proj", "main", gitlab.WithContext(t.Context())); err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		if *seen != "cfgtok" {
+			t.Errorf("token sent = %q, want the configured token", *seen)
+		}
+	})
+	t.Run("base_url from environment", func(t *testing.T) {
+		srv, _ := tokenCapture(t)
+		t.Setenv("GITLAB_TOKEN", "envtok")
+		t.Setenv("GITLAB_BASE_URL", srv.URL)
+		client := configuredClient(t, map[string]tftypes.Value{})
+		if got := client.BaseURL().String(); !strings.HasPrefix(got, srv.URL) {
+			t.Errorf("base URL = %q, want it under %q", got, srv.URL)
+		}
+	})
+}
+
+func TestConfigure_RejectsMalformedInputs(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	t.Setenv("GITLAB_BASE_URL", "")
+	cases := map[string]map[string]tftypes.Value{
+		"token with trailing newline": {"token": tftypes.NewValue(tftypes.String, "tok\n")},
+		"token with leading space":    {"token": tftypes.NewValue(tftypes.String, " tok")},
+		"base_url without scheme": {
+			"token":    tftypes.NewValue(tftypes.String, "tok"),
+			"base_url": tftypes.NewValue(tftypes.String, "gitlab.example.com"),
+		},
+		"base_url with odd scheme": {
+			"token":    tftypes.NewValue(tftypes.String, "tok"),
+			"base_url": tftypes.NewValue(tftypes.String, "ftp://gitlab.example.com"),
+		},
+	}
+	for name, attrs := range cases {
+		t.Run(name, func(t *testing.T) {
+			resp := runConfigure(t, attrs)
+			if !resp.Diagnostics.HasError() {
+				t.Fatal("expected a configure error")
+			}
+		})
+	}
+	t.Run("base_url with /api/v4 suffix is accepted", func(t *testing.T) {
+		client := configuredClient(t, map[string]tftypes.Value{
+			"token":    tftypes.NewValue(tftypes.String, "tok"),
+			"base_url": tftypes.NewValue(tftypes.String, "https://gitlab.example.com/api/v4"),
+		})
+		if got := client.BaseURL().String(); got != "https://gitlab.example.com/api/v4/" {
+			t.Errorf("base URL = %q", got)
+		}
+	})
+}
+
+func TestConfigure_ResponseHeaderTimeout(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	t.Setenv("GITLAB_BASE_URL", "")
+	client := configuredClient(t, map[string]tftypes.Value{"token": tftypes.NewValue(tftypes.String, "tok")})
+	transport, ok := client.HTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport is %T, want *http.Transport", client.HTTPClient().Transport)
+	}
+	if transport.ResponseHeaderTimeout != responseHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout = %v, want %v", transport.ResponseHeaderTimeout, responseHeaderTimeout)
+	}
+	if transport.MaxIdleConnsPerHost == 0 {
+		t.Error("expected cleanhttp's pooled transport settings to be kept")
 	}
 }
 

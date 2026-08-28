@@ -125,7 +125,9 @@ func TestDiffActions(t *testing.T) {
 				"change.yaml": planFile("new"),
 				"add.yaml":    planFile("a"),
 			},
-			want:    []string{"create:add.yaml", "update:change.yaml", "delete:remove.yaml"},
+			// Deletes first: GitLab applies actions in order, so a path may
+			// turn from a file into a directory within one commit.
+			want:    []string{"delete:remove.yaml", "create:add.yaml", "update:change.yaml"},
 			wantLen: 3,
 		},
 		{
@@ -163,7 +165,7 @@ func TestDiffActions(t *testing.T) {
 				Branch:    types.StringValue("main"),
 				Files:     c.state,
 			}
-			actions, err := r.diffActions(t.Context(), plan, state)
+			actions, _, err := r.diffActions(t.Context(), plan, state)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -207,7 +209,7 @@ func TestDiffActions_ContentEqualBytewise(t *testing.T) {
 		},
 	}
 
-	actions, err := r.diffActions(t.Context(), plan, state)
+	actions, _, err := r.diffActions(t.Context(), plan, state)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -407,7 +409,7 @@ func TestStampBlobsAfterCommit_FetchesMetadata(t *testing.T) {
 				"b.txt": {Content: types.StringValue("world"), BlobID: types.StringNull()},
 			}
 
-			diags := res.stampBlobs(t.Context(), "proj", "main", files, "deadbeef")
+			diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", nil)
 			for _, d := range diags {
 				if d.Severity() == 1 { // error
 					t.Errorf("unexpected error diagnostic: %s: %s", d.Summary(), d.Detail())
@@ -481,7 +483,7 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 
 	t.Run("enabled-default", func(t *testing.T) {
 		// OptimisticLock null → defaults to true.
-		actions, err := r.diffActions(t.Context(), plan, state)
+		actions, _, err := r.diffActions(t.Context(), plan, state)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -502,7 +504,7 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		planNoLock := plan
 		planNoLock.OptimisticLock = types.BoolValue(false)
-		actions, err := r.diffActions(t.Context(), planNoLock, state)
+		actions, _, err := r.diffActions(t.Context(), planNoLock, state)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -679,9 +681,30 @@ func TestApiErrorDiag(t *testing.T) {
 			contains:    []string{"retry after 60 seconds"},
 		},
 		{
-			name: "429-without-retry-after", err: mkErr(429, "rate limited", nil),
+			name: "429-ratelimit-resettime-fallback", err: mkErr(429, "rate limited", http.Header{"Ratelimit-Resettime": []string{"Tue, 05 Jan 2027 10:00:00 GMT"}}),
 			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
-			contains:    []string{"retry after unknown seconds"},
+			contains:    []string{"resets at Tue, 05 Jan 2027"},
+		},
+		{
+			name: "429-retry-after-wins", err: mkErr(429, "rate limited", http.Header{"Retry-After": []string{"7"}, "Ratelimit-Resettime": []string{"later"}}),
+			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
+			contains:    []string{"retry after 7 seconds"},
+		},
+		{
+			name: "429-ratelimit-reset-fallback", err: mkErr(429, "rate limited", http.Header{"Ratelimit-Reset": []string{"1700000000"}}),
+			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
+			contains:    []string{"unix time 1700000000"},
+		},
+		{
+			// Per-endpoint limits (18.7) send no rate-limit headers at all.
+			name: "429-without-headers", err: mkErr(429, "rate limited", nil),
+			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
+			contains:    []string{"no rate-limit headers", "20 MB", "split the bundle"},
+		},
+		{
+			name: "302-redirect-refused", err: mkErr(302, "", http.Header{"Location": []string{"https://evil.example.net/api/v4/x"}}),
+			wantSummary: "Refused to follow a GitLab redirect (HTTP 302)",
+			contains:    []string{"evil.example.net", "base_url"},
 		},
 		{
 			name: "413-too-large",
@@ -791,7 +814,7 @@ func TestStampBlobs_OneProbeFailure(t *testing.T) {
 		"good-path": {Content: types.StringValue("good"), BlobID: types.StringNull()},
 	}
 
-	diags := res.stampBlobs(t.Context(), "proj", "main", files, "deadbeef")
+	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", nil)
 
 	if diags.HasError() {
 		t.Fatalf("expected no errors, got: %v", diags.Errors())
@@ -860,7 +883,7 @@ func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
 		"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
 	}
 
-	diags := res.stampBlobs(t.Context(), "proj", "main", files, "deadbeef")
+	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", nil)
 
 	if diags.HasError() {
 		t.Fatalf("expected no errors, got: %v", diags.Errors())
@@ -883,6 +906,68 @@ func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
 	// Probe treated as failure → commitSHA fallback for LastCommitID.
 	if f.LastCommitID.ValueString() != "deadbeef" {
 		t.Errorf("LastCommitID = %q, want %q (commitSHA fallback)", f.LastCommitID.ValueString(), "deadbeef")
+	}
+}
+
+// TestStampBlobs_HeaderlessProbeIsFailure: a 2xx metadata response without
+// the blob / last-commit headers must not be stored as empty strings; it is
+// a failed probe (warning, null blob_id, commitSHA kept as the lock token).
+func TestStampBlobs_HeaderlessProbeIsFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res := &filesResource{client: client}
+	files := map[string]fileModel{"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()}}
+
+	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", nil)
+	if diags.HasError() || diags.WarningsCount() != 1 {
+		t.Fatalf("want exactly one warning, got %v", diags)
+	}
+	f := files["file.txt"]
+	if !f.BlobID.IsNull() || f.LastCommitID.ValueString() != "deadbeef" {
+		t.Errorf("headerless probe must leave blob null and keep commitSHA, got %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+	}
+}
+
+// TestStampBlobs_TouchedSubset: only the touched paths are probed and
+// restamped; the rest of the map is left exactly as handed in.
+func TestStampBlobs_TouchedSubset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "untouched") {
+			t.Errorf("untouched path must not be probed: %s", r.URL.Path)
+		}
+		w.Header().Set("X-Gitlab-Blob-Id", "newblob")
+		w.Header().Set("X-Gitlab-Last-Commit-Id", "deadbeef")
+		w.Header().Set("X-Gitlab-File-Path", "touched.txt")
+		w.Header().Set("X-Gitlab-Ref", "deadbeef")
+		w.Header().Set("X-Gitlab-Size", "5")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res := &filesResource{client: client}
+	files := map[string]fileModel{
+		"touched.txt":   {Content: types.StringValue("a"), BlobID: types.StringNull()},
+		"untouched.txt": {Content: types.StringValue("b"), BlobID: types.StringValue("oldblob"), LastCommitID: types.StringValue("oldlcid")},
+	}
+
+	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", map[string]bool{"touched.txt": true})
+	if diags.HasError() || diags.WarningsCount() != 0 {
+		t.Fatalf("unexpected diagnostics: %v", diags)
+	}
+	if f := files["touched.txt"]; f.BlobID.ValueString() != "newblob" || f.LastCommitID.ValueString() != "deadbeef" {
+		t.Errorf("touched path not stamped: %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+	}
+	if f := files["untouched.txt"]; f.BlobID.ValueString() != "oldblob" || f.LastCommitID.ValueString() != "oldlcid" {
+		t.Errorf("untouched path must be left alone: %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
 	}
 }
 
@@ -932,7 +1017,7 @@ func TestStampBlobs_ProbesAtCreatedCommit(t *testing.T) {
 		"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
 	}
 
-	diags := res.stampBlobs(t.Context(), "proj", "main", files, ourCommitSHA)
+	diags := res.stampBlobs(t.Context(), "proj", files, ourCommitSHA, nil)
 	if diags.HasError() {
 		t.Fatalf("unexpected error: %v", diags.Errors())
 	}

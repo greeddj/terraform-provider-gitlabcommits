@@ -161,6 +161,63 @@ func TestStringMatchesRegex(t *testing.T) {
 	}
 }
 
+func TestStringIsBase64(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   types.String
+		wantErr bool
+	}{
+		{"valid", types.StringValue("aGVsbG8="), false},
+		{"empty", types.StringValue(""), false},
+		{"invalid", types.StringValue("not-base64!!!"), true},
+		{"null", types.StringNull(), false},
+		{"unknown", types.StringUnknown(), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp := &validator.StringResponse{}
+			stringIsBase64().ValidateString(t.Context(), validator.StringRequest{ConfigValue: c.value, Path: path.Root("content_base64")}, resp)
+			if got := resp.Diagnostics.HasError(); got != c.wantErr {
+				t.Fatalf("hasError=%v want %v", got, c.wantErr)
+			}
+		})
+	}
+}
+
+func TestStringValidRepoPath(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   types.String
+		wantErr bool
+	}{
+		{"plain", types.StringValue("dir/file.yaml"), false},
+		{"leading slash", types.StringValue("/abs"), true},
+		{"traversal", types.StringValue("a/../b"), true},
+		{"null", types.StringNull(), false},
+		{"unknown", types.StringUnknown(), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp := &validator.StringResponse{}
+			stringValidRepoPath().ValidateString(t.Context(), validator.StringRequest{ConfigValue: c.value, Path: path.Root("file_path")}, resp)
+			if got := resp.Diagnostics.HasError(); got != c.wantErr {
+				t.Fatalf("hasError=%v want %v", got, c.wantErr)
+			}
+		})
+	}
+}
+
+func TestStringBranchName(t *testing.T) {
+	cases := map[string]bool{"main": false, "release/1.2": false, "feature_x-1": false, "has space": true, "tab\tname": true}
+	for value, wantErr := range cases {
+		resp := &validator.StringResponse{}
+		stringBranchName().ValidateString(t.Context(), validator.StringRequest{ConfigValue: types.StringValue(value), Path: path.Root("branch")}, resp)
+		if got := resp.Diagnostics.HasError(); got != wantErr {
+			t.Errorf("%q: hasError=%v want %v", value, got, wantErr)
+		}
+	}
+}
+
 func TestMapNonEmpty(t *testing.T) {
 	elemType := types.ObjectType{AttrTypes: map[string]attr.Type{
 		"x": types.StringType,

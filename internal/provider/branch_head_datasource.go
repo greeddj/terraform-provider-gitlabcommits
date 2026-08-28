@@ -50,7 +50,7 @@ func (d *branchHeadDataSource) Schema(_ context.Context, _ datasource.SchemaRequ
 				Validators:  []validator.String{stringNotEmpty()}},
 			"branch": schema.StringAttribute{Required: true,
 				Description: "Branch name.",
-				Validators:  []validator.String{stringNotEmpty()}},
+				Validators:  []validator.String{stringNotEmpty(), stringBranchName()}},
 			"commit_sha": schema.StringAttribute{Computed: true,
 				Description: "SHA of the commit at the branch head."},
 			"protected": schema.BoolAttribute{Computed: true,

@@ -58,14 +58,14 @@ func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, r
 				Validators:  []validator.String{stringNotEmpty()},
 			},
 			"branch": schema.StringAttribute{
-				Description: "Branch (or any ref) to read the file from.",
+				Description: "Branch, tag or commit SHA to read the file from (letters, digits, dot, underscore, dash and slash).",
 				Required:    true,
-				Validators:  []validator.String{stringNotEmpty()},
+				Validators:  []validator.String{stringNotEmpty(), stringBranchName()},
 			},
 			"file_path": schema.StringAttribute{
-				Description: "Path of the file inside the repository.",
+				Description: "Path of the file inside the repository (relative, no leading slash).",
 				Required:    true,
-				Validators:  []validator.String{stringNotEmpty()},
+				Validators:  []validator.String{stringNotEmpty(), stringValidRepoPath()},
 			},
 			"content": schema.StringAttribute{
 				Description: "Decoded text content of the file. Null when the file is not valid UTF-8 " +

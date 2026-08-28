@@ -156,6 +156,50 @@ func TestRead_BranchGoneRemovesResource(t *testing.T) {
 	}
 }
 
+// TestRead_EmptyFilesChecksBranch: right after import there is nothing to
+// probe, so the branch is the only thing Read can verify - gone means the
+// resource is removed, present means state passes through.
+func TestRead_EmptyFilesChecksBranch(t *testing.T) {
+	for _, branchStatus := range []int{http.StatusOK, http.StatusNotFound} {
+		t.Run(http.StatusText(branchStatus), func(t *testing.T) {
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/") {
+					if branchStatus == http.StatusOK {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"head"}}`))
+						return
+					}
+					http.Error(w, "gone", branchStatus)
+					return
+				}
+				t.Errorf("unexpected call %s %s with no managed files", r.Method, r.URL.Path)
+			})
+			state := readState("blob")
+			state.Files = map[string]fileModel{}
+
+			resp, _ := runRead(t, client, state)
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+			if gone := resp.State.Raw.IsNull(); gone != (branchStatus == http.StatusNotFound) {
+				t.Fatalf("resource removed = %v, want %v", gone, branchStatus == http.StatusNotFound)
+			}
+		})
+	}
+}
+
+// TestRead_EmptyBlobIDErrors: a metadata response without X-Gitlab-Blob-Id
+// would compare equal to nothing forever; it is an error, not "unchanged".
+func TestRead_EmptyBlobIDErrors(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	resp, _ := runRead(t, client, readState("oldblob"))
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an error for a metadata response without blob_id")
+	}
+}
+
 // TestRead_BranchCheckErrorFails: if the confirming branch lookup fails with a
 // non-404, Read must error instead of guessing between "deleted" and
 // "temporarily unreachable".

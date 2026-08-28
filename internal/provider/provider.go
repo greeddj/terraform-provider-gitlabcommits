@@ -5,13 +5,15 @@ package provider
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
@@ -25,6 +27,13 @@ import (
 var (
 	_ provider.Provider = &gitlabCommitsProvider{}
 )
+
+// responseHeaderTimeout bounds how long a request may wait for GitLab's
+// response headers once the request, body included, has been sent, so a
+// wedged instance or proxy fails the apply instead of hanging it forever.
+// Uploads are not bounded by it, which matters for large commits; it only
+// starts once GitLab has the whole request.
+const responseHeaderTimeout = 5 * time.Minute
 
 // New is a helper function to simplify provider server and testing implementation.
 func New(version string) func() provider.Provider {
@@ -152,9 +161,31 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 		)
 		return
 	}
+	// The token goes straight into a header; net/http rejects control
+	// characters there with an opaque transport error, and a trailing newline
+	// from a file or $(cat ...) is the usual way one gets in.
+	if token != strings.TrimSpace(token) || strings.ContainsFunc(token, unicode.IsControl) {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("token"),
+			"Malformed GitLab API Token",
+			"The token contains leading or trailing whitespace or a control character; check for a trailing newline if it came from a file or a shell substitution.",
+		)
+		return
+	}
 
 	clientOpts := []gitlab.ClientOptionFunc{}
 	if baseURL != "" {
+		// client-go only logs its own URL validation failure and carries on,
+		// so a schemeless value would surface much later as a transport error.
+		u, err := url.Parse(baseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			resp.Diagnostics.AddAttributeError(
+				path.Root("base_url"),
+				"Invalid GitLab base URL",
+				fmt.Sprintf("%q must be an absolute http:// or https:// URL with a host, for example https://gitlab.example.com", baseURL),
+			)
+			return
+		}
 		clientOpts = append(clientOpts, gitlab.WithBaseURL(baseURL))
 		if strings.HasPrefix(strings.ToLower(baseURL), "http://") {
 			resp.Diagnostics.AddAttributeWarning(
@@ -202,17 +233,23 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 		fmt.Sprintf("terraform-provider-gitlabcommits/%s", p.version),
 	))
 
+	// client-go's default is cleanhttp's pooled client with no response
+	// timeout at all; keep the pooled transport and add one. The token
+	// travels as a Private-Token header, which net/http does NOT strip when
+	// following a cross-host redirect (unlike Authorization/Cookie), so
+	// off-host redirects are refused by crossHostRedirectGuard.
+	transport := cleanhttp.DefaultPooledTransport()
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	clientOpts = append(clientOpts, gitlab.WithHTTPClient(&http.Client{
+		Transport:     transport,
+		CheckRedirect: crossHostRedirectGuard,
+	}))
+
 	client, err := gitlab.NewClient(token, clientOpts...)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to create GitLab client", err.Error())
 		return
 	}
-
-	// The token travels as a Private-Token header, which net/http does NOT strip
-	// when following a cross-host redirect (unlike Authorization/Cookie). Refuse
-	// off-host redirects so a malicious or misconfigured GitLab cannot bounce the
-	// token to another host.
-	client.HTTPClient().CheckRedirect = crossHostRedirectGuard
 
 	tflog.Info(ctx, "GitLab Commits provider configured", map[string]any{
 		"base_url":    baseURL,
@@ -245,22 +282,27 @@ func (p *gitlabCommitsProvider) Resources(_ context.Context) []func() resource.R
 // leaves custom headers like Private-Token intact, so a 3xx pointing off-host
 // would otherwise forward the API token to an attacker-controlled host. Same-host
 // redirects (including http->https upgrades) are allowed, but an https->http
-// downgrade is refused - it would resend the token in cleartext. The chain is
-// capped at 10 to match net/http's default behaviour, which a non-nil
-// CheckRedirect drops.
+// downgrade is refused - it would resend the token in cleartext. A refusal
+// returns http.ErrUseLastResponse rather than an error: the 3xx then reaches
+// client-go as a plain non-2xx response, which it does not retry (an error
+// from CheckRedirect would be replayed max_retries times as a transport
+// failure), and apiErrorDiag explains it with the Location header. The chain
+// is capped at 10 to match net/http's default behaviour, which a non-nil
+// CheckRedirect drops, and the cap is reported the same way.
 func crossHostRedirectGuard(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
 	}
 	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
+		// Same treatment as a refused hop: an error here would be replayed
+		// by the client's retry for GET/HEAD, a 3xx is reported once.
+		return http.ErrUseLastResponse
 	}
 	if req.URL.Host != via[0].URL.Host {
-		return fmt.Errorf("refusing cross-host redirect to %q: the GitLab token must not be sent to a host other than %q",
-			req.URL.Host, via[0].URL.Host)
+		return http.ErrUseLastResponse
 	}
 	if req.URL.Scheme == "http" && via[len(via)-1].URL.Scheme == "https" {
-		return fmt.Errorf("refusing https->http redirect downgrade to %q: the GitLab token must not be resent in cleartext", req.URL.String())
+		return http.ErrUseLastResponse
 	}
 	return nil
 }

@@ -30,10 +30,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// refreshParallelism caps concurrent GitLab API calls during a single Read.
-// 16 is well below GitLab.com's authenticated rate budget while giving a
-// 16× speedup on the documented fan-out use case (hundreds of files per
-// resource). The retry layer in the client handles 429s if we do hit a cap.
+// refreshParallelism caps concurrent GitLab API calls within one resource
+// operation (a Read, an adopt probe, a stampBlobs pass). It is a per-operation
+// bound: with terraform's -parallelism (default 10) the process-wide
+// concurrency is up to 10x this. 16 gives a 16x speedup on the documented
+// fan-out use case (hundreds of files per resource) while client-go's
+// RateLimit-Limit-derived limiter keeps the aggregate under GitLab's budget,
+// and the retry layer handles 429s if a cap is hit anyway.
 const refreshParallelism = 16
 
 var (
@@ -189,14 +192,7 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 				Validators: []validator.String{
 					stringNotEmpty(),
-					// Permissive character allowlist only: letters, digits, dot,
-					// underscore, dash, slash. Does NOT reject "..", a leading or
-					// trailing slash, or other git-invalid shapes; GitLab validates
-					// those server-side. This only blocks whitespace and exotic chars.
-					stringMatchesRegex(
-						`^[A-Za-z0-9_./-]+$`,
-						"branch name can only contain letters, digits, dot, underscore, dash, and slash",
-					),
+					stringBranchName(),
 				},
 			},
 			"commit_message": schema.StringAttribute{
@@ -218,7 +214,9 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			},
 			"detect_drift": schema.BoolAttribute{
 				Description: "If true (default), Read fetches each managed file from GitLab and updates state " +
-					"when the remote blob differs, so terraform plan reflects the real repository state.",
+					"when the remote blob differs, so terraform plan reflects the real repository state. " +
+					"With false, Read is a no-op: a file deleted out of band stays in state until detect_drift is " +
+					"re-enabled and a refresh runs, and until then an update that removes it fails with GitLab's 400.",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
@@ -237,6 +235,8 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					"adopted on the next apply: a create-action targeting an existing path is silently rewritten " +
 					"as an update. When optimistic_lock is enabled, that adopt-update carries the file's current " +
 					"commit, so a concurrent external modification is still detected instead of being overwritten. " +
+					"An existing path whose content and mode already match the plan needs no action at all, so an apply " +
+					"that only adopts identical files makes no commit and leaves commit_sha unset. " +
 					"Required for terraform import to converge cleanly.",
 				Optional: true,
 				Computed: true,
@@ -245,11 +245,15 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"create_branch_from": schema.StringAttribute{
 				Description: "If set and `branch` does not yet exist, the provider creates it from this " +
 					"branch name or full commit SHA (typically \"main\"; tags are not supported) together with " +
-					"the first commit, as one push event. " +
+					"the first commit, as one push event (when adoption leaves nothing to commit, the branch is created on its own). " +
 					"Only consulted by Create; once the branch exists, changing or removing this value is a " +
 					"state-only no-op (no destroy / recreate). A branch created this way is not deleted by " +
 					"terraform destroy; only the managed files are.",
 				Optional: true,
+				Validators: []validator.String{
+					stringNotEmpty(),
+					stringBranchName(),
+				},
 			},
 			"optimistic_lock": schema.BoolAttribute{
 				Description: "If true (default), update / delete / chmod actions send the file's last_commit_id to GitLab. " +
@@ -295,6 +299,7 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 							Optional: true,
 							Validators: []validator.String{
 								stringConflictsWithSibling("content"),
+								stringIsBase64(),
 							},
 						},
 						"execute_filemode": schema.BoolAttribute{
@@ -359,16 +364,6 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 	branch := plan.Branch.ValueString()
 	createFrom := plan.CreateBranchFrom.ValueString()
 
-	// The lock spans from the branch check through the commit: two instances
-	// materialising the same branch must see each other's work, or the second
-	// one would try to create a branch that by then exists.
-	release, lockErr := r.locks.acquire(ctx, project, branch)
-	if lockErr != nil {
-		resp.Diagnostics.AddError("Cancelled while waiting for the branch lock", lockErr.Error())
-		return
-	}
-	defer release()
-
 	branchExists, existsErr := r.branchExists(ctx, project, branch)
 	if existsErr != nil {
 		summary, detail := apiErrorDiag("checking branch", project, branch, existsErr)
@@ -395,7 +390,7 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 		if !branchExists {
 			probeRef = createFrom
 		}
-		probes = r.probeRemote(ctx, project, probeRef, paths)
+		probes = r.probeRemote(ctx, project, probeRef, paths, true)
 	}
 
 	actions := make([]*gitlab.CommitActionOptions, 0, len(plan.Files))
@@ -406,6 +401,51 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 			return
 		}
 		actions = append(actions, acts...)
+	}
+	plan.ID = types.StringValue(buildID(project, branch))
+
+	// The lock covers branch materialisation and the commit: two instances
+	// materialising the same branch must see each other's work, or the
+	// second one would try to create a branch that by then exists. The
+	// checks and probes above only read, so they ran unlocked; the branch is
+	// re-checked here. Probes taken against create_branch_from stay valid
+	// when the branch appeared meanwhile: it was created from that ref, and
+	// another instance's files are never this resource's paths.
+	release, lockErr := r.locks.acquire(ctx, project, branch)
+	if lockErr != nil {
+		resp.Diagnostics.AddError("Cancelled while waiting for the branch lock", lockErr.Error())
+		return
+	}
+	defer release()
+	if !branchExists {
+		branchExists, existsErr = r.branchExists(ctx, project, branch)
+		if existsErr != nil {
+			summary, detail := apiErrorDiag("checking branch", project, branch, existsErr)
+			resp.Diagnostics.AddError(summary, detail)
+			return
+		}
+	}
+
+	if len(actions) == 0 {
+		// Every path was adopted with identical content and mode: nothing to
+		// commit. A missing branch is still materialised, as a bare branch
+		// creation (one push event, no commit).
+		if !branchExists {
+			if err := r.createBranch(ctx, project, branch, createFrom); err != nil {
+				summary, detail := apiErrorDiag("ensuring branch exists", project, branch, err)
+				resp.Diagnostics.AddError(summary, detail)
+				return
+			}
+		}
+		release()
+		carryOver(plan.Files, nil, probes, nil)
+		plan.CommitSHA = types.StringNull()
+		tflog.Info(ctx, "GitLab files already match, no commit", map[string]any{
+			"project_id": project,
+			"branch":     branch,
+		})
+		resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+		return
 	}
 
 	opts := commitOptions(plan, actions)
@@ -442,20 +482,27 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 		return
 	}
 	// A 2xx response with a JSON-null body decodes to a nil *Commit with no
-	// error; guard before dereferencing so a hostile/buggy GitLab cannot panic
-	// the provider process after a commit may already have landed.
-	if commit == nil {
+	// error, and an empty id is just as unusable; guard before dereferencing
+	// so a hostile/buggy GitLab cannot panic the provider process after a
+	// commit may already have landed. Returning without state is deliberate:
+	// a Create that returns state on error is tainted by Terraform and
+	// replaced, which would push a delete commit; a re-run converges through
+	// adoption instead.
+	if commit == nil || commit.ID == "" {
 		resp.Diagnostics.AddError("GitLab returned no commit",
-			"CreateCommit succeeded but the response contained no commit object; repository state is unknown. Run `terraform plan` to reconcile.")
+			"CreateCommit succeeded but the response contained no commit object; repository state is unknown. "+
+				"Run `terraform plan` and apply again: with adopt_existing enabled (default) the retry adopts whatever the "+
+				"first attempt committed instead of failing on existing files.")
 		return
 	}
 
-	resp.Diagnostics.Append(r.stampBlobs(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), plan.Files, commit.ID)...)
+	touched := touchedPaths(actions)
+	carryOver(plan.Files, nil, probes, touched)
+	resp.Diagnostics.Append(r.stampBlobs(ctx, project, plan.Files, commit.ID, touched)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 	plan.CommitSHA = types.StringValue(commit.ID)
-	plan.ID = types.StringValue(buildID(plan.ProjectID.ValueString(), plan.Branch.ValueString()))
 
 	tflog.Info(ctx, "GitLab files commit created", map[string]any{
 		"project_id": plan.ProjectID.ValueString(),
@@ -512,6 +559,12 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 				}
 				return &pathError{path: p, err: err}
 			}
+			// client-go builds the metadata from response headers and reports
+			// a missing X-Gitlab-Blob-Id as "": comparing that with state
+			// would read as "unchanged" forever, so it is an error instead.
+			if meta.BlobID == "" {
+				return &pathError{path: p, err: errors.New("GitLab returned no blob_id in the metadata response")}
+			}
 			if meta.BlobID == f.BlobID.ValueString() &&
 				meta.ExecuteFilemode == f.ExecuteFilemode.ValueBool() {
 				results[i].metaLastCommitID = meta.LastCommitID
@@ -546,8 +599,9 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 	// (branch or project deleted out of band, or the token lost access -
 	// GitLab answers 404 for all three). Silently emptying the files map would
 	// strand the resource with state no apply can fix; drop it from state
-	// instead so the next apply recreates everything from scratch.
-	if allDropped(results) {
+	// instead so the next apply recreates everything from scratch. With no
+	// files at all (right after import) the branch is the only thing to check.
+	if len(paths) == 0 || allDropped(results) {
 		_, _, err := r.client.Branches.GetBranch(project, branch, gitlab.WithContext(ctx))
 		if err != nil {
 			if errors.Is(err, gitlab.ErrNotFound) {
@@ -670,21 +724,16 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 		return
 	}
 
-	actions, err := r.diffActions(ctx, plan, state)
+	actions, probes, err := r.diffActions(ctx, plan, state)
 	if err != nil {
 		resp.Diagnostics.AddError("Error building actions", err.Error())
 		return
 	}
 
 	if len(actions) == 0 {
-		// No file content changed; just preserve computed fields.
-		for p, f := range plan.Files {
-			if existing, ok := state.Files[p]; ok {
-				f.BlobID = existing.BlobID
-				f.LastCommitID = existing.LastCommitID
-			}
-			plan.Files[p] = f
-		}
+		// Nothing to commit: keep computed fields from state, or from the
+		// adopt probe for paths that turned out to already match.
+		carryOver(plan.Files, state.Files, probes, nil)
 		plan.CommitSHA = state.CommitSHA
 		plan.ID = state.ID
 		resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
@@ -715,13 +764,15 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 		return
 	}
 	// See Create: a JSON-null body decodes to a nil *Commit with no error.
-	if commit == nil {
+	if commit == nil || commit.ID == "" {
 		resp.Diagnostics.AddError("GitLab returned no commit",
 			"CreateCommit succeeded but the response contained no commit object; repository state is unknown. Run `terraform plan` to reconcile.")
 		return
 	}
 
-	resp.Diagnostics.Append(r.stampBlobs(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), plan.Files, commit.ID)...)
+	touched := touchedPaths(actions)
+	carryOver(plan.Files, state.Files, probes, touched)
+	resp.Diagnostics.Append(r.stampBlobs(ctx, plan.ProjectID.ValueString(), plan.Files, commit.ID, touched)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -757,7 +808,7 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 	useLock := state.optimisticLock()
 
 	paths := sortedKeys(state.Files)
-	probes := r.probeRemote(ctx, project, branch, paths)
+	probes := r.probeRemote(ctx, project, branch, paths, false)
 
 	// A failed probe must fail the destroy: treating it as "absent" would skip
 	// the delete action and let the framework drop the resource from state
@@ -817,6 +868,19 @@ func (r *filesResource) ImportState(ctx context.Context, req resource.ImportStat
 		resp.Diagnostics.AddError("Invalid Import ID", err.Error())
 		return
 	}
+	// Import records nothing but the id, so a typo would only surface as an
+	// empty, unfixable resource at the next plan; check the branch now.
+	exists, err := r.branchExists(ctx, project, branch)
+	if err != nil {
+		summary, detail := apiErrorDiag("checking the branch on import", project, branch, err)
+		resp.Diagnostics.AddError(summary, detail)
+		return
+	}
+	if !exists {
+		resp.Diagnostics.AddError("Branch not found",
+			fmt.Sprintf("branch %q does not exist in project %q, or the token cannot see the project (GitLab answers 404 for both); nothing to import", branch, project))
+		return
+	}
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("project_id"), types.StringValue(project))...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("branch"), types.StringValue(branch))...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), types.StringValue(buildID(project, branch)))...)
@@ -841,15 +905,36 @@ func parseImportID(s string) (project, branch string, err error) {
 }
 
 // diffActions computes the minimal set of commit actions needed to make the
-// repository match the plan. For files newly added in the plan, when
+// repository match the plan, plus the adopt probes it took so the caller can
+// stamp paths that needed no action. For files newly added in the plan, when
 // adopt_existing is enabled, it prefers update over create if the path already
-// exists in the repo (e.g. after terraform import). When optimistic_lock is
-// enabled, update / delete / chmod actions carry the file's previously-known
+// exists in the repo (e.g. after terraform import), and emits nothing at all
+// when the remote content already matches. When optimistic_lock is enabled,
+// update / delete / chmod actions carry the file's previously-known
 // last_commit_id so GitLab rejects the action if the file was concurrently
 // modified.
-func (r *filesResource) diffActions(ctx context.Context, plan, state filesResourceModel) ([]*gitlab.CommitActionOptions, error) {
+func (r *filesResource) diffActions(ctx context.Context, plan, state filesResourceModel) ([]*gitlab.CommitActionOptions, map[string]remoteProbe, error) {
 	actions := make([]*gitlab.CommitActionOptions, 0)
 	useLock := plan.optimisticLock()
+
+	// Deletes go first: GitLab applies a commit's actions in order against
+	// one index, so a path turning from a file into a directory (or back)
+	// only works when the old entry is gone before the new one is created.
+	for _, p := range sortedKeys(state.Files) {
+		if _, kept := plan.Files[p]; kept {
+			continue
+		}
+		del := &gitlab.CommitActionOptions{
+			Action:   new(gitlab.FileDelete),
+			FilePath: new(p),
+		}
+		if useLock {
+			if lcid := state.Files[p].LastCommitID.ValueString(); lcid != "" {
+				del.LastCommitID = new(lcid)
+			}
+		}
+		actions = append(actions, del)
+	}
 
 	// Probe new-in-plan paths in parallel when adoption is on. The
 	// post-import path (state.Files empty, plan.Files large) hits this with
@@ -864,7 +949,7 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 			}
 		}
 		if len(newPaths) > 0 {
-			probes = r.probeRemote(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), newPaths)
+			probes = r.probeRemote(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), newPaths, true)
 		}
 	}
 
@@ -875,7 +960,7 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 		if !exists {
 			acts, err := adoptAwareActions(p, pf, probes[p], useLock)
 			if err != nil {
-				return nil, fmt.Errorf("file %q: %w", p, err)
+				return nil, nil, fmt.Errorf("file %q: %w", p, err)
 			}
 			actions = append(actions, acts...)
 			continue
@@ -888,12 +973,12 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 
 		changed, err := contentChanged(pf, sf)
 		if err != nil {
-			return nil, fmt.Errorf("file %q: %w", p, err)
+			return nil, nil, fmt.Errorf("file %q: %w", p, err)
 		}
 		if changed {
 			a, err := buildAction(p, pf, gitlab.FileUpdate, lastCommitID)
 			if err != nil {
-				return nil, fmt.Errorf("file %q: %w", p, err)
+				return nil, nil, fmt.Errorf("file %q: %w", p, err)
 			}
 			actions = append(actions, a)
 		}
@@ -913,49 +998,77 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 		}
 	}
 
-	for _, p := range sortedKeys(state.Files) {
-		if _, kept := plan.Files[p]; kept {
-			continue
-		}
-		del := &gitlab.CommitActionOptions{
-			Action:   new(gitlab.FileDelete),
-			FilePath: new(p),
-		}
-		if useLock {
-			if lcid := state.Files[p].LastCommitID.ValueString(); lcid != "" {
-				del.LastCommitID = new(lcid)
-			}
-		}
-		actions = append(actions, del)
-	}
-
-	return actions, nil
+	return actions, probes, nil
 }
 
-// remoteProbe is the result of a HEAD-style metadata probe for one path:
-// whether the file exists at branch HEAD and, if so, its current
-// last_commit_id. The token lets an adopt-update be guarded by optimistic_lock
-// even though there is no prior state for the file. err is set for any probe
-// failure other than a genuine 404 so callers can tell "absent" from
-// "unknown": the adopt paths deliberately ignore it (a spurious create fails
-// loudly at CreateCommit anyway), but Delete must not - skipping a file
-// because a probe errored would let destroy report success while the file
-// still exists in the repository.
+// touchedPaths is the set of paths a commit's actions write to; every other
+// managed path keeps the blob_id / last_commit_id it already had.
+func touchedPaths(actions []*gitlab.CommitActionOptions) map[string]bool {
+	out := make(map[string]bool, len(actions))
+	for _, a := range actions {
+		if a.FilePath != nil {
+			out[*a.FilePath] = true
+		}
+	}
+	return out
+}
+
+// carryOver fills blob_id / last_commit_id for every path not in skip: from
+// state when the path was already managed, otherwise from the adopt probe (a
+// path that already matched the plan), otherwise null. Paths in skip are left
+// to stampBlobs, which reads them off the commit just created.
+func carryOver(files, state map[string]fileModel, probes map[string]remoteProbe, skip map[string]bool) {
+	for p, f := range files {
+		if skip[p] {
+			continue
+		}
+		if existing, ok := state[p]; ok {
+			f.BlobID = existing.BlobID
+			f.LastCommitID = existing.LastCommitID
+		} else if probe := probes[p]; probe.exists {
+			f.BlobID = stringOrNull(probe.blobID)
+			f.LastCommitID = stringOrNull(probe.lastCommitID)
+		} else {
+			f.BlobID = types.StringNull()
+			f.LastCommitID = types.StringNull()
+		}
+		files[p] = f
+	}
+}
+
+func stringOrNull(s string) types.String {
+	if s == "" {
+		return types.StringNull()
+	}
+	return types.StringValue(s)
+}
+
+// remoteProbe is the result of a metadata probe for one path: whether the
+// file exists at the ref and, if so, its blob_id, last_commit_id and exec bit,
+// plus the content when the probe was asked for it (adoption compares it with
+// the plan to avoid a no-op update commit). The lock token lets an
+// adopt-update be guarded by optimistic_lock even though there is no prior
+// state for the file. err is set for any failure other than a genuine 404 so
+// callers can tell "absent" from "unknown": the adopt paths deliberately fall
+// back to a plain update on it (a spurious create fails loudly at
+// CreateCommit anyway), but Delete must not - skipping a file because a probe
+// errored would let destroy report success while the file still exists.
 type remoteProbe struct {
 	err             error
 	lastCommitID    string
+	blobID          string
+	content         []byte
 	exists          bool
 	executeFilemode bool
+	hasContent      bool
 }
 
-// probeFile reports whether filePath is present at branch HEAD and returns its
-// last_commit_id. Used to rewrite spurious "create" actions into "update" when
-// adopting existing files, to forward a lock token on that adopt-update, and to
-// skip already-deleted paths during destroy. Only a genuine 404 maps to
-// "absent"; any other failure is carried in err.
-func (r *filesResource) probeFile(ctx context.Context, project, branch, filePath string) remoteProbe {
+// probeFile reports whether filePath is present at ref and returns its
+// metadata, plus the decoded content when withContent is set. Only a genuine
+// 404 maps to "absent"; any other failure is carried in err.
+func (r *filesResource) probeFile(ctx context.Context, project, ref, filePath string, withContent bool) remoteProbe {
 	meta, _, err := r.client.RepositoryFiles.GetFileMetaData(project, filePath, &gitlab.GetFileMetaDataOptions{
-		Ref: new(branch),
+		Ref: new(ref),
 	}, gitlab.WithContext(ctx))
 	if err != nil {
 		if errors.Is(err, gitlab.ErrNotFound) {
@@ -966,15 +1079,34 @@ func (r *filesResource) probeFile(ctx context.Context, project, branch, filePath
 	if meta == nil {
 		return remoteProbe{}
 	}
-	return remoteProbe{exists: true, lastCommitID: meta.LastCommitID, executeFilemode: meta.ExecuteFilemode}
+	probe := remoteProbe{exists: true, blobID: meta.BlobID, lastCommitID: meta.LastCommitID, executeFilemode: meta.ExecuteFilemode}
+	if !withContent {
+		return probe
+	}
+	file, _, err := r.client.RepositoryFiles.GetFile(project, filePath, &gitlab.GetFileOptions{
+		Ref: new(ref),
+	}, gitlab.WithContext(ctx))
+	if err != nil {
+		probe.err = err
+		return probe
+	}
+	raw, err := decodeRemoteContent(file)
+	if err != nil {
+		probe.err = err
+		return probe
+	}
+	probe.content, probe.hasContent = raw, true
+	return probe
 }
 
 // adoptAwareActions builds the action set for a path with no prior state: a
 // plain create, or - when the path already exists remotely - an adopt-update
-// carrying the probed lock token. The commits API honors execute_filemode only
-// on create and chmod actions, so an adopt-update cannot set the exec bit
-// itself; when the remote bit differs from the plan a companion chmod is
-// emitted into the same commit, keeping one-commit-per-apply intact.
+// carrying the probed lock token, or nothing at all when the remote content
+// already matches the plan (the import round-trip must not produce a commit).
+// The commits API honors execute_filemode only on create and chmod actions,
+// so an adopt-update cannot set the exec bit itself; when the remote bit
+// differs from the plan a companion chmod is emitted into the same commit,
+// keeping one-commit-per-apply intact.
 func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) ([]*gitlab.CommitActionOptions, error) {
 	op := gitlab.FileCreate
 	lastCommitID := ""
@@ -982,18 +1114,18 @@ func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) (
 		op = gitlab.FileUpdate
 		// Forward the probed last_commit_id under optimistic_lock so the
 		// adopt-update still fails on a concurrent writer instead of blindly
-		// overwriting it.
+		// overwriting it. A missing token would silently drop the guard, so
+		// it is an error rather than an unlocked write.
 		if useLock {
+			if probe.lastCommitID == "" {
+				return nil, errors.New("GitLab returned no last_commit_id for the existing file, so optimistic_lock cannot guard its adoption; retry, or set optimistic_lock = false")
+			}
 			lastCommitID = probe.lastCommitID
 		}
 	}
-	a, err := buildAction(p, f, op, lastCommitID)
-	if err != nil {
-		return nil, err
-	}
-	actions := []*gitlab.CommitActionOptions{a}
+	var chmod *gitlab.CommitActionOptions
 	if probe.exists && probe.executeFilemode != f.ExecuteFilemode.ValueBool() {
-		chmod := &gitlab.CommitActionOptions{
+		chmod = &gitlab.CommitActionOptions{
 			Action:          new(gitlab.FileChmod),
 			FilePath:        new(p),
 			ExecuteFilemode: new(f.ExecuteFilemode.ValueBool()),
@@ -1001,6 +1133,25 @@ func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) (
 		if lastCommitID != "" {
 			chmod.LastCommitID = new(lastCommitID)
 		}
+	}
+	if probe.hasContent {
+		raw, err := f.rawBytes()
+		if err != nil {
+			return nil, err
+		}
+		if bytes.Equal(raw, probe.content) {
+			if chmod != nil {
+				return []*gitlab.CommitActionOptions{chmod}, nil
+			}
+			return nil, nil
+		}
+	}
+	a, err := buildAction(p, f, op, lastCommitID)
+	if err != nil {
+		return nil, err
+	}
+	actions := []*gitlab.CommitActionOptions{a}
+	if chmod != nil {
 		actions = append(actions, chmod)
 	}
 	return actions, nil
@@ -1009,9 +1160,9 @@ func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) (
 // probeRemote fans probeFile out across paths at refreshParallelism. The
 // goroutines always return nil so Wait never fails; each path's outcome -
 // including non-404 probe errors - travels in its remoteProbe's err field
-// for the caller to interpret (Delete aborts on it, the adopt paths ignore
-// it on purpose).
-func (r *filesResource) probeRemote(ctx context.Context, project, branch string, paths []string) map[string]remoteProbe {
+// for the caller to interpret (Delete aborts on it, the adopt paths fall
+// back to an update on purpose).
+func (r *filesResource) probeRemote(ctx context.Context, project, ref string, paths []string, withContent bool) map[string]remoteProbe {
 	out := make(map[string]remoteProbe, len(paths))
 	if len(paths) == 0 {
 		return out
@@ -1021,7 +1172,7 @@ func (r *filesResource) probeRemote(ctx context.Context, project, branch string,
 	g.SetLimit(refreshParallelism)
 	for i, p := range paths {
 		g.Go(func() error {
-			probes[i] = r.probeFile(gctx, project, branch, p)
+			probes[i] = r.probeFile(gctx, project, ref, p, withContent)
 			return nil
 		})
 	}
@@ -1046,16 +1197,40 @@ func (r *filesResource) branchExists(ctx context.Context, project, branch string
 }
 
 // missingBranchPreflight validates that an absent branch can actually be
-// materialised. On a repository with zero commits every branch lookup 404s
-// and no ref exists to branch from, so the create_branch_from advice would
-// be a dead end; detect that case and say what actually helps.
+// materialised. A 404 on the project means the project itself is the problem
+// (missing, or invisible to the token), not the branch; on a repository with
+// zero commits every branch lookup 404s and no ref exists to branch from, so
+// the create_branch_from advice would be a dead end. Both cases say what
+// actually helps.
 func (r *filesResource) missingBranchPreflight(ctx context.Context, project, branch, createFrom string) error {
-	if proj, _, perr := r.client.Projects.GetProject(project, nil, gitlab.WithContext(ctx)); perr == nil && proj != nil && proj.EmptyRepo {
+	proj, _, err := r.client.Projects.GetProject(project, nil, gitlab.WithContext(ctx))
+	if err != nil {
+		if errors.Is(err, gitlab.ErrNotFound) {
+			return fmt.Errorf("project %q does not exist or the token cannot see it (GitLab answers 404 for both); "+
+				"check project_id and the token's scope and membership", project)
+		}
+		return fmt.Errorf("checking project %q: %w", project, err)
+	}
+	if proj != nil && proj.EmptyRepo {
 		return fmt.Errorf("repository %q has no commits, so branch %q cannot exist and create_branch_from has no ref to start from; "+
 			"create an initial commit first (for example initialize the project with a README)", project, branch)
 	}
 	if createFrom == "" {
 		return fmt.Errorf("branch %q does not exist; set create_branch_from to materialise it", branch)
+	}
+	return nil
+}
+
+// createBranch materialises branch from createFrom without a commit. Only
+// used when adoption found nothing to commit; otherwise start_branch on the
+// first commit does both in one operation.
+func (r *filesResource) createBranch(ctx context.Context, project, branch, createFrom string) error {
+	_, _, err := r.client.Branches.CreateBranch(project, &gitlab.CreateBranchOptions{
+		Branch: new(branch),
+		Ref:    new(createFrom),
+	}, gitlab.WithContext(ctx))
+	if err != nil {
+		return fmt.Errorf("creating branch %q from create_branch_from ref %q: %w", branch, createFrom, err)
 	}
 	return nil
 }
@@ -1130,10 +1305,13 @@ func (f fileModel) rawBytes() ([]byte, error) {
 	}
 }
 
-// stampBlobs refreshes BlobID and LastCommitID for every entry in files
-// after a successful CreateCommit. BlobID is pulled via parallel
-// GetFileMetaData probes (HEAD-style) so state reflects what GitLab
-// returns — including any future blob-id format (SHA-256 repos).
+// stampBlobs refreshes BlobID and LastCommitID for the paths a successful
+// CreateCommit touched (every path when touched is nil). BlobID is pulled via
+// parallel GetFileMetaData probes (HEAD-style) so state reflects what GitLab
+// returns, including any future blob-id format (SHA-256 repos). Paths the
+// commit did not touch are not probed at all; the caller carries their
+// values over from state (carryOver), so a probe hiccup can never stamp this
+// commit's SHA next to a file it never modified.
 //
 // Probes run at Ref = commitSHA (the commit just created), NOT at branch
 // HEAD: a writer landing between our CreateCommit and the probe would
@@ -1143,39 +1321,39 @@ func (f fileModel) rawBytes() ([]byte, error) {
 // racer's commit. Probing our own commit keeps state self-consistent; the
 // racer is then caught by the next Read (their blob differs) and by the
 // optimistic lock (our commit id no longer matches the file's last
-// commit). Per-file LastCommitID still comes from the probe response, not
-// commitSHA verbatim: files this commit did not touch keep their older
-// commit id, avoiding false lock conflicts.
+// commit).
 //
-// Fail-soft covers two shapes: probe error AND a server-returned blob_id
-// longer than 256 bytes (generous ceiling above SHA-512 hex; anything
-// longer is unexpected and treated as hostile). In both cases BlobID is
-// left null, LastCommitID keeps the commitSHA first-pass stamp, and a
-// warning is appended; the next Read will repopulate both.
+// Fail-soft covers three shapes: a probe error, a 2xx that carries no
+// blob_id or last_commit_id header, and a blob_id longer than 256 bytes
+// (generous ceiling above SHA-512 hex; anything longer is unexpected and
+// treated as hostile). In all of them BlobID is left null, LastCommitID
+// keeps the commitSHA first-pass stamp (correct for a touched file), and a
+// warning is appended; the next Read repopulates both.
 func (r *filesResource) stampBlobs(
 	ctx context.Context,
-	project, branch string,
+	project string,
 	files map[string]fileModel,
 	commitSHA string,
+	touched map[string]bool,
 ) diag.Diagnostics {
 	var diagnostics diag.Diagnostics
 
+	paths := make([]string, 0, len(files))
+	for _, p := range sortedKeys(files) {
+		if touched == nil || touched[p] {
+			paths = append(paths, p)
+		}
+	}
+
 	// First pass (serial): stamp LastCommitID from the known commit SHA and
 	// reset BlobID to null so a probe failure leaves it null rather than stale.
-	for p, f := range files {
-		if commitSHA != "" {
-			f.LastCommitID = types.StringValue(commitSHA)
-		}
+	for _, p := range paths {
+		f := files[p]
+		f.LastCommitID = types.StringValue(commitSHA)
 		f.BlobID = types.StringNull()
 		files[p] = f
 	}
 
-	ref := commitSHA
-	if ref == "" {
-		ref = branch
-	}
-
-	paths := sortedKeys(files)
 	type probeResult struct {
 		err          error
 		blobID       string
@@ -1188,7 +1366,7 @@ func (r *filesResource) stampBlobs(
 	for i, p := range paths {
 		g.Go(func() error {
 			meta, _, err := r.client.RepositoryFiles.GetFileMetaData(project, p, &gitlab.GetFileMetaDataOptions{
-				Ref: new(ref),
+				Ref: new(commitSHA),
 			}, gitlab.WithContext(gctx))
 			if err != nil {
 				results[i].err = err
@@ -1198,6 +1376,10 @@ func (r *filesResource) stampBlobs(
 				results[i].err = fmt.Errorf("path %q: server returned blob_id of unexpected length %d (max %d)", p, len(meta.BlobID), maxBlobIDLen)
 				return nil //nolint:nilerr // intentional: treat oversized blob_id as probe failure
 			}
+			if meta.BlobID == "" || meta.LastCommitID == "" {
+				results[i].err = fmt.Errorf("path %q: metadata response carried no blob_id or last_commit_id", p)
+				return nil //nolint:nilerr // intentional: a header-less 2xx is a failed probe, not a value to store
+			}
 			results[i].blobID = meta.BlobID
 			results[i].lastCommitID = meta.LastCommitID
 			return nil
@@ -1205,10 +1387,8 @@ func (r *filesResource) stampBlobs(
 	}
 	_ = g.Wait()
 
-	// Second pass (serial): apply probe results. On success, overwrite the
-	// first-pass commitSHA with the per-file LastCommitID probed at
-	// Ref=commitSHA, so files this commit did not touch keep their older
-	// commit id instead of a token that would trip a false lock conflict.
+	// Second pass (serial): apply probe results, overwriting the first-pass
+	// commitSHA with the per-file LastCommitID probed at Ref=commitSHA.
 	for i, p := range paths {
 		f := files[p]
 		if results[i].err != nil {
@@ -1274,10 +1454,18 @@ const maxBlobIDLen = 256
 const maxDiagBodyChars = 1024
 
 func truncateForDiag(s string) string {
+	// A diagnostic travels as a proto3 string, which must be valid UTF-8;
+	// a proxy error page in another encoding would otherwise fail to marshal.
+	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) <= maxDiagBodyChars {
 		return s
 	}
-	return s[:maxDiagBodyChars] + fmt.Sprintf("… (truncated, %d more chars)", len(s)-maxDiagBodyChars)
+	// Cut on a rune boundary for the same reason.
+	cut := maxDiagBodyChars
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + fmt.Sprintf("… (truncated, %d more chars)", len(s)-cut)
 }
 
 // apiErrorDiag turns a raw GitLab API error into a structured Terraform
@@ -1356,13 +1544,31 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 				"This provider batches every file change into one commit per apply, so split the files across multiple "+
 				"`gitlabcommits_files` resources (for example with for_each), or on self-managed GitLab raise the "+
 				"GITLAB_COMMITS_MAX_REQUEST_SIZE_BYTES limit. Body: %s", prefix, body)
+		case 301, 302, 303, 307, 308:
+			// crossHostRedirectGuard stops the client from following an
+			// off-host or https->http redirect; the 3xx then lands here.
+			summary = fmt.Sprintf("Refused to follow a GitLab redirect (HTTP %d)", status)
+			return summary, fmt.Sprintf("%s: GitLab answered with a redirect to %q. Redirects to another host or from https "+
+				"to http are not followed because the request carries the API token; point base_url at the final GitLab "+
+				"address. Body: %s", prefix, resp.Response.Header.Get("Location"), body)
 		case 429:
 			summary = "GitLab rate limit exceeded (HTTP 429)"
-			retryAfter := resp.Response.Header.Get("Retry-After")
-			if retryAfter == "" {
-				retryAfter = "unknown"
+			h := resp.Response.Header
+			switch {
+			case h.Get("Retry-After") != "":
+				return summary, fmt.Sprintf("%s: retry after %s seconds. Body: %s", prefix, h.Get("Retry-After"), body)
+			case h.Get("RateLimit-ResetTime") != "":
+				return summary, fmt.Sprintf("%s: the limit resets at %s. Body: %s", prefix, h.Get("RateLimit-ResetTime"), body)
+			case h.Get("RateLimit-Reset") != "":
+				return summary, fmt.Sprintf("%s: the limit resets at unix time %s. Body: %s", prefix, h.Get("RateLimit-Reset"), body)
+			default:
+				// GitLab's per-endpoint limits answer without any rate-limit
+				// header, unlike the Rack::Attack throttles.
+				return summary, fmt.Sprintf("%s: no rate-limit headers were sent, which is how GitLab's per-endpoint limits "+
+					"answer (on GitLab.com: commit requests over 20 MB are limited to 3 per 30 s and reads of blobs over 10 MB "+
+					"to 5 per minute; self-managed instances configure their own). Raise max_retries / retry_wait_min_ms, or "+
+					"split the bundle across resources. Body: %s", prefix, body)
 			}
-			return summary, fmt.Sprintf("%s: retry after %s seconds. Body: %s", prefix, retryAfter, body)
 		default:
 			if status >= 500 {
 				// A commit request is deliberately never replayed on 5xx (see

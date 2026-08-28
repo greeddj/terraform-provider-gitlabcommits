@@ -36,8 +36,8 @@ output "renovate_content" {
 
 ### Required
 
-- `branch` (String) Branch (or any ref) to read the file from.
-- `file_path` (String) Path of the file inside the repository.
+- `branch` (String) Branch, tag or commit SHA to read the file from (letters, digits, dot, underscore, dash and slash).
+- `file_path` (String) Path of the file inside the repository (relative, no leading slash).
 - `project_id` (String) Numeric project ID or the plain project path (e.g. "group/subgroup/project"); do not URL-encode it, the provider escapes it.
 
 ### Read-Only

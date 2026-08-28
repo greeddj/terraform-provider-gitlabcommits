@@ -5,6 +5,7 @@ package provider
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"regexp"
@@ -105,6 +106,65 @@ func (v stringRegexValidator) ValidateString(_ context.Context, req validator.St
 	}
 	if !v.re.MatchString(req.ConfigValue.ValueString()) {
 		resp.Diagnostics.AddAttributeError(req.Path, "Invalid value", v.msg)
+	}
+}
+
+// stringBranchName is the shared shape check for branch and ref attributes: a
+// permissive character allowlist only (letters, digits, dot, underscore,
+// dash, slash). It does NOT reject "..", a leading or trailing slash, or
+// other git-invalid shapes; GitLab validates those server-side. This only
+// blocks whitespace and exotic characters.
+func stringBranchName() validator.String {
+	return stringMatchesRegex(
+		`^[A-Za-z0-9_./-]+$`,
+		"branch name can only contain letters, digits, dot, underscore, dash, and slash",
+	)
+}
+
+// stringIsBase64 rejects a content_base64 value that does not decode, at plan
+// time instead of at apply time inside buildAction.
+func stringIsBase64() validator.String {
+	return stringIsBase64Validator{}
+}
+
+type stringIsBase64Validator struct{}
+
+func (v stringIsBase64Validator) Description(_ context.Context) string {
+	return "must be valid standard base64"
+}
+func (v stringIsBase64Validator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+func (v stringIsBase64Validator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if _, err := base64.StdEncoding.DecodeString(req.ConfigValue.ValueString()); err != nil {
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid base64", fmt.Sprintf("value is not valid standard base64: %s", err))
+	}
+}
+
+// stringValidRepoPath applies the repository-path rules of mapKeysValidRepoPath
+// to a single string attribute (the file data source's file_path).
+func stringValidRepoPath() validator.String {
+	return stringRepoPathValidator{}
+}
+
+type stringRepoPathValidator struct{}
+
+func (v stringRepoPathValidator) Description(_ context.Context) string {
+	return "must be a relative repository path: no leading slash, no \".\" or \"..\" segments, no NUL bytes, no empty segments, no segment starting with whitespace"
+}
+func (v stringRepoPathValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+func (v stringRepoPathValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if err := validateRepoPath(req.ConfigValue.ValueString()); err != nil {
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid file path",
+			fmt.Sprintf("path %q is invalid: %s", req.ConfigValue.ValueString(), err))
 	}
 }
 

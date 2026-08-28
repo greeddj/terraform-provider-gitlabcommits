@@ -4,7 +4,9 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"regexp"
@@ -42,6 +44,10 @@ func TestAccFiles_basic(t *testing.T) {
 
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
+			accCheckFileGone(project, branch, accTestPathPrefix+"basic/a.yaml"),
+			accCheckFileGone(project, branch, accTestPathPrefix+"basic/b.yaml"),
+		),
 		Steps: []resource.TestStep{
 			{
 				Config: accConfig(project, branch, map[string]string{
@@ -79,6 +85,10 @@ func TestAccFiles_addAndRemove(t *testing.T) {
 
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
+			accCheckFileGone(project, branch, accTestPathPrefix+"addrm/keep.yaml"),
+			accCheckFileGone(project, branch, accTestPathPrefix+"addrm/add.yaml"),
+		),
 		Steps: []resource.TestStep{
 			{
 				Config: accConfig(project, branch, map[string]string{
@@ -118,21 +128,79 @@ func TestAccFiles_import(t *testing.T) {
 
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             accCheckFileGone(project, branch, accTestPathPrefix+"import/a.yaml"),
 		Steps: []resource.TestStep{
-			{Config: cfg},
 			{
-				ResourceName:      "gitlabcommits_files.test",
-				ImportState:       true,
-				ImportStateId:     fmt.Sprintf("%s::%s", project, branch),
-				ImportStateVerify: false, // files map is intentionally empty after import
+				Config: cfg,
+				Check:  resource.TestCheckResourceAttrSet("gitlabcommits_files.test", "commit_sha"),
 			},
-			// Re-apply the same config after import. adopt_existing rewrites
-			// the spurious "create" actions into updates so apply converges
-			// without duplicate-file errors, and the framework's automatic
-			// plan-after-apply check enforces zero drift.
-			{Config: cfg},
+			{
+				ResourceName:       "gitlabcommits_files.test",
+				ImportState:        true,
+				ImportStateId:      fmt.Sprintf("%s::%s", project, branch),
+				ImportStateVerify:  false, // files map is intentionally empty after import
+				ImportStatePersist: true,  // the next step must start from the imported, empty-files state
+			},
+			// Re-apply the same config after import. adopt_existing compares
+			// the repository content with the plan and finds it identical, so
+			// the apply converges without a commit (commit_sha stays unset);
+			// the framework's automatic plan-after-apply check enforces zero
+			// drift.
+			{
+				Config: cfg,
+				Check:  resource.TestCheckNoResourceAttr("gitlabcommits_files.test", "commit_sha"),
+			},
 		},
 	})
+}
+
+// TestAccFiles_binaryContentBase64 round-trips bytes that are not valid
+// UTF-8 through content_base64 and asserts the exact bytes land in the
+// repository, then re-applies to prove a no-op plan.
+func TestAccFiles_binaryContentBase64(t *testing.T) {
+	testAccPreCheck(t)
+
+	project := os.Getenv("GITLAB_TEST_PROJECT_ID")
+	branch := accBranch(t)
+	path := accTestPathPrefix + "binary/blob.bin"
+	raw := []byte{0x00, 0xff, 0xfe, 0x01, 0x80, 0x7f}
+
+	var b strings.Builder
+	b.WriteString(accResourceHeader(project, branch))
+	fmt.Fprintf(&b, "  files = {\n    %q = { content_base64 = %q }\n  }\n}\n", path, base64.StdEncoding.EncodeToString(raw))
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             accCheckFileGone(project, branch, path),
+		Steps: []resource.TestStep{
+			{Config: b.String(), Check: accCheckFileBytes(project, branch, path, raw)},
+			{Config: b.String(), Check: accCheckFileBytes(project, branch, path, raw)},
+		},
+	})
+}
+
+// accCheckFileBytes asserts the exact bytes of path at branch HEAD.
+func accCheckFileBytes(project, branch, path string, want []byte) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		c, err := accClient()
+		if err != nil {
+			return err
+		}
+		file, _, err := c.RepositoryFiles.GetFile(project, path, &gitlab.GetFileOptions{
+			Ref: new(branch),
+		}, gitlab.WithContext(context.Background()))
+		if err != nil {
+			return fmt.Errorf("reading %q on %q: %w", path, branch, err)
+		}
+		got, err := decodeRemoteContent(file)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(got, want) {
+			return fmt.Errorf("bytes of %q = %x, want %x", path, got, want)
+		}
+		return nil
+	}
 }
 
 // --- helpers ---
@@ -289,6 +357,7 @@ func TestAccFiles_optimisticLockConflict(t *testing.T) {
 
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             accCheckFileGone(project, branch, path),
 		Steps: []resource.TestStep{
 			{Config: cfg("v1\n", true)},
 			{
@@ -339,6 +408,7 @@ func TestAccFiles_chmodCycle(t *testing.T) {
 
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             accCheckFileGone(project, branch, path),
 		Steps: []resource.TestStep{
 			{Config: cfg(true), Check: accCheckFileExec(project, branch, path, true)},
 			{Config: cfg(false), Check: accCheckFileExec(project, branch, path, false)},

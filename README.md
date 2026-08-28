@@ -20,17 +20,22 @@ branch of one project. The provider:
 - **Create** — pushes one commit that creates every file. If `adopt_existing`
   is true (default) and a path already exists in the repo, the action is
   silently rewritten from `create` to `update`, so the apply does not fail.
-  When the branch does not exist yet and `create_branch_from` is set, the
-  branch is created from that ref in the same operation as the commit (one
-  push event).
+  A path whose content and mode already match the plan needs no action, so
+  an apply that only adopts identical files makes no commit and leaves
+  `commit_sha` unset. When the branch does not exist yet and
+  `create_branch_from` is set, the branch is created from that ref in the
+  same operation as the commit (one push event); with nothing to commit it is
+  created on its own.
 - **Read** — probes each managed file via a HEAD-style metadata call
   (`GetFileMetaData`) and compares the GitLab-returned `blob_id` with the
   one in state. Only when the blob has actually drifted does it pull the
   full content. Any drift updates state, so the next plan shows real
   differences against the repo.
 - **Update** — diffs plan vs state and emits the **minimum** set of actions:
-  new paths → `create`, gone paths → `delete`, content changed → `update`,
-  exec bit flipped → `chmod`. If nothing changed, no commit is produced.
+  gone paths → `delete` (emitted first), new paths → `create`, or nothing
+  when the path already exists with identical content, content changed →
+  `update`, exec bit flipped → `chmod`. If nothing changed, no commit is
+  produced.
 - **Delete** — pushes one commit that removes every managed file. Files
   already absent on the remote are skipped (idempotent against external
   cleanup). Disable with `delete_on_destroy = false`.
@@ -98,10 +103,10 @@ attribute on the provider block. In CI, prefer a CI variable such as
 | `commit_message` | string | yes | Used for any commit produced (create / update / destroy). |
 | `author_name` | string | no | Override commit author name. |
 | `author_email` | string | no | Override commit author email. |
-| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit. The branch is not deleted on destroy. |
+| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit, or on its own when there is nothing to commit. The branch is not deleted on destroy. |
 | `detect_drift` | bool | no | Default `true`. If false, Read is a no-op. |
 | `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. Read from the state of the last apply; see Caveats. |
-| `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist (needed for clean import). |
+| `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist, or to no action when their content already matches (needed for clean import). |
 | `optimistic_lock` | bool | no | Default `true`. Send each file's `last_commit_id` so GitLab rejects concurrent updates with HTTP 400. Set to `false` to opt out. For the destroy commit, read from the state of the last apply. |
 | `files` | map of object | yes | See below. |
 | `id` | string | computed | Composite identifier `<project_id>::<branch>`. |
@@ -167,10 +172,12 @@ A complete example lives in [`examples/for_each/main.tf`](examples/for_each/main
 terraform import 'gitlabcommits_files.service["frontend"]' 'platform/gitops::main'
 ```
 
-After import the files map is empty in state. The next plan will produce
-`create` actions for every file; with `adopt_existing = true` (default) those
-that already exist in the repo are silently turned into `update`s, so the
-apply converges without manual surgery.
+Import checks that the branch exists. After import the files map is empty in
+state. The next plan will produce `create` actions for every file; with
+`adopt_existing = true` (default) those that already exist in the repo are
+compared with the plan: identical content needs no action, differing content
+becomes an `update`. A configuration that matches the repository therefore
+converges without a commit.
 
 ## Caveats worth knowing
 
@@ -228,6 +235,12 @@ apply converges without manual surgery.
   above 10 MB (5 per minute) are throttled separately; self-managed instances
   configure such limits independently. Those limits send no rate-limit
   headers, so a 429 without `Retry-After` can mean one of them.
+- **Timeouts and redirects.** Every request waits at most five minutes for
+  GitLab's response headers once it has been sent, so a wedged instance or
+  proxy fails the apply instead of hanging it (uploads are not bounded by
+  that). A redirect to another host or from https to http is never followed,
+  because the request carries the token; it is reported with the target so
+  you can point `base_url` at the final address.
 - **Commits are not idempotent, so the commit request is never replayed on
   5xx.** `POST /repository/commits` has no request deduplication: if a proxy
   answered 502/504 after GitLab had already accepted the commit, a retry

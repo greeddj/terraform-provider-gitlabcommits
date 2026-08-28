@@ -5,7 +5,9 @@ package provider
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,12 +17,33 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
+
+// fileJSON renders a GetFile response body the way GitLab does (base64
+// content), for handlers that answer the adopt probe's content fetch.
+func fileJSON(filePath, blob, lcid string, content []byte) []byte {
+	return []byte(fmt.Sprintf(`{"file_path":%q,"blob_id":%q,"content":%q,"encoding":"base64","last_commit_id":%q,"size":%d}`,
+		filePath, blob, base64.StdEncoding.EncodeToString(content), lcid, len(content)))
+}
+
+// metaHeaders answers a metadata probe (HEAD) for an existing file.
+func metaHeaders(w http.ResponseWriter, blob, lcid string, exec bool) {
+	w.Header().Set("X-Gitlab-Blob-Id", blob)
+	w.Header().Set("X-Gitlab-Last-Commit-Id", lcid)
+	w.Header().Set("X-Gitlab-File-Path", "f.txt")
+	w.Header().Set("X-Gitlab-Ref", "main")
+	w.Header().Set("X-Gitlab-Size", "3")
+	w.Header().Set("X-Gitlab-Execute-Filemode", fmt.Sprint(exec))
+	w.WriteHeader(http.StatusOK)
+}
 
 func runDelete(t *testing.T, client *gitlab.Client, state filesResourceModel) *resource.DeleteResponse {
 	t.Helper()
@@ -428,6 +451,10 @@ func TestCreate_AdoptRewritesToUpdateEndToEnd(t *testing.T) {
 			w.Header().Set("X-Gitlab-Ref", "main")
 			w.Header().Set("X-Gitlab-Size", "3")
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
+			// Adopt content compare: remote differs, so the update stands.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(fileJSON("f.txt", "remoteblob", "adopt-lcid", []byte("remote")))
 		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "adsha":
 			w.Header().Set("X-Gitlab-Blob-Id", "stampedblob")
 			w.Header().Set("X-Gitlab-Last-Commit-Id", "adsha")
@@ -629,6 +656,9 @@ func TestCreate_AdoptsFromCreateBranchFromRef(t *testing.T) {
 			w.Header().Set("X-Gitlab-Ref", "main")
 			w.Header().Set("X-Gitlab-Size", "3")
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(fileJSON("f.txt", "srcblob", "src-lcid", []byte("remote")))
 		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "absha":
 			w.Header().Set("X-Gitlab-Blob-Id", "stampedblob")
 			w.Header().Set("X-Gitlab-Last-Commit-Id", "absha")
@@ -1109,6 +1139,463 @@ func TestCreate_CommitIsNotRetriedOn5xx(t *testing.T) {
 	}
 	if got := posts.Load(); got != 1 {
 		t.Errorf("commit POST attempts = %d, want exactly 1", got)
+	}
+}
+
+// adoptServer fakes a branch whose f.txt already holds remoteContent: the
+// branch exists, the adopt probe finds the file, and the content fetch
+// returns remoteContent. Commit POSTs are counted and answered with 201.
+func adoptServer(t *testing.T, remoteContent string, posts *atomic.Int32, commitBody *string) *gitlab.Client {
+	t.Helper()
+	return newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "main":
+			metaHeaders(w, "remoteblob", "remote-lcid", false)
+		case r.Method == http.MethodHead:
+			stampHeaders(w, "newsha")
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(fileJSON("f.txt", "remoteblob", "remote-lcid", []byte(remoteContent)))
+		case r.Method == http.MethodPost:
+			posts.Add(1)
+			b, _ := io.ReadAll(r.Body)
+			*commitBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"newsha"}`))
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	})
+}
+
+// TestCreate_AdoptIdenticalContentMakesNoCommit: adopting a file whose remote
+// bytes already equal the plan must not produce a commit; state is stamped
+// from the probe and commit_sha stays null.
+func TestCreate_AdoptIdenticalContentMakesNoCommit(t *testing.T) {
+	var posts atomic.Int32
+	var body string
+	client := adoptServer(t, "old", &posts, &body)
+
+	resp := runCreate(t, client, readState("ignored"))
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if got := posts.Load(); got != 0 {
+		t.Fatalf("commit POSTs = %d, want 0 for identical content", got)
+	}
+	var out filesResourceModel
+	if d := resp.State.Get(t.Context(), &out); d.HasError() {
+		t.Fatalf("state.Get: %v", d)
+	}
+	f := out.Files["f.txt"]
+	if f.BlobID.ValueString() != "remoteblob" || f.LastCommitID.ValueString() != "remote-lcid" {
+		t.Errorf("state must carry the probed blob/lcid, got %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+	}
+	if !out.CommitSHA.IsNull() {
+		t.Errorf("commit_sha must be null when no commit was made, got %q", out.CommitSHA.ValueString())
+	}
+	if out.ID.ValueString() != "proj::main" {
+		t.Errorf("id = %q, want proj::main", out.ID.ValueString())
+	}
+}
+
+// TestCreate_AdoptDifferentContentUpdates: differing remote bytes keep the
+// adopt-update.
+func TestCreate_AdoptDifferentContentUpdates(t *testing.T) {
+	var posts atomic.Int32
+	var body string
+	client := adoptServer(t, "remote", &posts, &body)
+
+	resp := runCreate(t, client, readState("ignored"))
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("commit POSTs = %d, want 1", got)
+	}
+	if !strings.Contains(body, `"action":"update"`) || !strings.Contains(body, `"last_commit_id":"remote-lcid"`) {
+		t.Errorf("expected a locked adopt-update, body: %s", body)
+	}
+}
+
+// TestUpdate_AdoptIdenticalContentMakesNoCommit is the import round-trip:
+// empty state, a plan that matches the repository, no commit, and computed
+// fields filled from the probe so the framework sees no unknowns.
+func TestUpdate_AdoptIdenticalContentMakesNoCommit(t *testing.T) {
+	var posts atomic.Int32
+	var body string
+	client := adoptServer(t, "old", &posts, &body)
+
+	state := readState("ignored")
+	state.Files = map[string]fileModel{}
+	plan := readState("ignored")
+	pf := plan.Files["f.txt"]
+	pf.BlobID = types.StringUnknown()
+	pf.LastCommitID = types.StringUnknown()
+	plan.Files["f.txt"] = pf
+	plan.CommitSHA = types.StringUnknown()
+
+	resp := runUpdate(t, client, plan, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if got := posts.Load(); got != 0 {
+		t.Fatalf("commit POSTs = %d, want 0", got)
+	}
+	var out filesResourceModel
+	if d := resp.State.Get(t.Context(), &out); d.HasError() {
+		t.Fatalf("state.Get: %v", d)
+	}
+	f := out.Files["f.txt"]
+	if f.BlobID.ValueString() != "remoteblob" || f.LastCommitID.ValueString() != "remote-lcid" {
+		t.Errorf("state must carry the probed blob/lcid, got %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+	}
+	if out.CommitSHA.ValueString() != "sha" {
+		t.Errorf("commit_sha must be carried from state, got %q", out.CommitSHA.ValueString())
+	}
+}
+
+// TestCreate_AdoptIdenticalOnMissingBranchCreatesBranchOnly: identical files
+// on the source ref plus a missing target branch means a bare branch
+// creation and no commit.
+func TestCreate_AdoptIdenticalOnMissingBranchCreatesBranchOnly(t *testing.T) {
+	var branchCreated atomic.Bool
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			http.Error(w, "no branch yet", http.StatusNotFound)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+		case r.Method == http.MethodHead:
+			metaHeaders(w, "srcblob", "src-lcid", false)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(fileJSON("f.txt", "srcblob", "src-lcid", []byte("old")))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/branches"):
+			branchCreated.Store(true)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"name":"feature","commit":{"id":"base"}}`))
+		case r.Method == http.MethodPost:
+			t.Error("no commit expected when every file already matches")
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	plan := readState("ignored")
+	plan.Branch = types.StringValue("feature")
+	plan.ID = types.StringValue("proj::feature")
+	plan.CreateBranchFrom = types.StringValue("main")
+	resp := runCreate(t, client, plan)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if !branchCreated.Load() {
+		t.Error("the branch must still be materialised when there is nothing to commit")
+	}
+}
+
+// TestUpdate_StampsOnlyTouchedPaths: after a commit that changed one of two
+// files, the untouched file keeps its state values and is never probed.
+func TestUpdate_StampsOnlyTouchedPaths(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, "a.txt"):
+			t.Errorf("untouched path must not be probed: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		case r.Method == http.MethodHead:
+			stampHeaders(w, "upsha")
+		case r.Method == http.MethodPost:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"upsha"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	untouched := fileModel{
+		Content: types.StringValue("same"), ContentBase64: types.StringNull(),
+		BlobID: types.StringValue("blobA"), LastCommitID: types.StringValue("lcidA"), ExecuteFilemode: types.BoolValue(false),
+	}
+	state := readState("oldblob")
+	state.Files["a.txt"] = untouched
+	plan := readState("oldblob")
+	plan.Files["a.txt"] = untouched
+	pf := plan.Files["f.txt"]
+	pf.Content = types.StringValue("changed")
+	plan.Files["f.txt"] = pf
+
+	resp := runUpdate(t, client, plan, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	var out filesResourceModel
+	if d := resp.State.Get(t.Context(), &out); d.HasError() {
+		t.Fatalf("state.Get: %v", d)
+	}
+	if a := out.Files["a.txt"]; a.BlobID.ValueString() != "blobA" || a.LastCommitID.ValueString() != "lcidA" {
+		t.Errorf("untouched file must keep its state values, got %q/%q", a.BlobID.ValueString(), a.LastCommitID.ValueString())
+	}
+	if f := out.Files["f.txt"]; f.BlobID.ValueString() != "blob-upsha" || f.LastCommitID.ValueString() != "upsha" {
+		t.Errorf("touched file must be stamped from the commit, got %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+	}
+}
+
+// TestUpdate_MixedActionsProduceExactlyOneCommit counts the commit POSTs for
+// a plan that deletes, creates, updates and chmods at once.
+func TestUpdate_MixedActionsProduceExactlyOneCommit(t *testing.T) {
+	var posts atomic.Int32
+	var body string
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if r.URL.Query().Get("ref") == "main" {
+				http.Error(w, "absent", http.StatusNotFound)
+				return
+			}
+			stampHeaders(w, "mixsha")
+		case http.MethodPost:
+			posts.Add(1)
+			b, _ := io.ReadAll(r.Body)
+			body = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"mixsha"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	file := func(content string, exec bool) fileModel {
+		return fileModel{
+			Content: types.StringValue(content), ContentBase64: types.StringNull(),
+			BlobID: types.StringValue("b-" + content), LastCommitID: types.StringValue("l-" + content), ExecuteFilemode: types.BoolValue(exec),
+		}
+	}
+	state := readState("oldblob")
+	state.Files = map[string]fileModel{"keep.sh": file("k", false), "change.txt": file("old", false), "remove.txt": file("r", false)}
+	plan := readState("oldblob")
+	plan.Files = map[string]fileModel{"keep.sh": file("k", true), "change.txt": file("new", false), "add.txt": file("a", false)}
+
+	resp := runUpdate(t, client, plan, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("commit POSTs = %d, want exactly 1", got)
+	}
+	for _, want := range []string{`"action":"delete"`, `"action":"create"`, `"action":"update"`, `"action":"chmod"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("commit body missing %s: %s", want, body)
+		}
+	}
+	if strings.Index(body, `"action":"delete"`) > strings.Index(body, `"action":"create"`) {
+		t.Errorf("delete actions must precede creates, body: %s", body)
+	}
+}
+
+// TestUpdate_NoOpPreservesUnknownComputedFields drives the zero-action
+// branch with the unknowns a real plan carries and asserts state ends up
+// fully known and equal to the prior state.
+func TestUpdate_NoOpPreservesUnknownComputedFields(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected API call %s %s for a no-op update", r.Method, r.URL.Path)
+		http.Error(w, "no", http.StatusInternalServerError)
+	})
+	state := readState("blob")
+	plan := readState("blob")
+	pf := plan.Files["f.txt"]
+	pf.BlobID = types.StringUnknown()
+	pf.LastCommitID = types.StringUnknown()
+	plan.Files["f.txt"] = pf
+	plan.CommitSHA = types.StringUnknown()
+	plan.ID = types.StringUnknown()
+
+	resp := runUpdate(t, client, plan, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	var out filesResourceModel
+	if d := resp.State.Get(t.Context(), &out); d.HasError() {
+		t.Fatalf("state.Get: %v", d)
+	}
+	f := out.Files["f.txt"]
+	if f.BlobID.ValueString() != "blob" || f.LastCommitID.ValueString() != "oldlcid" || out.CommitSHA.ValueString() != "sha" || out.ID.ValueString() != "proj::main" {
+		t.Errorf("computed fields must equal prior state, got blob=%q lcid=%q sha=%q id=%q",
+			f.BlobID.ValueString(), f.LastCommitID.ValueString(), out.CommitSHA.ValueString(), out.ID.ValueString())
+	}
+}
+
+// TestCreate_InvalidFileMakesNoCommit: a file that cannot be turned into an
+// action fails before anything reaches the repository.
+func TestCreate_InvalidFileMakesNoCommit(t *testing.T) {
+	var posts atomic.Int32
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead:
+			http.Error(w, "absent", http.StatusNotFound)
+		case r.Method == http.MethodPost:
+			posts.Add(1)
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	plan := readState("ignored")
+	plan.Files["f.txt"] = fileModel{
+		Content: types.StringNull(), ContentBase64: types.StringValue("not-base64!!!"),
+		BlobID: types.StringNull(), LastCommitID: types.StringNull(), ExecuteFilemode: types.BoolValue(false),
+	}
+	resp := runCreate(t, client, plan)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected invalid base64 to fail Create")
+	}
+	if got := posts.Load(); got != 0 {
+		t.Errorf("commit POSTs = %d, want 0", got)
+	}
+}
+
+// runImport drives ImportState the way the framework does: an all-null state
+// of the resource schema and the composite id.
+func runImport(t *testing.T, client *gitlab.Client, id string) *resource.ImportStateResponse {
+	t.Helper()
+	ctx := t.Context()
+	res := newTestResource(client)
+	sresp := &resource.SchemaResponse{}
+	res.Schema(ctx, resource.SchemaRequest{}, sresp)
+	// fwserver hands ImportState a null object (EmptyState), not an object
+	// of nulls; SetAttribute must create the parent on that shape.
+	empty := tftypes.NewValue(sresp.Schema.Type().TerraformType(ctx), nil)
+	resp := &resource.ImportStateResponse{State: tfsdk.State{Schema: sresp.Schema, Raw: empty}}
+	res.ImportState(ctx, resource.ImportStateRequest{ID: id}, resp)
+	if !resp.Diagnostics.HasError() && resp.State.Raw.Equal(empty) {
+		t.Fatal("ImportState left the state empty; the framework would report Missing Resource Import State")
+	}
+	return resp
+}
+
+func TestImportState(t *testing.T) {
+	branchServer := func(status int) *gitlab.Client {
+		return newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/") {
+				if status == http.StatusOK {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+					return
+				}
+				http.Error(w, "nope", status)
+				return
+			}
+			t.Errorf("unexpected call %s %s", r.Method, r.URL.Path)
+		})
+	}
+
+	t.Run("sets project, branch and id", func(t *testing.T) {
+		resp := runImport(t, branchServer(http.StatusOK), "grp/proj::main")
+		if resp.Diagnostics.HasError() {
+			t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+		}
+		var project, branch, id string
+		resp.State.GetAttribute(t.Context(), path.Root("project_id"), &project)
+		resp.State.GetAttribute(t.Context(), path.Root("branch"), &branch)
+		resp.State.GetAttribute(t.Context(), path.Root("id"), &id)
+		if project != "grp/proj" || branch != "main" || id != "grp/proj::main" {
+			t.Errorf("imported project/branch/id = %q/%q/%q", project, branch, id)
+		}
+	})
+
+	t.Run("malformed id", func(t *testing.T) {
+		resp := runImport(t, branchServer(http.StatusOK), "no-separator")
+		if !resp.Diagnostics.HasError() || resp.Diagnostics.Errors()[0].Summary() != "Invalid Import ID" {
+			t.Fatalf("expected Invalid Import ID, got %v", resp.Diagnostics)
+		}
+	})
+
+	t.Run("missing branch", func(t *testing.T) {
+		resp := runImport(t, branchServer(http.StatusNotFound), "grp/proj::gone")
+		if !resp.Diagnostics.HasError() || resp.Diagnostics.Errors()[0].Summary() != "Branch not found" {
+			t.Fatalf("expected Branch not found, got %v", resp.Diagnostics)
+		}
+	})
+
+	t.Run("branch check error", func(t *testing.T) {
+		resp := runImport(t, branchServer(http.StatusForbidden), "grp/proj::main")
+		if !resp.Diagnostics.HasError() || !strings.Contains(resp.Diagnostics.Errors()[0].Summary(), "HTTP 403") {
+			t.Fatalf("expected the 403 to surface, got %v", resp.Diagnostics)
+		}
+	})
+}
+
+func TestMissingBranchPreflight_ProjectErrors(t *testing.T) {
+	t.Run("project 404 names the project", func(t *testing.T) {
+		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "no project", http.StatusNotFound)
+		})
+		err := newTestResource(client).missingBranchPreflight(t.Context(), "grp/porject", "main", "")
+		if err == nil || !strings.Contains(err.Error(), `project "grp/porject" does not exist or the token cannot see it`) {
+			t.Fatalf("want the project diagnostic, got: %v", err)
+		}
+	})
+	t.Run("other project errors surface", func(t *testing.T) {
+		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		})
+		err := newTestResource(client).missingBranchPreflight(t.Context(), "proj", "main", "main")
+		if err == nil || !strings.Contains(err.Error(), `checking project "proj"`) {
+			t.Fatalf("want a checking-project error, got: %v", err)
+		}
+	})
+}
+
+func TestAdoptAwareActions_EmptyLockTokenErrors(t *testing.T) {
+	f := fileModel{Content: types.StringValue("x"), ExecuteFilemode: types.BoolValue(false)}
+	probe := remoteProbe{exists: true}
+	if _, err := adoptAwareActions("f.txt", f, probe, true); err == nil || !strings.Contains(err.Error(), "optimistic_lock") {
+		t.Fatalf("a locked adoption without a token must fail, got: %v", err)
+	}
+	actions, err := adoptAwareActions("f.txt", f, probe, false)
+	if err != nil || len(actions) != 1 || *actions[0].Action != gitlab.FileUpdate || actions[0].LastCommitID != nil {
+		t.Fatalf("an unlocked adoption must be a plain update, got %v / %v", summarise(actions), err)
+	}
+}
+
+func TestAdoptAwareActions_IdenticalContentChmodOnly(t *testing.T) {
+	f := fileModel{Content: types.StringValue("x"), ExecuteFilemode: types.BoolValue(true)}
+	probe := remoteProbe{exists: true, lastCommitID: "l", content: []byte("x"), hasContent: true, executeFilemode: false}
+	actions, err := adoptAwareActions("f.txt", f, probe, true)
+	if err != nil || len(actions) != 1 || *actions[0].Action != gitlab.FileChmod || *actions[0].LastCommitID != "l" {
+		t.Fatalf("identical bytes with a differing exec bit must yield a locked chmod only, got %v / %v", summarise(actions), err)
+	}
+}
+
+func TestTruncateForDiag_RuneBoundary(t *testing.T) {
+	// "é" is two bytes; put it across the cut so a byte-wise slice would
+	// split it.
+	s := strings.Repeat("x", maxDiagBodyChars-1) + "é" + strings.Repeat("y", 50)
+	got := truncateForDiag(s)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated diagnostic is not valid UTF-8: %q", got[len(got)-20:])
+	}
+	if !strings.Contains(got, "truncated") || strings.Contains(got, "é") {
+		t.Errorf("expected the rune to be dropped and the suffix appended, got tail %q", got[len(got)-40:])
+	}
+	if short := "plain"; truncateForDiag(short) != short {
+		t.Error("short strings must pass through untouched")
+	}
+	if got := truncateForDiag("latin1 \x92 quote"); !utf8.ValidString(got) || !strings.Contains(got, "\uFFFD") {
+		t.Errorf("invalid bytes must be replaced, got %q", got)
 	}
 }
 
