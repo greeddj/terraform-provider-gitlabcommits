@@ -12,7 +12,7 @@ lint:
 
 test:
 	@echo "===== Test {{PROJECT}} ====="
-	go test ./...
+	go test -race ./...
 
 check:
 	@echo "===== Check {{PROJECT}} ====="

@@ -54,6 +54,9 @@ jobs:
       - name: Check terraform fmt (examples)
         run: terraform fmt -check -recursive examples/
 
+      - name: Validate example modules
+        run: ./scripts/validate-examples.sh
+
       - name: Verify generated docs are in sync
         # git status --porcelain also catches brand-new untracked doc pages,
         # which git diff would silently ignore.
@@ -63,6 +66,9 @@ jobs:
 
       - name: Verify copywrite headers are in sync
         run: go tool copywrite headers -d . --config .copywrite.hcl --plan
+
+      - name: Check go mod tidy
+        run: go mod tidy -diff
 
   release:
     name: Release

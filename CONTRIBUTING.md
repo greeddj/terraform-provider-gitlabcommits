@@ -25,7 +25,7 @@ a one-liner you can run manually — see the `Justfile`.
 2. **Run `just ci`** before pushing - it is the exact gate CI runs:
    - `just check` (`go vet`, `staticcheck`, `govulncheck`, `fieldalignment`)
    - `just lint` (`golangci-lint`, including the `gofmt` formatter)
-   - `just test` (`go test ./...`)
+   - `just test` (`go test -race ./...`)
    - `terraform fmt -check` and `terraform validate` over `examples/`
    - generated-docs and copywrite-header sync checks
    - `go mod tidy -diff`
@@ -49,8 +49,10 @@ export GITLAB_TEST_BRANCH_FROM='main'      # optional; create the branch from th
 go test -v -timeout=20m -run '^TestAcc' ./internal/...
 ```
 
-In CI they run via `.github/workflows/acceptance.yml` (manual trigger /
-nightly cron).
+In CI they run via `.github/workflows/acceptance.yml` (manual trigger,
+nightly cron, and pushes to `main` that touch `internal/**`) on a branch
+named after the run, which a final always-run step deletes even when the job
+times out or is cancelled.
 
 ## Pull requests
 

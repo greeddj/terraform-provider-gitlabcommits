@@ -7,7 +7,7 @@ name: Acceptance Tests
 on:
   workflow_dispatch:
   schedule:
-    # 03:17 UTC every day — late enough to not collide with release jobs,
+    # 03:17 UTC every day - late enough to not collide with release jobs,
     # offset by an odd number to spread load across CI providers.
     - cron: '17 3 * * *'
   push:
@@ -32,6 +32,16 @@ jobs:
     # manual workflow_dispatch instead fails loudly (see the run step) so it
     # cannot silently skip.
     if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'greeddj/terraform-provider-gitlabcommits' }}
+    # Only non-secret settings live at job level; the token and project are
+    # declared on the two steps that need them so the checkout / setup
+    # actions never see GitLab credentials.
+    env:
+      TF_ACC: '1'
+      # Unique per run and per attempt: the test config materialises the
+      # branch via create_branch_from, so runs never collide and a re-run of
+      # a failed job never starts on the previous attempt's leftovers.
+      GITLAB_TEST_BRANCH: 'tf-acc-test-${{ github.run_id }}-${{ github.run_attempt }}'
+      GITLAB_TEST_BRANCH_FROM: 'main'
     steps:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -51,15 +61,9 @@ jobs:
 
       - name: Run acceptance tests
         env:
-          TF_ACC: '1'
           GITLAB_TOKEN: ${{ secrets.GITLAB_TEST_TOKEN }}
           GITLAB_BASE_URL: ${{ secrets.GITLAB_TEST_BASE_URL }}
           GITLAB_TEST_PROJECT_ID: ${{ secrets.GITLAB_TEST_PROJECT_ID }}
-          # Unique per-run branch: the test config materialises it via
-          # create_branch_from and deletes it in cleanup, so runs never
-          # collide and never leave branches behind.
-          GITLAB_TEST_BRANCH: 'tf-acc-test-${{ github.run_id }}'
-          GITLAB_TEST_BRANCH_FROM: 'main'
         run: |
           if [ -z "$GITLAB_TOKEN" ] || [ -z "$GITLAB_TEST_PROJECT_ID" ]; then
             if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -70,3 +74,39 @@ jobs:
             exit 0
           fi
           go test -v -timeout=20m -run '^TestAcc' ./internal/...
+
+      - name: Delete the acceptance branch
+        # t.Cleanup in the test binary removes the branch on a normal exit,
+        # but not when the go test timeout panics the process, the job hits
+        # timeout-minutes, or the run is cancelled. This step always runs so
+        # no tf-acc-test-* branch outlives its run. It only ever warns: a
+        # cleanup hiccup must not redden a green test run.
+        if: always()
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TEST_TOKEN }}
+          GITLAB_BASE_URL: ${{ secrets.GITLAB_TEST_BASE_URL }}
+          GITLAB_TEST_PROJECT_ID: ${{ secrets.GITLAB_TEST_PROJECT_ID }}
+        run: |
+          if [ -z "$GITLAB_TOKEN" ] || [ -z "$GITLAB_TEST_PROJECT_ID" ]; then
+            exit 0
+          fi
+          base="${GITLAB_BASE_URL:-https://gitlab.com}"
+          base="${base%/}"
+          base="${base%/api/v4}"
+          project="$(jq -rn --arg s "$GITLAB_TEST_PROJECT_ID" '$s|@uri')"
+          branch="$(jq -rn --arg s "$GITLAB_TEST_BRANCH" '$s|@uri')"
+          api="$base/api/v4/projects/$project"
+          # Confirm the project is reachable first, so a 404 on the branch
+          # below really means "already deleted" and not a wrong endpoint.
+          code="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' \
+            -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$api")" || code=000
+          if [ "$code" != "200" ]; then
+            echo "::warning::project $GITLAB_TEST_PROJECT_ID unreachable for cleanup (HTTP $code); branch $GITLAB_TEST_BRANCH may be left behind"
+            exit 0
+          fi
+          code="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X DELETE \
+            -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$api/repository/branches/$branch")" || code=000
+          case "$code" in
+            204|404) echo "branch $GITLAB_TEST_BRANCH: cleanup HTTP $code" ;;
+            *) echo "::warning::branch $GITLAB_TEST_BRANCH: cleanup returned HTTP $code" ;;
+          esac
