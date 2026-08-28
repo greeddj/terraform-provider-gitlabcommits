@@ -12,6 +12,8 @@ each file becomes its own commit, which is a non-starter at any reasonable scale
 This provider lets you express the bundle as Terraform and emit exactly one
 commit per service.
 
+> **Note:** This project was created in collaboration with the Claude Code.
+
 ## How it actually works
 
 A single resource (`gitlabcommits_files`) owns a `map(path → file)` on one
