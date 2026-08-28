@@ -170,7 +170,7 @@ func validateRepoPath(p string) error {
 	if strings.ContainsRune(p, 0) {
 		return errors.New("must not contain NUL bytes")
 	}
-	for _, seg := range strings.Split(p, "/") {
+	for seg := range strings.SplitSeq(p, "/") {
 		if seg == "" {
 			return errors.New("must not contain empty segments (no leading, trailing, or doubled slashes)")
 		}

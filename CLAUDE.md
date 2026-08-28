@@ -8,7 +8,7 @@ A Terraform provider (`greeddj/gitlabcommits`) built on the **Terraform Plugin F
 
 ## Commands
 
-`just` is the entry point; every target is a thin wrapper over a Go/Terraform invocation (see `Justfile`). The analysis tools (`staticcheck`, `govulncheck`, `fieldalignment`, `tfplugindocs`, `copywrite`) are declared in the `tool` block of `go.mod` and run via `go tool ...`, so there is nothing to install. `golangci-lint` is the one external binary (CI pins v2.11.4; `.golangci.yml` enables an explicit linter list with `default: none`, so a new golangci-lint release cannot quietly add linters).
+`just` is the entry point; every target is a thin wrapper over a Go/Terraform invocation (see `Justfile`). The analysis tools (`staticcheck`, `govulncheck`, `fieldalignment`, `tfplugindocs`, `copywrite`) are declared in the `tool` block of `go.mod` and run via `go tool ...`, so there is nothing to install. `golangci-lint` is the one external binary (CI pins v2.13.1; `.golangci.yml` enables an explicit linter list with `default: none`, so a new golangci-lint release cannot quietly add linters).
 
 ```bash
 just ci              # the exact gate CI runs: check + lint + test + check-tf-fmt + check-examples + docs-check + headers-check + check-deps
@@ -98,7 +98,7 @@ Nil guards exist for a 2xx JSON-null body from `CreateCommit` (nil `*Commit`), `
 - `examples/complete`, `examples/for_each` and `examples/provider` are full modules that CI runs `terraform validate` on against the locally built provider; keep them valid. New API surface needs an example there so the docs pick it up.
 - License headers are enforced by `copywrite` (`.copywrite.hcl`; `examples/`, `.github/`, `docs/` are exempt).
 - A `v*` tag triggers `.github/workflows/release.yml` -> goreleaser (GPG-signed, `main.version` set via ldflags). The changelog is built from conventional commit titles (`feat:`, `fix:`, `docs:`; `chore:` and `test:` are excluded); there is no CHANGELOG file. Dependabot PRs use `fix(deps)` / `fix(ci)`.
-- `go.mod` is the single source of truth for the Go version (1.26); `.golangci.yml` mirrors it.
+- `go.mod` is the single source of truth for the Go version (1.27); `.golangci.yml` mirrors it.
 
 ## Code conventions
 

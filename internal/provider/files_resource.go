@@ -434,8 +434,7 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 		})
 	}
 	if err := g.Wait(); err != nil {
-		var pe *pathError
-		if errors.As(err, &pe) {
+		if pe, ok := errors.AsType[*pathError](err); ok {
 			summary, detail := apiErrorDiag(fmt.Sprintf("reading file %q", pe.path), project, branch, pe.err)
 			resp.Diagnostics.AddError(summary, detail)
 			return

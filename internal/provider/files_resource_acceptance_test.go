@@ -221,7 +221,7 @@ func accCheckFileExists(project, branch, path string) resource.TestCheckFunc {
 			return err
 		}
 		_, _, err = c.RepositoryFiles.GetFileMetaData(project, path, &gitlab.GetFileMetaDataOptions{
-			Ref: gitlab.Ptr(branch),
+			Ref: new(branch),
 		}, gitlab.WithContext(context.Background()))
 		if err != nil {
 			return fmt.Errorf("expected file %q to exist on %q: %w", path, branch, err)
@@ -238,7 +238,7 @@ func accCheckFileGone(project, branch, path string) resource.TestCheckFunc {
 			return err
 		}
 		_, _, err = c.RepositoryFiles.GetFileMetaData(project, path, &gitlab.GetFileMetaDataOptions{
-			Ref: gitlab.Ptr(branch),
+			Ref: new(branch),
 		}, gitlab.WithContext(context.Background()))
 		if err == nil {
 			return fmt.Errorf("expected file %q to be gone on %q, but it exists", path, branch)
@@ -255,7 +255,7 @@ func accCheckFileExec(project, branch, path string, want bool) resource.TestChec
 			return err
 		}
 		meta, _, err := c.RepositoryFiles.GetFileMetaData(project, path, &gitlab.GetFileMetaDataOptions{
-			Ref: gitlab.Ptr(branch),
+			Ref: new(branch),
 		}, gitlab.WithContext(context.Background()))
 		if err != nil {
 			return fmt.Errorf("metadata for %q on %q: %w", path, branch, err)
@@ -298,9 +298,9 @@ func TestAccFiles_optimisticLockConflict(t *testing.T) {
 						t.Fatalf("accClient: %v", err)
 					}
 					_, _, err = c.RepositoryFiles.UpdateFile(project, path, &gitlab.UpdateFileOptions{
-						Branch:        gitlab.Ptr(branch),
-						Content:       gitlab.Ptr("external edit\n"),
-						CommitMessage: gitlab.Ptr("tf-acc-test external edit"),
+						Branch:        new(branch),
+						Content:       new("external edit\n"),
+						CommitMessage: new("tf-acc-test external edit"),
 					}, gitlab.WithContext(context.Background()))
 					if err != nil {
 						t.Fatalf("out-of-band update: %v", err)
@@ -369,8 +369,8 @@ func TestAccFiles_keepOnDestroy(t *testing.T) {
 		// Best-effort: remove the survivor so a pre-existing shared branch is
 		// left clean (per-run branches are deleted wholesale anyway).
 		_, _ = c.RepositoryFiles.DeleteFile(project, path, &gitlab.DeleteFileOptions{
-			Branch:        gitlab.Ptr(branch),
-			CommitMessage: gitlab.Ptr("tf-acc-test cleanup"),
+			Branch:        new(branch),
+			CommitMessage: new("tf-acc-test cleanup"),
 		}, gitlab.WithContext(context.Background()))
 	})
 

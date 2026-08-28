@@ -89,8 +89,8 @@ func TestNullBodyDecodesToNilCommit(t *testing.T) {
 	}
 
 	commit, _, err := client.Commits.CreateCommit("proj", &gitlab.CreateCommitOptions{
-		Branch:        gitlab.Ptr("main"),
-		CommitMessage: gitlab.Ptr("m"),
+		Branch:        new("main"),
+		CommitMessage: new("m"),
 		Actions:       []*gitlab.CommitActionOptions{},
 	})
 	if err != nil {

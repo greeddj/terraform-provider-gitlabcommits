@@ -40,7 +40,7 @@ files map starts empty and is reconciled on the next plan + apply.
 - Terraform >= 1.5
 - GitLab >= 18.x (older versions may work for basic operations but are not supported)
 - A token that can call the GitLab REST API on the target project (see Authentication below)
-- Go >= 1.26 (development only)
+- Go >= 1.27 (development only)
 
 ## Provider configuration
 

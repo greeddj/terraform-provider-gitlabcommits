@@ -121,7 +121,7 @@ func (d *fileDataSource) Read(ctx context.Context, req datasource.ReadRequest, r
 	path := data.FilePath.ValueString()
 
 	file, _, err := d.client.RepositoryFiles.GetFile(project, path, &gitlab.GetFileOptions{
-		Ref: gitlab.Ptr(branch),
+		Ref: new(branch),
 	}, gitlab.WithContext(ctx))
 	if err != nil {
 		if errors.Is(err, gitlab.ErrNotFound) {

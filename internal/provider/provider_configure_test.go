@@ -5,6 +5,7 @@ package provider
 
 import (
 	"context"
+	"maps"
 	"math/big"
 	"testing"
 
@@ -32,9 +33,7 @@ func runConfigure(t *testing.T, attrs map[string]tftypes.Value) *provider.Config
 		"retry_wait_min_ms": tftypes.NewValue(tftypes.Number, nil),
 		"retry_wait_max_ms": tftypes.NewValue(tftypes.Number, nil),
 	}
-	for k, v := range attrs {
-		vals[k] = v
-	}
+	maps.Copy(vals, attrs)
 	raw := tftypes.NewValue(sch.Type().TerraformType(ctx), vals)
 
 	req := provider.ConfigureRequest{Config: tfsdk.Config{Schema: sch, Raw: raw}}
