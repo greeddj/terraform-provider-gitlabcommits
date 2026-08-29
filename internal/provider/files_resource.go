@@ -270,7 +270,7 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Computed:    true,
 			},
 			"files": schema.MapNestedAttribute{
-				Description: "Map of repository_path → file definition. The map key is the path inside the repo.",
+				Description: "Map of repository_path -> file definition. The map key is the path inside the repo.",
 				Required:    true,
 				Validators: []validator.Map{
 					mapNonEmpty(),
@@ -627,7 +627,7 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 		}
 		f := state.Files[p]
 		if res.file == nil {
-			// Took the metadata-only branch (blob unchanged) — refresh
+			// Took the metadata-only branch (blob unchanged) - refresh
 			// last_commit_id only when it has moved (a delete-then-re-add with
 			// identical content would otherwise stale the optimistic-lock token
 			// in state). A nil *File from a drifted blob is surfaced as an error
@@ -1465,7 +1465,7 @@ func truncateForDiag(s string) string {
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut] + fmt.Sprintf("… (truncated, %d more chars)", len(s)-cut)
+	return s[:cut] + fmt.Sprintf("... (truncated, %d more chars)", len(s)-cut)
 }
 
 // apiErrorDiag turns a raw GitLab API error into a structured Terraform
@@ -1494,22 +1494,24 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 		switch status {
 		case 401:
 			summary = "GitLab authentication failed (HTTP 401)"
-			return summary, fmt.Sprintf("%s: token rejected. Verify the token has the `api` scope and is not expired. Body: %s", prefix, body)
+			return summary, fmt.Sprintf("%s: token rejected. Verify the token has the `api` scope (or, for a fine-grained token, the required permissions) and is not expired. Body: %s", prefix, body)
 		case 403:
 			summary = "GitLab permission denied (HTTP 403)"
 			return summary, fmt.Sprintf("%s: %s Body: %s", prefix,
 				"The token was rejected by GitLab. Verify that: "+
-					"(1) the token has the `api` scope (write_repository alone does not authenticate REST API calls); "+
+					"(1) the token has the `api` scope, or the fine-grained permissions Commit: Create, Repository: Read and Branch: Read (write_repository alone does not authenticate REST API calls); "+
 					"(2) the token's user has the Developer role on the project, or Maintainer for a protected branch; "+
-					"(3) if you are using CI_JOB_TOKEN, switch to a Personal / Project / Group access token — job tokens cannot POST to /repository/commits.",
+					"(3) if you are using CI_JOB_TOKEN, switch to a Personal / Project / Group access token - job tokens cannot POST to /repository/commits; "+
+					"(4) if your group or instance enforces fine-grained personal access tokens, a legacy `api` token is refused after the enforcement date and the body lists the permissions a fine-grained token needs.",
 				body)
 		case 400, 409:
-			// 400 with optimistic-lock failure: GitLab 18 returns
-			//   "You are attempting to update a file that has changed since you
-			//    started editing it. Try again. File last commit id: <sha>"
-			// We match three substrings — `last_commit_id` (snake_case, future-proof if
+			// 400 with optimistic-lock failure. The commits API (Files::MultiService)
+			// answers "The file has changed since you started editing it: <path>";
+			// the single-file Files API and the web editor use "You are attempting
+			// to update a file that has changed since you started editing it."
+			// We match three substrings - `last_commit_id` (snake_case, future-proof if
 			// the API ever exposes the parameter name), `last commit` (current prose
-			// form), and `has changed since` (most stable phrase) — so any one
+			// form), and `has changed since` (most stable phrase) - so any one
 			// surviving a future rewording keeps the diagnostic accurate.
 			lower := strings.ToLower(resp.Message)
 			if strings.Contains(lower, "last_commit_id") ||
@@ -1645,7 +1647,7 @@ func commitOptions(m filesResourceModel, actions []*gitlab.CommitActionOptions) 
 // repository_files endpoints return base64 in practice; an empty Encoding
 // is treated the same way (some self-hosted variants omit it). An "rot13"-
 // or otherwise unknown encoding fails loudly rather than silently
-// passing through whatever string came on the wire — a text file whose
+// passing through whatever string came on the wire - a text file whose
 // content is accidentally valid base64 should not be mis-decoded.
 func decodeRemoteContent(f *gitlab.File) ([]byte, error) {
 	// GetFile returns a nil *File (with no error) when the server sends a 2xx

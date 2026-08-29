@@ -26,6 +26,12 @@ project. Supported token types:
 - **Personal Access Token** with the `api` scope.
 - **Project Access Token** (or **Group Access Token**) with the `api` scope.
   Recommended for CI/CD: scope a token to exactly the project(s) you manage.
+- **Fine-grained Personal Access Token** (GitLab 19.2+) with these permissions
+  on the target project (or its group): `Commit: Create`, `Repository: Read`,
+  `Branch: Read`, plus `Branch: Create` when a resource sets
+  `create_branch_from`. Required once your group or instance enforces
+  fine-grained tokens: legacy `api` tokens are refused after the enforcement
+  date.
 
 The token's user (or the token itself, for Project/Group tokens) needs the
 **Developer** role, or **Maintainer** to push to a protected branch.
@@ -35,10 +41,11 @@ attribute on the provider block. In CI, prefer a CI variable such as
 `TF_VAR_gitlab_token` over committing the token.
 
 The `write_repository` scope is for Git-over-HTTP (push/pull) and does
-**not** authenticate REST API calls; `api` is the only scope that does.
+**not** authenticate REST API calls; of the legacy scopes only `api` does.
 `CI_JOB_TOKEN` is not supported: GitLab's job-token allowlist permits only
-GET on the Commits, Files and Branches APIs, while this provider needs
-`POST /repository/commits`.
+GET on the Commits, Files and Branches APIs (fine-grained job token
+permissions add nothing beyond `READ_REPOSITORIES` there), while this
+provider needs `POST /repository/commits`.
 
 ## Limits, retries and timeouts
 

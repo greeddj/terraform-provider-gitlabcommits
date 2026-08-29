@@ -65,11 +65,12 @@ func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaReque
 	resp.Schema = schema.Schema{
 		Description: "Terraform provider for managing repository files in GitLab via the Commits API. " +
 			"Each managed resource produces one commit per terraform apply containing all of its file changes. " +
-			"Tested against GitLab 18.x; older versions may work for basic operations but are not supported.",
+			"Tested against GitLab 19.x; older versions may work for basic operations but are not supported.",
 		Attributes: map[string]schema.Attribute{
 			"token": schema.StringAttribute{
-				Description: "GitLab token used for REST API calls. Must have the `api` scope. " +
-					"Personal, Project, or Group access tokens are supported; CI_JOB_TOKEN is not (its allowlist excludes POST /repository/commits). " +
+				Description: "GitLab token used for REST API calls: a Personal, Project, or Group access token with the `api` scope, " +
+					"or a fine-grained personal access token (GitLab 19.2+) with Commit: Create, Repository: Read and Branch: Read " +
+					"(plus Branch: Create when create_branch_from is used). CI_JOB_TOKEN is not supported (its allowlist excludes POST /repository/commits). " +
 					"May also be provided via the GITLAB_TOKEN environment variable. See the provider documentation's Authentication section for details.",
 				Optional:  true,
 				Sensitive: true,
@@ -87,7 +88,7 @@ func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaReque
 			},
 			"retry_wait_min_ms": schema.Int64Attribute{
 				Description: "Base wait (ms) between rate-limited (429) retries; it doubles with each attempt and the " +
-					"Ratelimit-Reset header extends it when GitLab sends one. 5xx retries use the client's fixed 700-900 ms " +
+					"RateLimit-Reset header extends it when GitLab sends one. 5xx retries use the client's fixed 700-900 ms " +
 					"schedule instead. Default 1000.",
 				Optional: true,
 			},
@@ -157,7 +158,7 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	if token == "" {
 		resp.Diagnostics.AddError(
 			"Missing GitLab API Token",
-			"Set `token` in the provider block or export GITLAB_TOKEN. The token must have the `api` scope (Personal, Project, or Group access token). See the provider documentation's Authentication section for details.",
+			"Set `token` in the provider block or export GITLAB_TOKEN. The token must have the `api` scope (Personal, Project, or Group access token) or be a fine-grained personal access token with the permissions listed in the provider documentation's Authentication section.",
 		)
 		return
 	}
@@ -191,7 +192,7 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 			resp.Diagnostics.AddAttributeWarning(
 				path.Root("base_url"),
 				"GitLab base_url is using plaintext HTTP",
-				"Traffic between Terraform and GitLab — including the API token — will be sent unencrypted. "+
+				"Traffic between Terraform and GitLab - including the API token - will be sent unencrypted. "+
 					"Use https:// unless this is intentional (e.g. a TLS-terminating proxy in front of the API).",
 			)
 		}

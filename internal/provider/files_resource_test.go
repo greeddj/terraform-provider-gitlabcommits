@@ -61,7 +61,7 @@ func TestRawBytes(t *testing.T) {
 // TestDiffActions exercises the central reconciliation logic: the set of
 // actions emitted for any given (state, plan) pair.
 func TestDiffActions(t *testing.T) {
-	// textFile is a state-side file — content set, blob opaque (as stored after stampBlobs).
+	// textFile is a state-side file - content set, blob opaque (as stored after stampBlobs).
 	textFile := func(content string) fileModel {
 		return fileModel{
 			Content:         types.StringValue(content),
@@ -473,16 +473,16 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 				Content:         types.StringValue("v2"),
 				ExecuteFilemode: types.BoolValue(false),
 			},
-			"c.sh": { // exec bit flipped, content unchanged → chmod only
+			"c.sh": { // exec bit flipped, content unchanged -> chmod only
 				Content:         types.StringValue("#!/bin/sh\n"),
 				ExecuteFilemode: types.BoolValue(true),
 			},
-			// b.yaml gone → delete
+			// b.yaml gone -> delete
 		},
 	}
 
 	t.Run("enabled-default", func(t *testing.T) {
-		// OptimisticLock null → defaults to true.
+		// OptimisticLock null -> defaults to true.
 		actions, _, err := r.diffActions(t.Context(), plan, state)
 		if err != nil {
 			t.Fatal(err)
@@ -516,7 +516,7 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 	})
 }
 
-// lastCommitIDs returns a path → last_commit_id map for actions, empty string
+// lastCommitIDs returns a path -> last_commit_id map for actions, empty string
 // when an action has no LastCommitID set.
 func lastCommitIDs(actions []*gitlab.CommitActionOptions) map[string]string {
 	out := make(map[string]string, len(actions))
@@ -585,7 +585,7 @@ func TestParseImportID(t *testing.T) {
 	}
 }
 
-// TestApiErrorDiag pins the HTTP-status → diagnostic mapping. Each branch
+// TestApiErrorDiag pins the HTTP-status -> diagnostic mapping. Each branch
 // (401/403/404/400/409/429/default) carries actionable wording for the user;
 // asserting the summary plus key detail substrings here keeps the wording from
 // drifting silently and locks in the truncation + Retry-After behaviour.
@@ -640,15 +640,24 @@ func TestApiErrorDiag(t *testing.T) {
 			contains:    []string{"refresh-only"},
 		},
 		{
-			// Verbatim GitLab 18 message for optimistic-lock failure.
-			name: "400-gitlab18-verbatim",
+			// Verbatim commits API (Files::MultiService) message for an
+			// optimistic-lock failure.
+			name: "400-commits-api-verbatim",
+			err: mkErr(400,
+				"The file has changed since you started editing it: config/app.yaml", nil),
+			wantSummary: "Concurrent modification detected (optimistic_lock)",
+			contains:    []string{"refresh-only"},
+		},
+		{
+			// Verbatim single-file Files API / web editor message.
+			name: "400-files-api-verbatim",
 			err: mkErr(400,
 				"You are attempting to update a file that has changed since you started editing it. Try again. File last commit id: 8a2b3c4d", nil),
 			wantSummary: "Concurrent modification detected (optimistic_lock)",
 			contains:    []string{"refresh-only"},
 		},
 		{
-			// Fictional message that contains only "has changed since" — no overlap
+			// Fictional message that contains only "has changed since" - no overlap
 			// with "last_commit_id" or "last commit". Falsifies the third substring
 			// branch in apiErrorDiag independently of the other two matchers.
 			name: "400-has-changed-since-only",
@@ -781,9 +790,9 @@ func TestStampBlobs_OneProbeFailure(t *testing.T) {
 			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
 			return
 		}
-		// Route by path segment: "bad-path" → 403 (a non-retried failure, so
+		// Route by path segment: "bad-path" -> 403 (a non-retried failure, so
 		// the test is not stalled by the client's backoff schedule),
-		// "good-path" → 200 with blob header.
+		// "good-path" -> 200 with blob header.
 		if strings.Contains(r.URL.Path, "bad-path") {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
@@ -834,7 +843,7 @@ func TestStampBlobs_OneProbeFailure(t *testing.T) {
 	if !bad.BlobID.IsNull() {
 		t.Errorf("bad-path BlobID should be null after probe failure, got %q", bad.BlobID.ValueString())
 	}
-	// Probe failed → falls back to commitSHA.
+	// Probe failed -> falls back to commitSHA.
 	if bad.LastCommitID.ValueString() != "deadbeef" {
 		t.Errorf("bad-path LastCommitID = %q, want %q (commitSHA fallback)", bad.LastCommitID.ValueString(), "deadbeef")
 	}
@@ -843,7 +852,7 @@ func TestStampBlobs_OneProbeFailure(t *testing.T) {
 	if good.BlobID.ValueString() != goodBlob {
 		t.Errorf("good-path BlobID = %q, want %q", good.BlobID.ValueString(), goodBlob)
 	}
-	// Probe succeeded → LastCommitID comes from the server, not commitSHA.
+	// Probe succeeded -> LastCommitID comes from the server, not commitSHA.
 	if good.LastCommitID.ValueString() != goodServerCommitID {
 		t.Errorf("good-path LastCommitID = %q, want %q (server value)", good.LastCommitID.ValueString(), goodServerCommitID)
 	}
@@ -903,7 +912,7 @@ func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
 	if !f.BlobID.IsNull() {
 		t.Errorf("BlobID should be null for oversized blob_id, got %q", f.BlobID.ValueString())
 	}
-	// Probe treated as failure → commitSHA fallback for LastCommitID.
+	// Probe treated as failure -> commitSHA fallback for LastCommitID.
 	if f.LastCommitID.ValueString() != "deadbeef" {
 		t.Errorf("LastCommitID = %q, want %q (commitSHA fallback)", f.LastCommitID.ValueString(), "deadbeef")
 	}

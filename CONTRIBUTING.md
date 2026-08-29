@@ -1,7 +1,7 @@
 # Contributing
 
 Thanks for taking the time to contribute! This document is intentionally
-short — please read all of it.
+short - please read all of it.
 
 ## Quick start
 
@@ -15,12 +15,12 @@ just build     # local binary in ./dist (runs check + lint + test first)
 ```
 
 If you don't have [Just](https://github.com/casey/just), each target maps to
-a one-liner you can run manually — see the `Justfile`.
+a one-liner you can run manually - see the `Justfile`.
 
 ## Development loop
 
 1. **Edit code** under `internal/provider/`. New code paths need unit tests in
-   the same package — see `*_test.go` for examples (table-driven where it
+   the same package - see `*_test.go` for examples (table-driven where it
    helps).
 2. **Run `just ci`** before pushing - it is the exact gate CI runs:
    - `just check` (`go vet`, `staticcheck`, `govulncheck`, `fieldalignment`)
@@ -60,14 +60,14 @@ times out or is cancelled.
   feature/bugfix work.
 - Conventional commit style for the PR title (`feat:`, `fix:`, `docs:`,
   `chore:`, `test:`). Goreleaser uses these to produce the changelog.
-- Keep PRs reviewable — under ~400 lines of diff is the sweet spot.
+- Keep PRs reviewable - under ~400 lines of diff is the sweet spot.
 - New API surface (resources, data sources, schema attributes) needs a doc
   example in `examples/` so `tfplugindocs` picks it up.
 
 ## Code style
 
 - Default to **no comments**. Names should carry their meaning. Add a comment
-  only when *why* is non-obvious — invariants, workarounds, surprising
+  only when *why* is non-obvious - invariants, workarounds, surprising
   behaviour.
 - Don't write code for hypothetical future requirements.
 - Validate at boundaries (user config, API responses); trust internal code.

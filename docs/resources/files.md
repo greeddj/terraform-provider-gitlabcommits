@@ -61,7 +61,7 @@ resource "gitlabcommits_files" "service" {
 
 - `branch` (String) Target branch. Must already exist, or set create_branch_from to materialise it. Changing it forces replacement: with the default delete_on_destroy = true the replacement first pushes a commit deleting every managed file from the old branch before creating them on the new one.
 - `commit_message` (String) Message used for any commit (create / update / destroy) the resource produces. Only takes effect on an apply that actually changes file content, mode, or set; editing just commit_message or the author fields produces no commit, so the new value applies to the next change.
-- `files` (Attributes Map) Map of repository_path → file definition. The map key is the path inside the repo. (see [below for nested schema](#nestedatt--files))
+- `files` (Attributes Map) Map of repository_path -> file definition. The map key is the path inside the repo. (see [below for nested schema](#nestedatt--files))
 - `project_id` (String) Numeric project ID or the plain project path (e.g. "group/subgroup/project"); do not URL-encode it, the provider escapes it. Changing it forces replacement: with the default delete_on_destroy = true the replacement first pushes a commit deleting every managed file from the old project and branch.
 
 ### Optional

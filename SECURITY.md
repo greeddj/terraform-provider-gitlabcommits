@@ -26,7 +26,7 @@ In scope:
 - the GitLab API interactions performed by the provider.
 
 Out of scope:
-- vulnerabilities in GitLab itself — please report those at
+- vulnerabilities in GitLab itself - please report those at
   https://about.gitlab.com/security,
 - vulnerabilities in Terraform Core or HashiCorp's Plugin Framework.
 

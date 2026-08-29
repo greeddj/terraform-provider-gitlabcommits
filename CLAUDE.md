@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Terraform provider (`greeddj/gitlabcommits`) built on the **Terraform Plugin Framework** (protocol 6, not SDKv2). It manages a bundle of files on one branch of one GitLab project and batches every change into **one commit per `terraform apply` per resource**. All Go code lives in the single package `internal/provider/`; `main.go` only serves it. GitLab access goes through `gitlab.com/gitlab-org/api/client-go`. Supported GitLab is 18.x (what CI tests against); the technical floor of the API surface used is 14.10 (`execute_filemode`), and `allow_empty` (18.8) is not used: client-go v1.46.0 does not expose it, and a zero-action apply makes no request at all.
+A Terraform provider (`greeddj/gitlabcommits`) built on the **Terraform Plugin Framework** (protocol 6, not SDKv2). It manages a bundle of files on one branch of one GitLab project and batches every change into **one commit per `terraform apply` per resource**. All Go code lives in the single package `internal/provider/`; `main.go` only serves it. GitLab access goes through `gitlab.com/gitlab-org/api/client-go`. Supported GitLab is 19.x (what CI tests against); the technical floor of the API surface used is 14.10 (`execute_filemode`), and `allow_empty` (18.8) is not used: client-go v1.46.0 does not expose it, and a zero-action apply makes no request at all.
 
 ## Commands
 

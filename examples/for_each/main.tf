@@ -1,5 +1,5 @@
 # ============================================================================
-# Real-world layout: 20 services × 30 environments
+# Real-world layout: 20 services x 30 environments
 #   - one terraform resource per service
 #   - one commit per service per apply
 #   - all per-env helm values and ArgoCD application manifests in that commit
@@ -33,7 +33,7 @@ variable "gitops_branch" {
   default     = "main"
 }
 
-# 30 environments × 20 services = 600 (service, env) pairs handled below.
+# 30 environments x 20 services = 600 (service, env) pairs handled below.
 variable "environments" {
   type = map(object({
     cluster   = string

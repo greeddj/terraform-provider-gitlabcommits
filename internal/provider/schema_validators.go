@@ -170,7 +170,7 @@ func (v stringRepoPathValidator) ValidateString(_ context.Context, req validator
 
 // mapNonEmpty rejects empty maps. Used to keep `files` from being silently
 // configured as `{}`, which would otherwise translate to "delete everything"
-// on update — almost never what the user wants.
+// on update - almost never what the user wants.
 func mapNonEmpty() validator.Map {
 	return mapNonEmptyValidator{}
 }

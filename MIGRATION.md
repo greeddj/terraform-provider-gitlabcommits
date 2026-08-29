@@ -6,7 +6,7 @@ The old `gitlabcommits_commit` modelled a commit as a Terraform resource. That
 model never fit Terraform's desired-state semantics: Read couldn't detect
 drift, Update silently created another commit on top, and Delete was a no-op.
 The new resource (`gitlabcommits_files`) treats a *bundle of files in a branch*
-as the unit of state — which is what users actually want to manage.
+as the unit of state - which is what users actually want to manage.
 
 ### What changes
 
@@ -25,7 +25,7 @@ as the unit of state — which is what users actually want to manage.
    release that ships `gitlabcommits_files`).
 2. **Re-write each `gitlabcommits_commit` resource** to `gitlabcommits_files`:
    - Convert the `files` list to a map keyed by `file_path`.
-   - Drop the `action` attribute — the provider computes it from the diff.
+   - Drop the `action` attribute - the provider computes it from the diff.
    - Optional fields (`previous_path`, `encoding`) that were used for `move`
      and explicit base64 are no longer needed; use `content_base64` for
      binaries and let the diff handle moves as create/delete pairs.
@@ -39,7 +39,7 @@ as the unit of state — which is what users actually want to manage.
    per resource** (its updates simply re-write the same bytes when the
    rendered content already matches the repo); only subsequent applies with
    no changes produce zero commits.
-5. **Inspect once** — run `terraform plan` again; it should report no
+5. **Inspect once** - run `terraform plan` again; it should report no
    changes.
 
 ### When using a custom CI orchestrator
@@ -59,7 +59,7 @@ last-write-wins.
 ### Example before / after
 
 ```hcl
-# BEFORE — gitlabcommits_commit
+# BEFORE - gitlabcommits_commit
 resource "gitlabcommits_commit" "frontend" {
   project_id     = "platform/gitops"
   branch         = "main"
@@ -74,7 +74,7 @@ resource "gitlabcommits_commit" "frontend" {
 ```
 
 ```hcl
-# AFTER — gitlabcommits_files
+# AFTER - gitlabcommits_files
 resource "gitlabcommits_files" "frontend" {
   project_id     = "platform/gitops"
   branch         = "main"
@@ -94,12 +94,13 @@ resource; every later apply with no changes produces zero commits.
 ## `blob_id` is now opaque
 
 Early pre-release builds computed each file's `blob_id` locally using
-`sha1("blob <size>\0<content>")` — git's own format — so the value in
+`sha1("blob <size>\0<content>")` - git's own format - so the value in
 `terraform.tfstate` was always a 40-character SHA-1. The provider now
 stores whatever `blob_id` GitLab returns, treating it as an opaque
 string. On SHA-1 repositories the value is unchanged; on SHA-256
-repositories (GitLab 16.1+ experimental, wider in 18.x) it will be a
-64-character SHA-256.
+repositories (an opt-in experiment since GitLab 16.7, behind the
+`support_sha256_repositories` feature flag and chosen at project creation)
+it will be a 64-character SHA-256.
 
 No user action is required: `blob_id` is `Computed`, so the first plan /
 apply after the upgrade overwrites it from the GitLab API. If you

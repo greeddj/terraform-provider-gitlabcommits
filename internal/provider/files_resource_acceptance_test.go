@@ -62,7 +62,7 @@ func TestAccFiles_basic(t *testing.T) {
 				),
 			},
 			{
-				// One file changed → one update commit. The other file's blob_id stays put.
+				// One file changed -> one update commit. The other file's blob_id stays put.
 				Config: accConfig(project, branch, map[string]string{
 					accTestPathPrefix + "basic/a.yaml": "version: 2\n",
 					accTestPathPrefix + "basic/b.yaml": "version: 1\n",
