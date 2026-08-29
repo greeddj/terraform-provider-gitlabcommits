@@ -3,7 +3,7 @@ terraform {
     gitlabcommits = {
       source = "greeddj/gitlabcommits"
       # Pin a version once you depend on released behaviour, e.g.:
-      # version = "~> 1.0"
+      # version = "~> 0.1.0"
     }
   }
 }
