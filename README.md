@@ -1,5 +1,9 @@
 # Terraform Provider: GitLab Commits
 
+[![CI](https://github.com/greeddj/terraform-provider-gitlabcommits/actions/workflows/ci.yml/badge.svg)](https://github.com/greeddj/terraform-provider-gitlabcommits/actions/workflows/ci.yml)
+[![Release](https://github.com/greeddj/terraform-provider-gitlabcommits/actions/workflows/release.yml/badge.svg)](https://github.com/greeddj/terraform-provider-gitlabcommits/actions/workflows/release.yml)
+[![codecov](https://codecov.io/gh/greeddj/terraform-provider-gitlabcommits/graph/badge.svg)](https://codecov.io/gh/greeddj/terraform-provider-gitlabcommits)
+
 A Terraform provider that manages **bundles of files** in a GitLab repository.
 Every change a resource makes - create, update, delete or chmod - is batched
 into **one commit per `terraform apply`**, so you get **one CI pipeline run per
