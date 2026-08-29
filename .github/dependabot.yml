@@ -6,9 +6,11 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    # No `include: scope`: it appends a second (deps) scope, and the
+    # `fix(deps)(deps)` title that produces does not match the changelog
+    # group in .goreleaser.yml, so the bump lands under Bug Fixes.
     commit-message:
       prefix: "fix(deps)"
-      include: scope
     groups:
       hashicorp:
         patterns:
@@ -25,4 +27,3 @@ updates:
     open-pull-requests-limit: 3
     commit-message:
       prefix: "fix(ci)"
-      include: scope

@@ -5,14 +5,27 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  # release.yml runs this same gate on a tag instead of copying it.
+  workflow_call:
+    secrets:
+      CODECOV_TOKEN:
+        required: false
 
 permissions:
   contents: read
+
+# The literal `ci-` prefix keeps a call from release.yml out of the caller's
+# own concurrency group: sharing a group with the caller would make the called
+# run queue behind the job that is waiting for it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   tests_and_checks:
     name: Tests and Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

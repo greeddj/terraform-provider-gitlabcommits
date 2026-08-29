@@ -22,6 +22,13 @@ on:
 permissions:
   contents: read
 
+# Every run drives the same GitLab project, so a scheduled run, a push and a
+# manual dispatch queue instead of overlapping. Cancelling is not an option:
+# a killed run may never reach the step that deletes the branch it created.
+concurrency:
+  group: acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   acceptance:
     name: Acceptance
@@ -46,7 +53,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          # The job runs a test binary that talks to GitLab with its own
+          # token; the workflow token has no business staying in .git/config.
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
