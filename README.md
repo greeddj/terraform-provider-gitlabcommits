@@ -58,7 +58,7 @@ files map starts empty and is reconciled on the next plan + apply.
 - On macOS and Windows, `SSL_CERT_FILE` / `SSL_CERT_DIR`, when set, replace the
   system certificate store for the provider's TLS connections (Go 1.27 default);
   unset them if your GitLab's CA lives only in the system store
-- Go >= 1.27 (development only)
+- Go >= 1.27.1 (development only)
 
 ## Provider configuration
 

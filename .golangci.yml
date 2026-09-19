@@ -5,7 +5,7 @@
 # default: none + every enabled linter listed explicitly so a new
 # golangci-lint version pulling in additional defaults cannot quietly
 # red-light CI. Single source of truth for the Go target is go.mod;
-# this file mirrors it.
+# this file mirrors its minor, which is all the go: key takes.
 version: "2"
 run:
   go: "1.27"
