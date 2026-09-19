@@ -26,7 +26,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
-	gitlab "gitlab.com/gitlab-org/api/client-go"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -1479,9 +1479,13 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 	summary := fmt.Sprintf("GitLab API error: %s", action)
 	prefix := fmt.Sprintf("project=%q branch=%q", project, branch)
 
-	// client-go collapses every 404 into the bare ErrNotFound sentinel (no
-	// *ErrorResponse survives), so 404 must be recognised here - a status
-	// switch below would never see it.
+	// ErrNotFound is itself an *ErrorResponse (StatusCode 404, nil Response)
+	// and (*ErrorResponse).Is matches on the status code alone, so errors.Is
+	// catches every 404 client-go can produce, shared sentinel or not. It has
+	// to: the sentinel carries no *http.Response, so the guarded switch below
+	// skips it and the 404 would reach the bare err.Error() tail. The order
+	// earns its keep as well, since a 404 that did arrive with a Response
+	// would otherwise land in that switch's default.
 	if errors.Is(err, gitlab.ErrNotFound) {
 		summary = "GitLab resource not found (HTTP 404)"
 		return summary, fmt.Sprintf("%s: the project, branch, or file does not exist, or the token cannot see it "+

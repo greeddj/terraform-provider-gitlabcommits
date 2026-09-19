@@ -17,7 +17,9 @@ updates:
           - "github.com/hashicorp/*"
       gitlab-client:
         patterns:
-          - "gitlab.com/gitlab-org/api/client-go"
+          # Wildcarded: dependabot matches the module path, which carries the
+          # major suffix, so a literal would stop grouping at the next major.
+          - "gitlab.com/gitlab-org/api/client-go*"
 
   - package-ecosystem: github-actions
     directory: "/"

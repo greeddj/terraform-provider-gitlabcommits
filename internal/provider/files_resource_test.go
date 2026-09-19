@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	gitlab "gitlab.com/gitlab-org/api/client-go"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 )
 
 // TestRawBytes verifies that fileModel.rawBytes returns identical bytes whether
@@ -595,8 +595,9 @@ func TestApiErrorDiag(t *testing.T) {
 			headers = http.Header{}
 		}
 		return &gitlab.ErrorResponse{
-			Response: &http.Response{StatusCode: status, Header: headers},
-			Message:  msg,
+			StatusCode: status,
+			Response:   &http.Response{StatusCode: status, Header: headers},
+			Message:    msg,
 		}
 	}
 
@@ -617,10 +618,20 @@ func TestApiErrorDiag(t *testing.T) {
 			contains:    []string{"api", "Developer", "CI_JOB_TOKEN"},
 		},
 		{
-			// client-go never delivers a 404 as *ErrorResponse - CheckResponse
-			// collapses it into the bare sentinel, so that is what the
-			// diagnostic must recognise.
+			// CheckResponse answers every 404 with this one shared value, so it
+			// is the shape the diagnostic sees in practice.
 			name: "404-sentinel", err: gitlab.ErrNotFound,
+			wantSummary: "GitLab resource not found (HTTP 404)",
+			contains:    []string{"does not exist"},
+		},
+		{
+			// Not the shared sentinel, and carrying a live *http.Response.
+			// (*ErrorResponse).Is matches on the status code alone, so errors.Is
+			// claims it before the status switch does - which is the only thing
+			// keeping it out of that switch's default, since unlike the sentinel
+			// it clears the nil guard. CheckResponse does not build this shape
+			// today, so nothing else pins the order.
+			name: "404-with-response", err: mkErr(404, "404 Project Not Found", nil),
 			wantSummary: "GitLab resource not found (HTTP 404)",
 			contains:    []string{"does not exist"},
 		},
