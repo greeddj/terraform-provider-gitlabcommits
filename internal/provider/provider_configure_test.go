@@ -8,11 +8,13 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"math"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -22,6 +24,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-log/tflogtest"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
+	"golang.org/x/time/rate"
 )
 
 // runConfigure invokes the provider's Configure with the given attribute
@@ -299,15 +302,49 @@ func TestConfigure_ResponseHeaderTimeout(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
 	t.Setenv("GITLAB_BASE_URL", "")
 	client := configuredClient(t, map[string]tftypes.Value{"token": tftypes.NewValue(tftypes.String, "tok")})
-	transport, ok := client.HTTPClient().Transport.(*http.Transport)
+	observer, ok := client.HTTPClient().Transport.(*rateLimitObserver)
 	if !ok {
-		t.Fatalf("transport is %T, want *http.Transport", client.HTTPClient().Transport)
+		t.Fatalf("transport is %T, want *rateLimitObserver", client.HTTPClient().Transport)
+	}
+	transport, ok := observer.next.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport under the rate-limit observer is %T, want *http.Transport", observer.next)
 	}
 	if transport.ResponseHeaderTimeout != responseHeaderTimeout {
 		t.Errorf("ResponseHeaderTimeout = %v, want %v", transport.ResponseHeaderTimeout, responseHeaderTimeout)
 	}
 	if transport.MaxIdleConnsPerHost == 0 {
 		t.Error("expected cleanhttp's pooled transport settings to be kept")
+	}
+}
+
+// closeIdleRecorder is a transport that records CloseIdleConnections.
+type closeIdleRecorder struct {
+	http.RoundTripper
+	closed bool
+}
+
+func (r *closeIdleRecorder) CloseIdleConnections() { r.closed = true }
+
+// TestConfigure_CloseIdleConnectionsReachesThePool: the retrying client
+// flushes the idle pool when a request finally fails, through
+// http.Client.CloseIdleConnections, which does nothing unless the
+// transport implements the method; the rate-limit observer must pass it on.
+func TestConfigure_CloseIdleConnectionsReachesThePool(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	t.Setenv("GITLAB_BASE_URL", "")
+	client := configuredClient(t, map[string]tftypes.Value{"token": tftypes.NewValue(tftypes.String, "tok")})
+	observer, ok := client.HTTPClient().Transport.(*rateLimitObserver)
+	if !ok {
+		t.Fatalf("transport is %T, want *rateLimitObserver", client.HTTPClient().Transport)
+	}
+	recorder := &closeIdleRecorder{RoundTripper: observer.next}
+	observer.next = recorder
+
+	client.HTTPClient().CloseIdleConnections()
+
+	if !recorder.closed {
+		t.Error("CloseIdleConnections did not reach the pooled transport")
 	}
 }
 
@@ -502,4 +539,102 @@ func TestConfigure_BaseURLCredentialsStayOutOfLogs(t *testing.T) {
 			t.Fatalf("want the invalid-URL error naming GITLAB_BASE_URL, got %v", resp.Diagnostics)
 		}
 	})
+}
+
+// TestConfigure_RateLimitHeaderIsRaceFree: GitLab.com sends RateLimit-Limit,
+// and the provider's requests run concurrently. client-go's own limiter
+// reassigns a field on the first response that every later request reads
+// unsynchronised, so a request starting in another goroutine after that
+// response is a data race; go test -race (which just test runs) reports it
+// unless Configure installs its own limiter. That limiter must still take
+// its rate from the header.
+func TestConfigure_RateLimitHeaderIsRaceFree(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("RateLimit-Limit", "600000")
+		branchJSON(w, "main", "head")
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("GITLAB_TOKEN", "")
+	client := configuredClient(t, map[string]tftypes.Value{
+		"token":    tftypes.NewValue(tftypes.String, "tok"),
+		"base_url": tftypes.NewValue(tftypes.String, srv.URL),
+	})
+
+	errs := make(chan error, 2)
+	get := func() {
+		_, _, err := client.Branches.GetBranch("proj", "main", gitlab.WithContext(t.Context()))
+		errs <- err
+	}
+	go get()
+	// Nothing orders the second request after the first: like another
+	// resource's refresh, it only starts later. Any synchronisation with the
+	// first goroutine would hide the race from the detector.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		get()
+	}()
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("request: %v", err)
+		}
+	}
+
+	observer, ok := client.HTTPClient().Transport.(*rateLimitObserver)
+	if !ok {
+		t.Fatalf("transport is %T, want *rateLimitObserver", client.HTTPClient().Transport)
+	}
+	if got := observer.limiter.current.Load().Limit(); got != rate.Limit(600000.0/60*0.66) {
+		t.Errorf("limit = %v, want two thirds of the header's per-second rate", got)
+	}
+}
+
+// TestHeaderRateLimiter_Observe pins the derivation client-go uses: two
+// thirds of the per-minute limit per second as the rate, a third (at least
+// one) as the burst, the request that brought the header counted, and only
+// the first response considered. counted is checked only where the rate is
+// slow enough for the missing token to still show.
+func TestHeaderRateLimiter_Observe(t *testing.T) {
+	cases := []struct {
+		name, header string
+		limit        rate.Limit
+		burst        int
+		counted      bool
+	}{
+		{name: "gitlab.com style", header: "600", limit: rate.Limit(600.0 / 60 * 0.66), burst: 3, counted: true},
+		{name: "burst at least one", header: "60", limit: rate.Limit(60.0 / 60 * 0.66), burst: 1, counted: true},
+		{name: "huge value keeps a positive burst", header: "1e300", limit: rate.Limit(1e300 / 60 * 0.66), burst: math.MaxInt32},
+		{name: "absent", limit: rate.Inf},
+		{name: "zero", header: "0", limit: rate.Inf},
+		{name: "negative", header: "-5", limit: rate.Inf},
+		{name: "garbage", header: "many", limit: rate.Inf},
+		{name: "not a number", header: "NaN", limit: rate.Inf},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			l := newHeaderRateLimiter()
+			h := http.Header{}
+			if c.header != "" {
+				h.Set("RateLimit-Limit", c.header)
+			}
+			l.observe(h)
+			l.observe(http.Header{"Ratelimit-Limit": []string{"6"}})
+			lim := l.current.Load()
+			if c.limit == rate.Inf && lim.Limit() != rate.Inf ||
+				math.Abs(float64(lim.Limit()-c.limit)) > 1e-9*float64(c.limit) {
+				t.Errorf("limit = %v, want %v", lim.Limit(), c.limit)
+			}
+			if c.limit == rate.Inf {
+				if err := l.Wait(t.Context()); err != nil {
+					t.Errorf("an unset limiter must not block: %v", err)
+				}
+				return
+			}
+			if lim.Burst() != c.burst {
+				t.Errorf("burst = %d, want %d", lim.Burst(), c.burst)
+			}
+			if tokens := lim.Tokens(); c.counted && tokens > float64(c.burst)-0.5 {
+				t.Errorf("tokens = %v, want the request that brought the header counted", tokens)
+			}
+		})
+	}
 }

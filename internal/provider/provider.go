@@ -6,11 +6,15 @@ package provider
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -23,6 +27,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
+	"golang.org/x/time/rate"
 )
 
 var (
@@ -297,10 +302,14 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	// off-host redirects are refused by crossHostRedirectGuard.
 	transport := cleanhttp.DefaultPooledTransport()
 	transport.ResponseHeaderTimeout = responseHeaderTimeout
-	clientOpts = append(clientOpts, gitlab.WithHTTPClient(&http.Client{
-		Transport:     transport,
-		CheckRedirect: crossHostRedirectGuard,
-	}))
+	limiter := newHeaderRateLimiter()
+	clientOpts = append(clientOpts,
+		gitlab.WithHTTPClient(&http.Client{
+			Transport:     &rateLimitObserver{next: transport, limiter: limiter},
+			CheckRedirect: crossHostRedirectGuard,
+		}),
+		gitlab.WithCustomLimiter(limiter),
+	)
 
 	client, err := gitlab.NewClient(token, clientOpts...)
 	if err != nil {
@@ -390,4 +399,70 @@ func withoutUserinfo(u *url.URL) string {
 	masked := *u
 	masked.User = url.User("xxxxx")
 	return masked.String()
+}
+
+// headerRateLimiter is the GitLab client's rate limiter. client-go derives
+// one itself from the first response's RateLimit-Limit header, but stores it
+// in a plain field that every request reads without synchronisation: a data
+// race once requests run concurrently, as the refresh fan-outs and parallel
+// resource instances sharing the client do. Installing this limiter with
+// gitlab.WithCustomLimiter turns that derivation off; observe repeats it and
+// publishes the result through an atomic pointer.
+type headerRateLimiter struct {
+	current atomic.Pointer[rate.Limiter]
+	once    sync.Once
+}
+
+func newHeaderRateLimiter() *headerRateLimiter {
+	l := &headerRateLimiter{}
+	l.current.Store(rate.NewLimiter(rate.Inf, 0))
+	return l
+}
+
+func (l *headerRateLimiter) Wait(ctx context.Context) error {
+	return l.current.Load().Wait(ctx)
+}
+
+// observe configures the limiter from the first response, as client-go
+// does: two thirds of GitLab's per-minute limit as the steady rate and a
+// third as the burst, with the request that brought the header counted. A
+// first response without a usable header leaves the limiter off for good.
+func (l *headerRateLimiter) observe(h http.Header) {
+	l.once.Do(func() {
+		perMinute, _ := strconv.ParseFloat(h.Get("RateLimit-Limit"), 64)
+		if perMinute > 0 {
+			perSecond := perMinute / 60
+			// The cap keeps a huge value from converting to a negative burst,
+			// which would fail every request.
+			lim := rate.NewLimiter(rate.Limit(perSecond*0.66), max(1, int(min(perSecond*0.33, math.MaxInt32))))
+			lim.Allow()
+			l.current.Store(lim)
+		}
+	})
+}
+
+// rateLimitObserver is the transport under the GitLab client: it hands each
+// response's headers to the rate limiter.
+type rateLimitObserver struct {
+	next    http.RoundTripper
+	limiter *headerRateLimiter
+}
+
+func (t *rateLimitObserver) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.next.RoundTrip(req)
+	if err == nil {
+		t.limiter.observe(resp.Header)
+	}
+	return resp, err
+}
+
+// CloseIdleConnections forwards to the pooled transport. http.Client reaches
+// a transport's idle pool only through this method, and go-retryablehttp
+// calls it whenever a request finally fails or is cancelled, to drop idle
+// connections that may be as broken as the one that failed; without the
+// forward the pool would keep them.
+func (t *rateLimitObserver) CloseIdleConnections() {
+	if c, ok := t.next.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
 }
