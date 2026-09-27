@@ -388,17 +388,14 @@ func TestRead_NullFileBodyOnDriftErrors(t *testing.T) {
 	}
 }
 
-// TestRead_OversizedBlobIDIgnored: an absurdly long blob_id from
-// GetFile is not persisted; state keeps blob_id null and a warning is emitted.
+// TestRead_OversizedBlobIDIgnored: an absurdly long blob_id from GetFile is
+// not persisted; state keeps blob_id null, takes last_commit_id from the
+// metadata response, and a warning is emitted.
 func TestRead_OversizedBlobIDIgnored(t *testing.T) {
 	oversized := strings.Repeat("a", maxBlobIDLen+1)
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
-			w.Header().Set("X-Gitlab-Blob-Id", "newblob")
-			w.Header().Set("X-Gitlab-File-Path", "f.txt")
-			w.Header().Set("X-Gitlab-Ref", "main")
-			w.Header().Set("X-Gitlab-Size", "3")
-			w.WriteHeader(http.StatusOK)
+			metaHeaders(w, "newblob", "metalcid", false)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -413,8 +410,9 @@ func TestRead_OversizedBlobIDIgnored(t *testing.T) {
 	if resp.Diagnostics.WarningsCount() == 0 {
 		t.Error("expected a warning for the oversized blob_id")
 	}
-	if f := out.Files["f.txt"]; !f.BlobID.IsNull() {
-		t.Errorf("blob_id = %q, want null (oversized ignored)", f.BlobID.ValueString())
+	if f := out.Files["f.txt"]; !f.BlobID.IsNull() || f.LastCommitID.ValueString() != "metalcid" || f.Content.ValueString() != "new" {
+		t.Errorf("blob_id / last_commit_id / content = %s / %q / %q, want null / metalcid / new",
+			f.BlobID, f.LastCommitID.ValueString(), f.Content.ValueString())
 	}
 }
 

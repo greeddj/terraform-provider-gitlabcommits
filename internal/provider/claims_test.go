@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
@@ -656,5 +657,122 @@ func TestClaims_WarningNamesThePath(t *testing.T) {
 		if !strings.Contains(w.Detail(), want) {
 			t.Errorf("warning detail %q does not mention %q", w.Detail(), want)
 		}
+	}
+}
+
+// TestClaims_CreateOverADirectoryFilledMeanwhile: a resource that creates a
+// file where another resource in the same apply adds a file inside a
+// directory of that name would replace the directory, and wipe that file,
+// if the other commit lands after its directory check. The other resource
+// claimed its path before committing, so the claim, checked under the
+// branch lock, fails the create before it is sent. Here the other resource
+// runs to completion while the directory check's answer is on its way.
+func TestClaims_CreateOverADirectoryFilledMeanwhile(t *testing.T) {
+	for _, update := range []bool{false, true} {
+		name := "create"
+		if update {
+			name = "update adding the path"
+		}
+		t.Run(name, func(t *testing.T) {
+			fake := &repoFake{files: map[string]string{"a.txt": "l0"}}
+			locks := newBranchLocks()
+			var filler operation
+			var filled atomic.Bool
+			h := fake.handler(t)
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				h(w, r)
+				// The listing's answer is written but reaches the resource
+				// only once this handler returns.
+				if isTreeRequest(r) && r.URL.Query().Get("path") == "conf" && filled.CompareAndSwap(false, true) {
+					filler.run(r.Context())
+				}
+			})
+			fillerRes := &filesResource{client: client, locks: locks}
+			res := &filesResource{client: client, locks: locks}
+			filler = createOp(t, fillerRes, managedFiles(true, map[string]string{"conf/x": ""}))
+			op := createOp(t, res, managedFiles(true, map[string]string{"conf": ""}))
+			if update {
+				op = updateOp(t, res, managedFiles(true, map[string]string{"a.txt": "l0", "conf": ""}),
+					managedFiles(true, map[string]string{"a.txt": "l0"}))
+			}
+
+			op.run(t.Context())
+
+			if !filled.Load() {
+				t.Fatal("the directory was never checked; the test does not exercise the race")
+			}
+			commits, _, repo := fake.recorded()
+			if want := [][]string{{"create:conf/x"}}; !slices.EqualFunc(commits, want, slices.Equal[[]string]) {
+				t.Errorf("commits = %q, want only the filler's %q", commits, want)
+			}
+			wantDiag(t, "filler diagnostic", filler.diags(), "")
+			wantDiag(t, "error", op.diags().Errors(), `"conf" cannot be created on branch "main": it would replace the directory holding "conf/x"`)
+			checkStateMatchesRepo(t, "filler", filler.state(), repo)
+		})
+	}
+}
+
+// TestClaims_CreateOverAClaimedDirectory: a claim inside the directory a
+// create would replace fails the create when it names the same project,
+// under any spelling, and is ignored when it names another project that
+// shares the branch name. A failed lookup commits nothing.
+func TestClaims_CreateOverAClaimedDirectory(t *testing.T) {
+	cases := []struct {
+		projects      map[string]int64
+		name          string
+		claimant      string
+		wantError     string
+		wantCommits   [][]string
+		projectStatus int
+	}{
+		{
+			name:      "the same spelling",
+			claimant:  "proj",
+			wantError: `which a gitlabcommits_files resource in this run adopts or writes, so nothing was committed`,
+		},
+		{
+			name:      "another spelling of the same project",
+			claimant:  "123",
+			projects:  map[string]int64{"proj": 123},
+			wantError: `adopts or writes through project_id "123", the same project as "proj", so nothing was committed`,
+		},
+		{
+			name:        "another project",
+			claimant:    "7",
+			projects:    map[string]int64{"proj": 123},
+			wantCommits: [][]string{{"create:conf"}},
+		},
+		{
+			name:          "a failed lookup",
+			claimant:      "7",
+			projects:      map[string]int64{},
+			projectStatus: http.StatusInternalServerError,
+			wantError:     "Whether the two name the same project is unknown",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &repoFake{files: map[string]string{}, projects: c.projects, projectStatus: c.projectStatus}
+			res := newTestResource(fake.client(t))
+			res.locks.claim(c.claimant, "main", []string{"conf/sub/x"})
+			res.locks.claim("proj", "other", []string{"conf/y"})
+
+			resp := runCreateOn(t, res, managedFiles(true, map[string]string{"conf": ""}))
+
+			commits, _, _ := fake.recorded()
+			if !slices.EqualFunc(commits, c.wantCommits, slices.Equal[[]string]) {
+				t.Errorf("commits = %q, want %q", commits, c.wantCommits)
+			}
+			wantDiag(t, "error", resp.Diagnostics.Errors(), c.wantError)
+			if errs := resp.Diagnostics.Errors(); len(errs) == 1 {
+				withPath, ok := errs[0].(diag.DiagnosticWithPath)
+				if !ok || !withPath.Path().Equal(path.Root("files").AtMapKey("conf")) {
+					t.Errorf("the error must point at files[\"conf\"], got %v", errs[0])
+				}
+				if !strings.Contains(errs[0].Detail(), `"conf/sub/x"`) {
+					t.Errorf("the error must name the claimed path, got %q", errs[0].Detail())
+				}
+			}
+		})
 	}
 }

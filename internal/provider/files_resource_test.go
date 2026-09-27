@@ -151,23 +151,37 @@ func TestDiffActions(t *testing.T) {
 		},
 	}
 
-	r := &filesResource{}
+	// With adoption off the only requests are the directory check of a
+	// created path, answered here as "no directory", and the branch lookup
+	// that confirms that 404.
+	r := newTestResource(newReadClient(t, func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case isTreeRequest(req):
+			noDirectory(w)
+			return
+		case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/branches/main"):
+			branchJSON(w, "main", "head")
+			return
+		}
+		t.Errorf("unexpected call %s %s?%s", req.Method, req.URL.Path, req.URL.RawQuery)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			plan := filesResourceModel{
 				ProjectID:     types.StringValue("group/proj"),
 				Branch:        types.StringValue("main"),
 				Files:         c.plan,
-				AdoptExisting: types.BoolValue(false), // disable network calls in unit test
+				AdoptExisting: types.BoolValue(false),
 			}
 			state := filesResourceModel{
 				ProjectID: types.StringValue("group/proj"),
 				Branch:    types.StringValue("main"),
 				Files:     c.state,
 			}
-			actions, _, err := r.diffActions(t.Context(), plan, state)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			actions, _, diags := r.diffActions(t.Context(), plan, state)
+			if diags.HasError() {
+				t.Fatalf("unexpected error: %v", diags)
 			}
 			if len(actions) != c.wantLen {
 				t.Fatalf("got %d actions, want %d: %+v", len(actions), c.wantLen, summarise(actions))
@@ -209,9 +223,9 @@ func TestDiffActions_ContentEqualBytewise(t *testing.T) {
 		},
 	}
 
-	actions, _, err := r.diffActions(t.Context(), plan, state)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	actions, _, diags := r.diffActions(t.Context(), plan, state)
+	if diags.HasError() {
+		t.Fatalf("unexpected error: %v", diags)
 	}
 	if len(actions) != 0 {
 		t.Fatalf("expected no actions for bytewise-equal content, got %d: %v", len(actions), summarise(actions))
@@ -481,9 +495,9 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 
 	t.Run("enabled-default", func(t *testing.T) {
 		// OptimisticLock null -> defaults to true.
-		actions, _, err := r.diffActions(t.Context(), plan, state)
-		if err != nil {
-			t.Fatal(err)
+		actions, _, diags := r.diffActions(t.Context(), plan, state)
+		if diags.HasError() {
+			t.Fatal(diags)
 		}
 		got := lastCommitIDs(actions)
 		want := map[string]string{"a.yaml": "commit-A", "b.yaml": "commit-B", "c.sh": "commit-C"}
@@ -502,9 +516,9 @@ func TestDiffActions_OptimisticLock(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		planNoLock := plan
 		planNoLock.OptimisticLock = types.BoolValue(false)
-		actions, _, err := r.diffActions(t.Context(), planNoLock, state)
-		if err != nil {
-			t.Fatal(err)
+		actions, _, diags := r.diffActions(t.Context(), planNoLock, state)
+		if diags.HasError() {
+			t.Fatal(diags)
 		}
 		for _, a := range actions {
 			if a.LastCommitID != nil {
@@ -869,62 +883,69 @@ func TestStampBlobs_OneProbeFailure(t *testing.T) {
 }
 
 // TestStampBlobs_OversizedBlobIDRejected verifies the defensive length cap: when
-// the server returns a blob_id longer than 256 bytes (anything above SHA-512 hex
-// is unexpected and could indicate a hostile/MITM'd response), stampBlobs treats
-// the probe as failed: BlobID is null, LastCommitID falls back to commitSHA, and
-// a warning (not an error) is emitted.
+// the server returns a blob_id or last_commit_id longer than 256 bytes
+// (anything above SHA-512 hex is unexpected and could indicate a
+// hostile/MITM'd response), stampBlobs treats the probe as failed: BlobID is
+// null, LastCommitID falls back to commitSHA, and a warning (not an error)
+// naming the path once is emitted.
 func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
 	oversized := strings.Repeat("a", 300)
+	for _, tc := range []struct{ name, blob, lcid string }{
+		{name: "blob_id", blob: oversized, lcid: "should-not-appear"},
+		{name: "last_commit_id", blob: "should-not-appear", lcid: oversized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodHead {
+					http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
+					return
+				}
+				w.Header().Set("X-Gitlab-Blob-Id", tc.blob)
+				w.Header().Set("X-Gitlab-Last-Commit-Id", tc.lcid)
+				w.Header().Set("X-Gitlab-Commit-Id", "should-not-appear")
+				w.Header().Set("X-Gitlab-File-Path", "file.txt")
+				w.Header().Set("X-Gitlab-Ref", "main")
+				w.Header().Set("X-Gitlab-Size", "5")
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodHead {
-			http.Error(w, "expected HEAD", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("X-Gitlab-Blob-Id", oversized)
-		w.Header().Set("X-Gitlab-Last-Commit-Id", "should-not-appear")
-		w.Header().Set("X-Gitlab-Commit-Id", "should-not-appear")
-		w.Header().Set("X-Gitlab-File-Path", "file.txt")
-		w.Header().Set("X-Gitlab-Ref", "main")
-		w.Header().Set("X-Gitlab-Size", "5")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
+			client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
 
-	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+			res := &filesResource{client: client}
 
-	res := &filesResource{client: client}
+			files := map[string]fileModel{
+				"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
+			}
 
-	files := map[string]fileModel{
-		"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
-	}
+			diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", map[string]bool{"file.txt": true})
 
-	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", map[string]bool{"file.txt": true})
+			if diags.HasError() {
+				t.Fatalf("expected no errors, got: %v", diags.Errors())
+			}
+			if n := diags.WarningsCount(); n != 1 {
+				t.Fatalf("expected 1 warning, got %d", n)
+			}
+			w := diags.Warnings()[0]
+			if n := strings.Count(w.Detail(), "file.txt"); n != 1 {
+				t.Errorf("warning detail %q should mention the path %q once, got %d", w.Detail(), "file.txt", n)
+			}
+			if want := tc.name + " of unexpected length 300"; !strings.Contains(w.Detail(), want) {
+				t.Errorf("warning detail %q should say %q", w.Detail(), want)
+			}
 
-	if diags.HasError() {
-		t.Fatalf("expected no errors, got: %v", diags.Errors())
-	}
-	if n := diags.WarningsCount(); n != 1 {
-		t.Fatalf("expected 1 warning, got %d", n)
-	}
-	w := diags.Warnings()[0]
-	if !strings.Contains(w.Detail(), "file.txt") {
-		t.Errorf("warning detail %q should mention the path %q", w.Detail(), "file.txt")
-	}
-	if !strings.Contains(w.Detail(), "300") {
-		t.Errorf("warning detail %q should mention the length %d", w.Detail(), 300)
-	}
-
-	f := files["file.txt"]
-	if !f.BlobID.IsNull() {
-		t.Errorf("BlobID should be null for oversized blob_id, got %q", f.BlobID.ValueString())
-	}
-	// Probe treated as failure -> commitSHA fallback for LastCommitID.
-	if f.LastCommitID.ValueString() != "deadbeef" {
-		t.Errorf("LastCommitID = %q, want %q (commitSHA fallback)", f.LastCommitID.ValueString(), "deadbeef")
+			f := files["file.txt"]
+			if !f.BlobID.IsNull() {
+				t.Errorf("BlobID should be null for an oversized id, got %q", f.BlobID.ValueString())
+			}
+			// Probe treated as failure -> commitSHA fallback for LastCommitID.
+			if f.LastCommitID.ValueString() != "deadbeef" {
+				t.Errorf("LastCommitID = %q, want %q (commitSHA fallback)", f.LastCommitID.ValueString(), "deadbeef")
+			}
+		})
 	}
 }
 

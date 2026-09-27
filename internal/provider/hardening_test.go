@@ -5,6 +5,7 @@ package provider
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,6 +15,8 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
@@ -271,9 +274,9 @@ func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
 	}
 
 	t.Run("lock on forwards probed token", func(t *testing.T) {
-		actions, _, err := res.diffActions(t.Context(), plan(true), emptyState())
-		if err != nil {
-			t.Fatalf("diffActions: %v", err)
+		actions, _, diags := res.diffActions(t.Context(), plan(true), emptyState())
+		if diags.HasError() {
+			t.Fatalf("diffActions: %v", diags)
 		}
 		if len(actions) != 1 {
 			t.Fatalf("want 1 action, got %d", len(actions))
@@ -288,9 +291,9 @@ func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
 	})
 
 	t.Run("lock off omits token", func(t *testing.T) {
-		actions, _, err := res.diffActions(t.Context(), plan(false), emptyState())
-		if err != nil {
-			t.Fatalf("diffActions: %v", err)
+		actions, _, diags := res.diffActions(t.Context(), plan(false), emptyState())
+		if diags.HasError() {
+			t.Fatalf("diffActions: %v", diags)
 		}
 		if len(actions) != 1 {
 			t.Fatalf("want 1 action, got %d", len(actions))
@@ -349,9 +352,9 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	emptyState := filesResourceModel{Files: map[string]fileModel{}}
 
 	t.Run("mismatch adds chmod with lock token", func(t *testing.T) {
-		actions, _, err := res.diffActions(t.Context(), plan(true), emptyState)
-		if err != nil {
-			t.Fatalf("diffActions: %v", err)
+		actions, _, diags := res.diffActions(t.Context(), plan(true), emptyState)
+		if diags.HasError() {
+			t.Fatalf("diffActions: %v", diags)
 		}
 		if len(actions) != 2 {
 			t.Fatalf("want update+chmod, got %d actions", len(actions))
@@ -372,9 +375,9 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	})
 
 	t.Run("matching bit emits no chmod", func(t *testing.T) {
-		actions, _, err := res.diffActions(t.Context(), plan(false), emptyState)
-		if err != nil {
-			t.Fatalf("diffActions: %v", err)
+		actions, _, diags := res.diffActions(t.Context(), plan(false), emptyState)
+		if diags.HasError() {
+			t.Fatalf("diffActions: %v", diags)
 		}
 		if len(actions) != 1 {
 			t.Fatalf("want a single update, got %d actions", len(actions))
@@ -384,9 +387,9 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	t.Run("remote exec true plan false adds chmod false", func(t *testing.T) {
 		remoteExec = true
 		defer func() { remoteExec = false }()
-		actions, _, err := res.diffActions(t.Context(), plan(false), emptyState)
-		if err != nil {
-			t.Fatalf("diffActions: %v", err)
+		actions, _, diags := res.diffActions(t.Context(), plan(false), emptyState)
+		if diags.HasError() {
+			t.Fatalf("diffActions: %v", diags)
 		}
 		if len(actions) != 2 {
 			t.Fatalf("want update+chmod, got %d actions", len(actions))
@@ -396,4 +399,56 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 			t.Error("chmod must clear execute_filemode when the remote bit is set and the plan wants it off")
 		}
 	})
+}
+
+// TestTreeEntryWithoutPath: a tree listing that answers with a null entry or
+// an entry without a path fails the file it was listed for, in the one-entry
+// directory check and in the recursive listing of a directory turning into
+// a file alike, and nothing is committed. Read as "no directory" it would let
+// a create replace a directory; dereferenced it would panic the provider.
+func TestTreeEntryWithoutPath(t *testing.T) {
+	for _, body := range []string{`[null]`, `[{"path":"","type":"blob"}]`} {
+		for _, recursive := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s recursive %v", body, recursive), func(t *testing.T) {
+				var posts atomic.Int32
+				client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+					switch {
+					case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/branches/main"):
+						branchJSON(w, "main", "base")
+					case r.Method == http.MethodHead:
+						http.Error(w, "404 File Not Found", http.StatusNotFound)
+					case isTreeRequest(r) && recursive && r.URL.Query().Get("recursive") != "true":
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(`[{"path":"conf/app.yaml","type":"blob"}]`))
+					case isTreeRequest(r):
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(body))
+					case r.Method == http.MethodPost:
+						posts.Add(1)
+						http.Error(w, "unexpected commit", http.StatusInternalServerError)
+					default:
+						t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+						http.Error(w, "unexpected", http.StatusInternalServerError)
+					}
+				})
+				var diags diag.Diagnostics
+				if recursive {
+					diags = runUpdate(t, client, managedFiles(true, map[string]string{"conf": ""}),
+						managedFiles(true, map[string]string{"conf/app.yaml": "l1"})).Diagnostics
+				} else {
+					diags = runCreate(t, client, managedFiles(true, map[string]string{"conf": ""})).Diagnostics
+				}
+				wantDiag(t, "error", diags.Errors(), "GitLab returned a tree entry without a path")
+				if errs := diags.Errors(); len(errs) == 1 {
+					withPath, ok := errs[0].(diag.DiagnosticWithPath)
+					if !ok || !withPath.Path().Equal(path.Root("files").AtMapKey("conf")) {
+						t.Errorf("the error must point at files[\"conf\"], got %v", errs[0])
+					}
+				}
+				if posts.Load() != 0 {
+					t.Errorf("commits = %d, want none", posts.Load())
+				}
+			})
+		}
+	}
 }

@@ -28,10 +28,13 @@ branch of one project. The provider:
   silently rewritten from `create` to `update`, so the apply does not fail.
   A path whose content and mode already match the plan needs no action, so
   an apply that only adopts identical files makes no commit and leaves
-  `commit_sha` unset. When the branch does not exist yet and
+  `commit_sha` unset. A path that cannot be read for adoption fails the
+  apply before anything is committed. When the branch does not exist yet and
   `create_branch_from` is set, the branch is created from that ref in the
   same operation as the commit (one push event); with nothing to commit it is
-  created on its own.
+  created on its own. A branch name is resolved to its head commit first,
+  and the files are compared with that commit and the branch created from
+  it, even if the source branch moves in the meantime.
 - **Read** - probes each managed file via a HEAD-style metadata call
   (`GetFileMetaData`) and compares the GitLab-returned `blob_id` and exec
   bit with state. Only when the blob has actually drifted does it pull the
@@ -40,7 +43,8 @@ branch of one project. The provider:
 - **Update** - diffs plan vs state and emits the **minimum** set of actions:
   gone paths -> `delete` (emitted first), new paths -> `create`, or nothing
   when the path already exists with identical content, content changed ->
-  `update`, exec bit flipped -> `chmod`. If nothing changed, no commit is
+  `update`, exec bit flipped -> `chmod`. A file is never created where the
+  branch holds a directory (see Caveats). If nothing changed, no commit is
   produced. A delete or chmod that carries no lock token (for example with
   `optimistic_lock = false`) is probed first: a delete of a path that no
   longer holds a file is dropped, and a chmod of one fails. A delete of a
@@ -136,11 +140,11 @@ attribute on the provider block. In CI, prefer a CI variable such as
 | `commit_message` | string | yes | Used for any commit produced (create / update / destroy). |
 | `author_name` | string | no | Override commit author name. |
 | `author_email` | string | no | Override commit author email. |
-| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit, or on its own when there is nothing to commit. The branch is not deleted on destroy. |
+| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit, or on its own when there is nothing to commit. A branch name is resolved to its head commit once, when the resource is created. The branch is not deleted on destroy. |
 | `detect_drift` | bool | no | Default `true`. If false, Read is a no-op. |
 | `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. Read from the state of the last apply; see Caveats. |
-| `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist, or to no action when their content already matches (needed for clean import). |
-| `optimistic_lock` | bool | no | Default `true`. Send each file's `last_commit_id` so GitLab rejects concurrent updates with HTTP 400. Set to `false` to opt out. For the destroy commit, read from the state of the last apply. |
+| `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist, or to no action when their content already matches (needed for clean import). A path that cannot be read fails the apply without a commit. |
+| `optimistic_lock` | bool | no | Default `true`. Send each file's `last_commit_id` so GitLab rejects concurrent updates with HTTP 400. Set to `false` to opt out. Not sent on the first commit of a branch created from `create_branch_from`. For the destroy commit, read from the state of the last apply. |
 | `files` | map of object | yes | See below. Must not be empty: `files = {}` would mean "delete everything", which is what `terraform destroy` is for. |
 | `id` | string | computed | Composite identifier `<project_id>::<branch>`. |
 | `commit_sha` | string | computed | SHA of the most recent commit produced by this resource. |
@@ -328,7 +332,18 @@ converges without a commit.
   bot intentionally co-edits the same files); the trade-off is silent
   last-write-wins. Without the token the provider probes each path before a
   delete or chmod, because GitLab would apply the action to whatever sits at
-  the path, including a directory that replaced the file.
+  the path, including a directory that replaced the file. The first commit
+  of a branch created from `create_branch_from` carries no token: GitLab
+  would check it against the default branch instead of the commit the new
+  branch starts from, and that commit cannot change.
+- **A file never replaces a directory.** GitLab lets a created file replace
+  a directory at the same path together with everything in it, so a new
+  path where the branch holds a directory fails the apply without a commit.
+  The one exception is a directory holding only files the resource manages
+  and drops from `files` in the same apply: the commit deletes them first,
+  then creates the file. A new path also fails when another resource in the
+  same apply adds or adopts a file inside a directory of that name, even
+  one it has not committed yet.
 - **`commit_message` is per-apply**, not per-file. The same message is used
   for create / update / destroy commits. This is by design - one resource,
   one logical change, one message.

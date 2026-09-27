@@ -114,6 +114,42 @@ func TestAccFiles_addAndRemove(t *testing.T) {
 	})
 }
 
+// TestAccFiles_directoryToFile: a directory holding only managed files turns
+// into a file of the same name in one apply, since the commit deletes the
+// files before it creates the new one.
+func TestAccFiles_directoryToFile(t *testing.T) {
+	testAccPreCheck(t)
+
+	project := os.Getenv("GITLAB_TEST_PROJECT_ID")
+	branch := accBranch(t)
+	dir := accTestPathPrefix + "dir2file/conf"
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
+			accCheckFileGone(project, branch, dir),
+			accCheckFileGone(project, branch, dir+"/app.yaml"),
+		),
+		Steps: []resource.TestStep{
+			{
+				Config: accConfig(project, branch, map[string]string{
+					dir + "/app.yaml": "a\n",
+				}),
+				Check: accCheckFileExists(project, branch, dir+"/app.yaml"),
+			},
+			{
+				Config: accConfig(project, branch, map[string]string{
+					dir: "c\n",
+				}),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					accCheckFileExists(project, branch, dir),
+					accCheckFileGone(project, branch, dir+"/app.yaml"),
+				),
+			},
+		},
+	})
+}
+
 // TestAccFiles_import covers the round-trip: create files, drop the resource
 // from state, re-import, and verify a no-op plan.
 func TestAccFiles_import(t *testing.T) {

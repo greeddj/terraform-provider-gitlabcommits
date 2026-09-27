@@ -79,14 +79,14 @@ func deleteRequest(t *testing.T, res *filesResource, state filesResourceModel) (
 }
 
 // repoFake is a small stateful GitLab: files maps every path on the branch
-// to its last commit id. Like GitLab it answers a metadata probe from that
-// map and rejects with HTTP 400, landing nothing, a commit that creates an
-// existing path, or updates, deletes or chmods a missing one or with a stale
-// last_commit_id; an accepted commit is applied to the map. branchStatus,
-// commitStatus and probeStatus (per path) override the answers for GET
-// /branches/, a commit and a probe. Every file holds the content "x", which
-// a content fetch returns. Every project_id spelling reaches the same
-// branch; projects answers a project lookup with the numeric id for a
+// to its last commit id. Like GitLab it answers a metadata probe and a tree
+// listing from that map and rejects with HTTP 400, landing nothing, a commit
+// that creates an existing path, or updates, deletes or chmods a missing one
+// or with a stale last_commit_id; an accepted commit is applied to the map.
+// branchStatus, commitStatus and probeStatus (per path) override the answers
+// for GET /branches/, a commit and a probe. Every file holds the content
+// "x", which a content fetch returns. Every project_id spelling reaches the
+// same branch; projects answers a project lookup with the numeric id for a
 // spelling (projectStatus overrides it), and while it is nil a lookup is an
 // unexpected call. beforeCommit, when set, runs as a commit arrives and
 // before it is handled, without holding the fake's lock. Commits, probes
@@ -107,7 +107,12 @@ type repoFake struct {
 
 func (f *repoFake) client(t *testing.T) *gitlab.Client {
 	t.Helper()
-	return newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+	return newReadClient(t, f.handler(t))
+}
+
+// handler serves the fake, for a test that wraps it in a handler of its own.
+func (f *repoFake) handler(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && f.beforeCommit != nil {
 			f.beforeCommit()
 		}
@@ -139,6 +144,19 @@ func (f *repoFake) client(t *testing.T) *gitlab.Client {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(fileJSON(p, "blob-"+lcid, lcid, []byte("x")))
+		case isTreeRequest(r):
+			var entries []gitlab.TreeNode
+			for _, p := range slices.Sorted(maps.Keys(f.files)) {
+				if strings.HasPrefix(p, r.URL.Query().Get("path")+"/") {
+					entries = append(entries, gitlab.TreeNode{Path: p, Type: "blob"})
+				}
+			}
+			if len(entries) == 0 {
+				noDirectory(w)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(entries)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
 			if f.branchStatus != 0 {
 				http.Error(w, "branch lookup", f.branchStatus)
@@ -190,7 +208,19 @@ func (f *repoFake) client(t *testing.T) *gitlab.Client {
 			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
 			http.Error(w, "unexpected", http.StatusInternalServerError)
 		}
-	})
+	}
+}
+
+// isTreeRequest reports whether r lists a repository tree, which Create and
+// Update do for every path they create.
+func isTreeRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/repository/tree")
+}
+
+// noDirectory answers a tree listing as GitLab does for a path that is
+// missing or holds a file.
+func noDirectory(w http.ResponseWriter) {
+	http.Error(w, `{"message":"404 invalid revision or path Not Found"}`, http.StatusNotFound)
 }
 
 // rejection is GitLab's message for a commit it refuses, or "".
@@ -962,38 +992,29 @@ func TestUpdate_NoOpProducesNoCommit(t *testing.T) {
 // TestCreate_EmptyRepositoryDiagnostics: on a project with zero commits every
 // branch lookup 404s and no ref exists to branch from, so the usual "set
 // create_branch_from" advice is a dead end. Create must say what actually
-// helps, with or without create_branch_from configured.
+// helps, with or without create_branch_from configured, and commit nothing.
 func TestCreate_EmptyRepositoryDiagnostics(t *testing.T) {
-	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
-			http.Error(w, "no branch", http.StatusNotFound)
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":1,"empty_repo":true}`))
-		default:
-			http.Error(w, "unexpected call", http.StatusInternalServerError)
-		}
-	})
-
 	for _, withFrom := range []bool{false, true} {
-		plan := readState("blob")
-		if withFrom {
-			plan.CreateBranchFrom = types.StringValue("main")
-		}
-		resp := runCreate(t, client, plan)
-		if !resp.Diagnostics.HasError() {
-			t.Fatalf("withFrom=%v: expected an error on an empty repository", withFrom)
-		}
-		found := false
-		for _, d := range resp.Diagnostics.Errors() {
-			if strings.Contains(d.Detail(), "no commits") || strings.Contains(d.Summary(), "no commits") {
-				found = true
+		t.Run(fmt.Sprintf("create_branch_from set %v", withFrom), func(t *testing.T) {
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+					http.Error(w, "no branch", http.StatusNotFound)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
+					projectJSON(w, true)
+				default:
+					t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+					http.Error(w, "unexpected", http.StatusInternalServerError)
+				}
+			})
+
+			plan := readState("blob")
+			if withFrom {
+				plan.CreateBranchFrom = types.StringValue("main")
 			}
-		}
-		if !found {
-			t.Errorf("withFrom=%v: diagnostic must explain the repository has no commits, got: %v", withFrom, resp.Diagnostics.Errors())
-		}
+			resp := runCreate(t, client, plan)
+			wantDiag(t, "error", resp.Diagnostics.Errors(), "no commits")
+		})
 	}
 }
 
@@ -1010,6 +1031,8 @@ func TestCreate_HappyPathStampsState(t *testing.T) {
 		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "main":
 			// Adopt probe before the commit: path does not exist yet.
 			http.Error(w, "absent", http.StatusNotFound)
+		case isTreeRequest(r):
+			noDirectory(w)
 		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "newsha":
 			// stampBlobs probe at the created commit.
 			w.Header().Set("X-Gitlab-Blob-Id", "stampedblob")
@@ -1195,7 +1218,7 @@ func TestBranchHelpers(t *testing.T) {
 			_, _ = w.Write([]byte(`{"id":1,"empty_repo":true}`))
 		})
 		r := newTestResource(client)
-		err := r.missingBranchPreflight(t.Context(), "proj", "feature", "main")
+		_, err := r.missingBranchPreflight(t.Context(), "proj", "feature", "main")
 		if err == nil || !strings.Contains(err.Error(), "no commits") {
 			t.Fatalf("want the empty-repository diagnostic, got: %v", err)
 		}
@@ -1207,7 +1230,7 @@ func TestBranchHelpers(t *testing.T) {
 			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
 		})
 		r := newTestResource(client)
-		err := r.missingBranchPreflight(t.Context(), "proj", "feature", "")
+		_, err := r.missingBranchPreflight(t.Context(), "proj", "feature", "")
 		if err == nil || !strings.Contains(err.Error(), "create_branch_from") {
 			t.Fatalf("want the create_branch_from hint, got: %v", err)
 		}
@@ -1215,23 +1238,43 @@ func TestBranchHelpers(t *testing.T) {
 
 }
 
-// TestCreate_StartBranchRejectionNamesRef: when GitLab rejects the first
-// commit that was to materialise the branch, the diagnostic names the branch
-// and the create_branch_from ref, since that pairing is the usual culprit.
-func TestCreate_StartBranchRejectionNamesRef(t *testing.T) {
+// sourceHead is the head commit of create_branch_from = "main" in the fakes
+// of a missing target branch.
+const sourceHead = "5eed00000000000000000000000000000000a1a1"
+
+// branchJSON answers a branch lookup with the given head commit.
+func branchJSON(w http.ResponseWriter, name, head string) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(w, `{"name":%q,"commit":{"id":%q}}`, name, head)
+}
+
+// projectJSON answers the project lookup of the missing-branch preflight.
+func projectJSON(w http.ResponseWriter, empty bool) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(w, `{"id":1,"empty_repo":%t}`, empty)
+}
+
+// TestCreate_FirstCommitRejectionNamesRef: when GitLab rejects the first
+// commit that was to materialise the branch, the diagnostic names the branch,
+// the create_branch_from ref and the commit it resolved to, since that
+// pairing is the usual culprit.
+func TestCreate_FirstCommitRejectionNamesRef(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/branches/main"):
+			branchJSON(w, "main", sourceHead)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
 			http.Error(w, "no branch yet", http.StatusNotFound)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+			projectJSON(w, false)
 		case r.Method == http.MethodHead:
 			http.Error(w, "absent", http.StatusNotFound)
+		case isTreeRequest(r):
+			noDirectory(w)
 		case r.Method == http.MethodPost:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"message":"You can only create or edit files when you are on a branch"}`))
+			_, _ = w.Write([]byte(`{"message":"Push rule rejected the branch"}`))
 		default:
 			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
 			http.Error(w, "unexpected", http.StatusInternalServerError)
@@ -1240,54 +1283,45 @@ func TestCreate_StartBranchRejectionNamesRef(t *testing.T) {
 
 	plan := readState("ignored")
 	plan.Branch = types.StringValue("feature")
-	plan.CreateBranchFrom = types.StringValue("nope")
+	plan.CreateBranchFrom = types.StringValue("main")
 
 	resp := runCreate(t, client, plan)
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("expected the rejected first commit to fail Create")
 	}
 	summary := resp.Diagnostics.Errors()[0].Summary()
-	if !strings.Contains(summary, `creating branch "feature" from create_branch_from ref "nope"`) {
-		t.Errorf("summary must name the branch and ref, got: %q", summary)
+	if want := `creating branch "feature" from create_branch_from ref "main" at commit ` + sourceHead; !strings.Contains(summary, want) {
+		t.Errorf("summary must name the branch, ref and commit, got: %q", summary)
 	}
 }
 
 // TestCreate_AdoptsFromCreateBranchFromRef is the regression test for
 // adoption across branch materialisation: when the branch does not exist yet
-// and create_branch_from points at a ref that already contains a managed
-// path, the adopt probe must resolve against that source ref - the new
-// branch inherits the file, so a plain create would die with "already
-// exists". The branch itself is materialised by start_branch on the commit,
+// and create_branch_from points at a branch that already contains a managed
+// path, the adopt probe must resolve against that branch's head commit - the
+// new branch inherits the file, so a plain create would die with "already
+// exists". The branch itself is materialised by start_sha on the commit,
 // never by a separate branch-creation call.
 func TestCreate_AdoptsFromCreateBranchFromRef(t *testing.T) {
 	var commitBody string
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/branches/main"):
+			branchJSON(w, "main", sourceHead)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
 			http.Error(w, "no branch yet", http.StatusNotFound)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
-		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "main":
-			// The managed path already exists on the source ref.
-			w.Header().Set("X-Gitlab-Blob-Id", "srcblob")
-			w.Header().Set("X-Gitlab-Last-Commit-Id", "src-lcid")
-			w.Header().Set("X-Gitlab-File-Path", "f.txt")
-			w.Header().Set("X-Gitlab-Ref", "main")
-			w.Header().Set("X-Gitlab-Size", "3")
-			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
+			projectJSON(w, false)
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == sourceHead:
+			// The managed path already exists on the source branch.
+			metaHeaders(w, "srcblob", "src-lcid", false)
+		case r.Method == http.MethodGet && r.URL.Query().Get("ref") == sourceHead && strings.Contains(r.URL.Path, "/repository/files/"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(fileJSON("f.txt", "srcblob", "src-lcid", []byte("remote")))
 		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "absha":
-			w.Header().Set("X-Gitlab-Blob-Id", "stampedblob")
-			w.Header().Set("X-Gitlab-Last-Commit-Id", "absha")
-			w.Header().Set("X-Gitlab-File-Path", "f.txt")
-			w.Header().Set("X-Gitlab-Ref", "absha")
-			w.Header().Set("X-Gitlab-Size", "3")
-			w.WriteHeader(http.StatusOK)
+			stampHeaders(w, "absha")
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/branches"):
-			t.Error("the branch must be created by start_branch on the commit, not by a separate call")
+			t.Error("the branch must be created by start_sha on the commit, not by a separate call")
 			http.Error(w, "unexpected", http.StatusInternalServerError)
 		case r.Method == http.MethodPost:
 			b, _ := io.ReadAll(r.Body)
@@ -1309,14 +1343,11 @@ func TestCreate_AdoptsFromCreateBranchFromRef(t *testing.T) {
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
 	}
-	if !strings.Contains(commitBody, `"start_branch":"main"`) {
-		t.Errorf("the first commit must materialise the branch via start_branch, body: %s", commitBody)
+	if !strings.Contains(commitBody, `"start_sha":"`+sourceHead+`"`) || strings.Contains(commitBody, "start_branch") {
+		t.Errorf("the first commit must materialise the branch via start_sha at the resolved head, body: %s", commitBody)
 	}
 	if !strings.Contains(commitBody, `"action":"update"`) {
 		t.Errorf("inherited path must be adopted as an update, body: %s", commitBody)
-	}
-	if !strings.Contains(commitBody, `"last_commit_id":"src-lcid"`) {
-		t.Errorf("adopt-update must carry the source ref's lock token, body: %s", commitBody)
 	}
 }
 
@@ -1356,6 +1387,8 @@ func TestCreate_ExistingBranchSendsNoStartBranch(t *testing.T) {
 			http.Error(w, "absent", http.StatusNotFound)
 		case r.Method == http.MethodHead:
 			stampHeaders(w, "newsha")
+		case isTreeRequest(r):
+			noDirectory(w)
 		case r.Method == http.MethodPost:
 			b, _ := io.ReadAll(r.Body)
 			commitBody = string(b)
@@ -1363,7 +1396,8 @@ func TestCreate_ExistingBranchSendsNoStartBranch(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"id":"newsha"}`))
 		default:
-			w.WriteHeader(http.StatusOK)
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
 		}
 	})
 
@@ -1607,35 +1641,40 @@ func TestUpdate_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
 // TestCreate_ConcurrentBranchMaterialisationIsSerialised: several instances
 // creating on the same missing branch must not all try to materialise it.
 // Create holds the branch lock from the existence check through the commit,
-// so the first instance creates the branch with start_branch and the others
-// then see it and commit plainly.
+// so the first instance creates the branch with start_sha and the others
+// then see it, probe it again and commit plainly.
 func TestCreate_ConcurrentBranchMaterialisationIsSerialised(t *testing.T) {
 	var branchCreated atomic.Bool
-	var startBranchCommits, commits atomic.Int32
+	var startSHACommits, commits, branchProbes atomic.Int32
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/branches/main"):
+			branchJSON(w, "main", sourceHead)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
 			if !branchCreated.Load() {
 				http.Error(w, "no branch yet", http.StatusNotFound)
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"name":"feature","commit":{"id":"base"}}`))
+			branchJSON(w, "feature", "sha")
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+			projectJSON(w, false)
 		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "sha":
 			stampHeaders(w, "sha")
 		case r.Method == http.MethodHead:
+			if r.URL.Query().Get("ref") == "feature" {
+				branchProbes.Add(1)
+			}
 			http.Error(w, "absent", http.StatusNotFound)
+		case isTreeRequest(r):
+			noDirectory(w)
 		case r.Method == http.MethodPost:
 			b, _ := io.ReadAll(r.Body)
 			commits.Add(1)
-			if strings.Contains(string(b), `"start_branch"`) {
+			if strings.Contains(string(b), `"start_sha"`) {
 				if branchCreated.Swap(true) {
-					t.Error("start_branch sent for a branch that already exists")
+					t.Error("start_sha sent for a branch that already exists")
 				}
-				startBranchCommits.Add(1)
+				startSHACommits.Add(1)
 			} else if !branchCreated.Load() {
 				t.Error("plain commit attempted before the branch was materialised")
 			}
@@ -1643,7 +1682,8 @@ func TestCreate_ConcurrentBranchMaterialisationIsSerialised(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"id":"sha"}`))
 		default:
-			w.WriteHeader(http.StatusOK)
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
 		}
 	})
 	locks := newBranchLocks()
@@ -1664,11 +1704,14 @@ func TestCreate_ConcurrentBranchMaterialisationIsSerialised(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if got := startBranchCommits.Load(); got != 1 {
-		t.Errorf("start_branch commits = %d, want exactly 1", got)
+	if got := startSHACommits.Load(); got != 1 {
+		t.Errorf("start_sha commits = %d, want exactly 1", got)
 	}
 	if got := commits.Load(); got != 4 {
 		t.Errorf("commits = %d, want one per instance", got)
+	}
+	if got := branchProbes.Load(); got != 3 {
+		t.Errorf("probes of the branch = %d, want one per instance that found it created", got)
 	}
 }
 
@@ -1687,6 +1730,8 @@ func TestCreate_ConcurrentOnExistingBranchCommitsAreSerialised(t *testing.T) {
 			stampHeaders(w, "sha")
 		case r.Method == http.MethodHead:
 			http.Error(w, "absent", http.StatusNotFound)
+		case isTreeRequest(r):
+			noDirectory(w)
 		case r.Method == http.MethodPost:
 			posts.Add(1)
 			overlap.enter()
@@ -1726,18 +1771,22 @@ func TestCreate_ConcurrentOnExistingBranchCommitsAreSerialised(t *testing.T) {
 // TestCreate_ErrorInsideLockReleasesIt: Create returns from inside its
 // critical section when the branch re-check or the bare branch creation
 // fails, and the lock must be free afterwards, or every sibling on that
-// branch would wait until the apply is cancelled.
+// branch would wait until the apply is cancelled. f.txt exists at the
+// source, so no directory check adds a branch lookup before the lock.
 func TestCreate_ErrorInsideLockReleasesIt(t *testing.T) {
 	for _, identical := range []bool{false, true} {
 		name := "branch re-check fails"
+		remote := "remote"
 		if identical {
 			// Adoption leaves nothing to commit, so the branch is created bare.
-			name = "bare branch creation fails"
+			name, remote = "bare branch creation fails", "old"
 		}
 		t.Run(name, func(t *testing.T) {
 			var branchGets atomic.Int32
 			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/branches/main"):
+					branchJSON(w, "main", sourceHead)
 				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
 					if branchGets.Add(1) > 1 && !identical {
 						http.Error(w, "unavailable", http.StatusInternalServerError)
@@ -1747,13 +1796,11 @@ func TestCreate_ErrorInsideLockReleasesIt(t *testing.T) {
 				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
-				case r.Method == http.MethodHead && identical:
-					metaHeaders(w, "remoteblob", "remote-lcid", false)
 				case r.Method == http.MethodHead:
-					http.Error(w, "absent", http.StatusNotFound)
+					metaHeaders(w, "remoteblob", "remote-lcid", false)
 				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
 					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write(fileJSON("f.txt", "remoteblob", "remote-lcid", []byte("old")))
+					_, _ = w.Write(fileJSON("f.txt", "remoteblob", "remote-lcid", []byte(remote)))
 				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/branches"):
 					http.Error(w, "push rule", http.StatusForbidden)
 				default:
@@ -1769,6 +1816,9 @@ func TestCreate_ErrorInsideLockReleasesIt(t *testing.T) {
 			if resp := runCreateOn(t, res, plan); !resp.Diagnostics.HasError() {
 				t.Fatal("expected Create to fail")
 			}
+			if got := branchGets.Load(); got < 2 {
+				t.Fatalf("branch lookups = %d, want the failure under the lock", got)
+			}
 			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 			defer cancel()
 			release, err := res.locks.acquire(ctx, "proj", "feature")
@@ -1780,42 +1830,55 @@ func TestCreate_ErrorInsideLockReleasesIt(t *testing.T) {
 	}
 }
 
-// TestCreate_CommitSHASourceUsesStartSHA: the commits API separates
-// start_branch from start_sha, so a create_branch_from that is a full commit
-// SHA must travel as start_sha.
+// TestCreate_CommitSHASourceUsesStartSHA: a create_branch_from that is a
+// full commit SHA is used as it is, with no branch lookup, and travels as
+// start_sha. Gitaly takes only lowercase hex there, so an uppercase SHA is
+// lowercased, for the probes as well.
 func TestCreate_CommitSHASourceUsesStartSHA(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
-	var commitBody string
-	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
-			http.Error(w, "no branch yet", http.StatusNotFound)
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
-		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "newsha":
-			stampHeaders(w, "newsha")
-		case r.Method == http.MethodHead:
-			http.Error(w, "absent", http.StatusNotFound)
-		case r.Method == http.MethodPost:
-			b, _ := io.ReadAll(r.Body)
-			commitBody = string(b)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusCreated)
-			_, _ = w.Write([]byte(`{"id":"newsha"}`))
-		default:
-			w.WriteHeader(http.StatusOK)
-		}
-	})
+	for _, configured := range []string{sha, strings.ToUpper(sha)} {
+		t.Run(configured, func(t *testing.T) {
+			var commitBody string
+			var refs []string
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/branches/feature"):
+					http.Error(w, "no branch yet", http.StatusNotFound)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
+					projectJSON(w, false)
+				case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "newsha":
+					stampHeaders(w, "newsha")
+				case r.Method == http.MethodHead:
+					refs = append(refs, r.URL.Query().Get("ref"))
+					http.Error(w, "absent", http.StatusNotFound)
+				case isTreeRequest(r):
+					refs = append(refs, r.URL.Query().Get("ref"))
+					noDirectory(w)
+				case r.Method == http.MethodPost:
+					b, _ := io.ReadAll(r.Body)
+					commitBody = string(b)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(`{"id":"newsha"}`))
+				default:
+					t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+					http.Error(w, "unexpected", http.StatusInternalServerError)
+				}
+			})
 
-	plan := readState("ignored")
-	plan.Branch = types.StringValue("feature")
-	plan.CreateBranchFrom = types.StringValue(sha)
-	if resp := runCreate(t, client, plan); resp.Diagnostics.HasError() {
-		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
-	}
-	if !strings.Contains(commitBody, `"start_sha":"`+sha+`"`) || strings.Contains(commitBody, "start_branch") {
-		t.Errorf("a SHA source must be sent as start_sha only, body: %s", commitBody)
+			plan := readState("ignored")
+			plan.Branch = types.StringValue("feature")
+			plan.CreateBranchFrom = types.StringValue(configured)
+			if resp := runCreate(t, client, plan); resp.Diagnostics.HasError() {
+				t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+			if !strings.Contains(commitBody, `"start_sha":"`+sha+`"`) || strings.Contains(commitBody, "start_branch") {
+				t.Errorf("a SHA source must be sent as a lowercase start_sha only, body: %s", commitBody)
+			}
+			if want := []string{sha, sha}; !slices.Equal(refs, want) {
+				t.Errorf("probe refs = %q, want %q", refs, want)
+			}
+		})
 	}
 }
 
@@ -1846,11 +1909,14 @@ func TestCreate_CommitIsNotRetriedOn5xx(t *testing.T) {
 			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
 		case r.Method == http.MethodHead:
 			http.Error(w, "absent", http.StatusNotFound)
+		case isTreeRequest(r):
+			noDirectory(w)
 		case r.Method == http.MethodPost:
 			posts.Add(1)
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		default:
-			w.WriteHeader(http.StatusOK)
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
 		}
 	})
 
@@ -1961,6 +2027,8 @@ func TestCreate_AdoptIdenticalBesideNewPathCommitsOnlyTheNewPath(t *testing.T) {
 			metaHeaders(w, "remoteblob", "remote-lcid", false)
 		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "main":
 			http.Error(w, "absent", http.StatusNotFound)
+		case isTreeRequest(r) && !adopted:
+			noDirectory(w)
 		case r.Method == http.MethodGet && adopted:
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(fileJSON("a.txt", "remoteblob", "remote-lcid", []byte("same")))
@@ -2047,9 +2115,11 @@ func TestUpdate_AdoptIdenticalContentMakesNoCommit(t *testing.T) {
 // on the source ref plus a missing target branch means a bare branch
 // creation and no commit.
 func TestCreate_AdoptIdenticalOnMissingBranchCreatesBranchOnly(t *testing.T) {
-	var branchCreated atomic.Bool
+	var branchRef string
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/branches/main"):
+			branchJSON(w, "main", sourceHead)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
 			http.Error(w, "no branch yet", http.StatusNotFound)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
@@ -2061,7 +2131,11 @@ func TestCreate_AdoptIdenticalOnMissingBranchCreatesBranchOnly(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(fileJSON("f.txt", "srcblob", "src-lcid", []byte("old")))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/branches"):
-			branchCreated.Store(true)
+			var opts gitlab.CreateBranchOptions
+			if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
+				t.Errorf("decoding the branch body: %v", err)
+			}
+			branchRef = *opts.Ref
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"name":"feature","commit":{"id":"base"}}`))
@@ -2069,7 +2143,8 @@ func TestCreate_AdoptIdenticalOnMissingBranchCreatesBranchOnly(t *testing.T) {
 			t.Error("no commit expected when every file already matches")
 			http.Error(w, "unexpected", http.StatusInternalServerError)
 		default:
-			w.WriteHeader(http.StatusOK)
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
 		}
 	})
 
@@ -2080,22 +2155,23 @@ func TestCreate_AdoptIdenticalOnMissingBranchCreatesBranchOnly(t *testing.T) {
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
 	}
-	if !branchCreated.Load() {
-		t.Error("the branch must still be materialised when there is nothing to commit")
+	if branchRef != sourceHead {
+		t.Errorf("the branch must still be materialised, from the commit the probes read: ref = %q, want %q", branchRef, sourceHead)
 	}
 }
 
 // TestCreate_MissingBranchFailureMakesNoCommit: when the branch still has to
 // be materialised, a failed re-check under the lock or a failed bare branch
-// creation fails Create before any commit, and without state.
+// creation fails Create before any commit, and without state. f.txt exists
+// at the source, so no directory check adds a branch lookup before the lock.
 func TestCreate_MissingBranchFailureMakesNoCommit(t *testing.T) {
 	cases := []struct {
 		name string
-		// remoteContent is what the source ref holds for f.txt; "" means absent.
+		// remoteContent is what the source ref holds for f.txt.
 		remoteContent string
 		recheckStatus int
 	}{
-		{name: "re-check under the lock fails", recheckStatus: http.StatusForbidden},
+		{name: "re-check under the lock fails", remoteContent: "remote", recheckStatus: http.StatusForbidden},
 		{name: "bare branch creation fails", remoteContent: "old", recheckStatus: http.StatusNotFound},
 	}
 	for _, tc := range cases {
@@ -2103,6 +2179,8 @@ func TestCreate_MissingBranchFailureMakesNoCommit(t *testing.T) {
 			var branchGets atomic.Int32
 			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/branches/main"):
+					branchJSON(w, "main", sourceHead)
 				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
 					if branchGets.Add(1) == 1 {
 						http.Error(w, "no branch yet", http.StatusNotFound)
@@ -2112,8 +2190,6 @@ func TestCreate_MissingBranchFailureMakesNoCommit(t *testing.T) {
 				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
-				case r.Method == http.MethodHead && tc.remoteContent == "":
-					http.Error(w, "absent", http.StatusNotFound)
 				case r.Method == http.MethodHead:
 					metaHeaders(w, "srcblob", "src-lcid", false)
 				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
@@ -2137,13 +2213,17 @@ func TestCreate_MissingBranchFailureMakesNoCommit(t *testing.T) {
 			if !resp.State.Raw.IsNull() {
 				t.Errorf("a failed Create must return no state, got: %s", resp.State.Raw)
 			}
+			if got := branchGets.Load(); got < 2 {
+				t.Errorf("branch lookups = %d, want the failure under the lock", got)
+			}
 		})
 	}
 }
 
 // TestCreate_AdoptExistingFalseCreatesWithoutProbing: with adopt_existing
-// off, Create never probes the branch for existing paths; it sends a plain,
-// unlocked create and leaves an existing file to fail loudly at GitLab.
+// off, Create never probes the branch for existing files; it only checks
+// that no directory sits at the path, sends a plain, unlocked create and
+// leaves an existing file to fail loudly at GitLab.
 func TestCreate_AdoptExistingFalseCreatesWithoutProbing(t *testing.T) {
 	var body string
 	var committed atomic.Bool
@@ -2157,6 +2237,8 @@ func TestCreate_AdoptExistingFalseCreatesWithoutProbing(t *testing.T) {
 		case r.Method == http.MethodHead:
 			t.Errorf("adopt_existing = false must not probe the branch: %s?%s", r.URL.Path, r.URL.RawQuery)
 			metaHeaders(w, "remoteblob", "remote-lcid", false)
+		case isTreeRequest(r):
+			noDirectory(w)
 		case r.Method == http.MethodPost && !committed.Swap(true):
 			b, _ := io.ReadAll(r.Body)
 			body = string(b)
@@ -2236,14 +2318,18 @@ func TestUpdate_MixedActionsProduceExactlyOneCommit(t *testing.T) {
 	var posts atomic.Int32
 	var sent []string
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodHead:
+		switch {
+		case isTreeRequest(r):
+			noDirectory(w)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			branchJSON(w, "main", "head")
+		case r.Method == http.MethodHead:
 			if r.URL.Query().Get("ref") == "main" {
 				http.Error(w, "absent", http.StatusNotFound)
 				return
 			}
 			stampHeaders(w, "mixsha")
-		case http.MethodPost:
+		case r.Method == http.MethodPost:
 			posts.Add(1)
 			var opts gitlab.CreateCommitOptions
 			if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
@@ -2419,7 +2505,7 @@ func TestMissingBranchPreflight_ProjectErrors(t *testing.T) {
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no project", http.StatusNotFound)
 		})
-		err := newTestResource(client).missingBranchPreflight(t.Context(), "grp/porject", "main", "")
+		_, err := newTestResource(client).missingBranchPreflight(t.Context(), "grp/porject", "main", "")
 		if err == nil || !strings.Contains(err.Error(), `project "grp/porject" does not exist or the token cannot see it`) {
 			t.Fatalf("want the project diagnostic, got: %v", err)
 		}
@@ -2428,7 +2514,7 @@ func TestMissingBranchPreflight_ProjectErrors(t *testing.T) {
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "boom", http.StatusInternalServerError)
 		})
-		err := newTestResource(client).missingBranchPreflight(t.Context(), "proj", "main", "main")
+		_, err := newTestResource(client).missingBranchPreflight(t.Context(), "proj", "main", "main")
 		if err == nil || !strings.Contains(err.Error(), `checking project "proj"`) {
 			t.Fatalf("want a checking-project error, got: %v", err)
 		}
@@ -2438,8 +2524,9 @@ func TestMissingBranchPreflight_ProjectErrors(t *testing.T) {
 func TestAdoptAwareActions_EmptyLockTokenErrors(t *testing.T) {
 	f := fileModel{Content: types.StringValue("x"), ExecuteFilemode: types.BoolValue(false)}
 	probe := remoteProbe{exists: true}
-	if _, err := adoptAwareActions("f.txt", f, probe, true); err == nil || !strings.Contains(err.Error(), "optimistic_lock") {
-		t.Fatalf("a locked adoption without a token must fail, got: %v", err)
+	if _, err := adoptAwareActions("f.txt", f, probe, true); err == nil || !strings.Contains(err.Error(), "optimistic_lock") ||
+		strings.Contains(err.Error(), "= false") {
+		t.Fatalf("a locked adoption without a token must fail without advising to turn the lock off, got: %v", err)
 	}
 	actions, err := adoptAwareActions("f.txt", f, probe, false)
 	if err != nil || len(actions) != 1 || *actions[0].Action != gitlab.FileUpdate || actions[0].LastCommitID != nil {

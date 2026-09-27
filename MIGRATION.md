@@ -38,7 +38,8 @@ as the unit of state - which is what users actually want to manage.
    exists" errors. A path whose content and mode already match the rendered
    configuration needs no action at all, so a resource whose files all match
    the repository makes no commit; one with differing files pushes one
-   adoption commit carrying only those.
+   adoption commit carrying only those. A path that cannot be read stops
+   the apply before anything is committed, so re-running it is safe.
 5. **Inspect once** - run `terraform plan` again; it should report no
    changes.
 
