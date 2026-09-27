@@ -340,7 +340,7 @@ func updateRequest(t *testing.T, res *filesResource, plan, state filesResourceMo
 	sch := sresp.Schema
 
 	pl := tfsdk.Plan{Schema: sch}
-	planned := plannedModel(plan, false)
+	planned := plannedModel(plan, &state)
 	if d := pl.Set(ctx, &planned); d.HasError() {
 		t.Fatalf("plan.Set: %v", d)
 	}
@@ -375,7 +375,7 @@ func createRequest(t *testing.T, res *filesResource, plan filesResourceModel) (r
 	sch := sresp.Schema
 
 	pl := tfsdk.Plan{Schema: sch}
-	planned := plannedModel(plan, true)
+	planned := plannedModel(plan, nil)
 	if d := pl.Set(ctx, &planned); d.HasError() {
 		t.Fatalf("plan.Set: %v", d)
 	}
@@ -383,20 +383,40 @@ func createRequest(t *testing.T, res *filesResource, plan filesResourceModel) (r
 	return resource.CreateRequest{Plan: pl}, &resource.CreateResponse{State: tfsdk.State{Schema: sch, Raw: empty}}
 }
 
-// plannedModel returns m as the framework plans it: every Computed attribute
-// with no default and no configured value is unknown (known after apply),
-// except id on Update, which UseStateForUnknown keeps at its prior value.
-// The files map is copied, so a state model sharing it never sees the
-// unknowns.
-func plannedModel(m filesResourceModel, create bool) filesResourceModel {
+// plannedModel returns m as the framework plans it against prior, nil for a
+// Create: every Computed attribute with no default and no configured value
+// is unknown (known after apply), except what an Update plan keeps at its
+// prior value. That is id, through UseStateForUnknown, and, while project_id
+// and branch are unchanged, what ModifyPlan keeps: the blob_id and
+// last_commit_id of every file whose content, content_base64 and
+// execute_filemode equal prior's, and commit_sha when every file does and
+// the plan adds or removes none. The files map is copied, so a state model
+// sharing it never sees the unknowns.
+func plannedModel(m filesResourceModel, prior *filesResourceModel) filesResourceModel {
 	m.Files = maps.Clone(m.Files)
+	sameTarget := prior != nil && m.ProjectID.Equal(prior.ProjectID) && m.Branch.Equal(prior.Branch)
+	allKept := sameTarget && len(m.Files) == len(prior.Files)
 	for p, f := range m.Files {
-		f.BlobID = types.StringUnknown()
-		f.LastCommitID = types.StringUnknown()
+		var pf fileModel
+		kept := false
+		if sameTarget {
+			pf, kept = prior.Files[p]
+			kept = kept && f.Content.Equal(pf.Content) && f.ContentBase64.Equal(pf.ContentBase64) &&
+				f.ExecuteFilemode.Equal(pf.ExecuteFilemode)
+		}
+		if kept {
+			f.BlobID, f.LastCommitID = pf.BlobID, pf.LastCommitID
+		} else {
+			f.BlobID, f.LastCommitID = types.StringUnknown(), types.StringUnknown()
+			allKept = false
+		}
 		m.Files[p] = f
 	}
 	m.CommitSHA = types.StringUnknown()
-	if create {
+	if allKept {
+		m.CommitSHA = prior.CommitSHA
+	}
+	if prior == nil {
 		m.ID = types.StringUnknown()
 	}
 	return m
@@ -422,8 +442,9 @@ func checkCreateResult(t *testing.T, resp *resource.CreateResponse) {
 }
 
 // checkUpdateResult is the Update counterpart: success is a fully known
-// state, and failure leaves the prior state exactly as it was, since
-// anything else would record content that never landed.
+// state that keeps every value the plan already knew, and failure leaves the
+// prior state exactly as it was, since anything else would record content
+// that never landed.
 func checkUpdateResult(t *testing.T, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	t.Helper()
 	switch {
@@ -435,6 +456,27 @@ func checkUpdateResult(t *testing.T, req resource.UpdateRequest, resp *resource.
 		t.Error("a successful Update must return state")
 	case !resp.State.Raw.IsFullyKnown():
 		t.Errorf("Update returned state with unknown values: %s", resp.State.Raw)
+	default:
+		checkKeepsPlan(t, req.Plan.Raw, resp.State.Raw)
+	}
+}
+
+// checkKeepsPlan fails when applied differs from a value planned as known.
+// Terraform rejects that after apply, with the commit already landed, as
+// "Provider produced inconsistent result after apply"; an unknown planned
+// value may become anything. It only calls t.Error, so workers may use it.
+func checkKeepsPlan(t *testing.T, planned, applied tftypes.Value) {
+	t.Helper()
+	diffs, err := planned.Diff(applied)
+	if err != nil {
+		t.Errorf("comparing the applied state with the plan: %v", err)
+		return
+	}
+	for _, d := range diffs {
+		if d.Value1 != nil && !d.Value1.IsKnown() {
+			continue
+		}
+		t.Errorf("applied state changes a value the plan knew at %s: planned %v, applied %v", d.Path, d.Value1, d.Value2)
 	}
 }
 
@@ -2516,8 +2558,9 @@ func TestCreate_AdoptExistingFalseCreatesWithoutProbing(t *testing.T) {
 
 // TestUpdate_StampsOnlyTouchedPaths: after a commit that changed one of two
 // files, the untouched file keeps its state values and is never probed. The
-// plan carries its computed fields as unknown, so only carrying them over
-// from state can fill them.
+// untouched file switches to content_base64 of the same bytes, which needs
+// no action but which the plan leaves with its computed fields unknown, so
+// only carrying them over from state can fill them.
 func TestUpdate_StampsOnlyTouchedPaths(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -2542,6 +2585,7 @@ func TestUpdate_StampsOnlyTouchedPaths(t *testing.T) {
 	state := readState("oldblob")
 	state.Files["a.txt"] = untouched
 	plan := readState("oldblob")
+	untouched.Content, untouched.ContentBase64 = types.StringNull(), types.StringValue("c2FtZQ==")
 	plan.Files["a.txt"] = untouched
 	pf := plan.Files["f.txt"]
 	pf.Content = types.StringValue("changed")
@@ -2624,7 +2668,10 @@ func TestUpdate_MixedActionsProduceExactlyOneCommit(t *testing.T) {
 
 // TestUpdate_NoOpPreservesUnknownComputedFields drives the zero-action
 // branch with every computed field unknown, id included, and asserts state
-// ends up fully known and equal to the prior state.
+// ends up fully known with the prior computed values. The file switches to
+// content_base64 of the same bytes: that needs no action, but the plan
+// leaves its ids and commit_sha unknown, so only the zero-action branch can
+// fill them.
 func TestUpdate_NoOpPreservesUnknownComputedFields(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected API call %s %s for a no-op update", r.Method, r.URL.Path)
@@ -2633,6 +2680,9 @@ func TestUpdate_NoOpPreservesUnknownComputedFields(t *testing.T) {
 	state := readState("blob")
 	plan := readState("blob")
 	plan.ID = types.StringUnknown()
+	pf := plan.Files["f.txt"]
+	pf.Content, pf.ContentBase64 = types.StringNull(), types.StringValue("b2xk")
+	plan.Files["f.txt"] = pf
 
 	resp := runUpdate(t, client, plan, state)
 	if resp.Diagnostics.HasError() {

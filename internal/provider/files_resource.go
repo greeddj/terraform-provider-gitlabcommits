@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"slices"
@@ -18,6 +19,7 @@ import (
 	"sync/atomic"
 	"unicode/utf8"
 
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -27,6 +29,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 	"golang.org/x/sync/errgroup"
@@ -45,6 +48,7 @@ var (
 	_ resource.Resource                = &filesResource{}
 	_ resource.ResourceWithConfigure   = &filesResource{}
 	_ resource.ResourceWithImportState = &filesResource{}
+	_ resource.ResourceWithModifyPlan  = &filesResource{}
 )
 
 func NewFilesResource() resource.Resource {
@@ -417,8 +421,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Default:  booldefault.StaticBool(true),
 			},
 			"commit_sha": schema.StringAttribute{
-				Description: "SHA of the last commit produced by this resource.",
-				Computed:    true,
+				Description: "SHA of the last commit produced by this resource. A plan that adds and removes no file and " +
+					"leaves every file's content, content_base64 and execute_filemode as they are, all known at plan time, " +
+					"keeps it known, since the apply makes no commit.",
+				Computed: true,
 			},
 			"files": schema.MapNestedAttribute{
 				Description: "Map of repository_path -> file definition. The map key is the path inside the repo. " +
@@ -426,7 +432,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					"directory with everything in it; the one exception is a directory holding only files this resource " +
 					"manages and drops from the map in the same apply. A new path also fails when another resource in the " +
 					"same apply adds or adopts a file inside a directory of that name. An entry must not be null: omit the " +
-					"key to leave a file out.",
+					"key to leave a file out. A plan shows blob_id and last_commit_id as known after apply only for a file it " +
+					"adds, a file whose content, content_base64 or execute_filemode it changes (a switch between content and " +
+					"content_base64 of the same bytes included, though that commits nothing), and a file whose values are " +
+					"not known until apply.",
 				Required: true,
 				Validators: []validator.Map{
 					mapNonEmpty(),
@@ -501,6 +510,87 @@ func (r *filesResource) Configure(_ context.Context, req resource.ConfigureReque
 	r.client = deps.client
 	r.locks = deps.locks
 	r.retryCommits = deps.retryCommits
+}
+
+// ModifyPlan plans the computed values an apply keeps as they are. Once
+// anything in the resource changes, the framework plans every computed
+// attribute unknown, so a one-file edit would list every file as changing
+// and a commit_message edit would plan commit_sha unknown with no commit to
+// come. A file whose content, content_base64 and execute_filemode the plan
+// leaves as state has them (fileKept) keeps its blob_id and last_commit_id:
+// Update emits no action for it and carries both over from state
+// (carryOver). commit_sha is kept too when every file is kept and the plan
+// adds or removes none, since Update then makes no commit and keeps it.
+// Nothing else in the plan can make Update commit. Create, destroy, an
+// unknown files map and a changed or unknown project_id or branch (a
+// replacement, planned again as a create) keep the framework's unknowns.
+func (r *filesResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() || req.State.Raw.IsNull() {
+		return
+	}
+	var state filesResourceModel
+	var project, branch types.String
+	var files types.Map
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("project_id"), &project)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("branch"), &branch)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("files"), &files)...)
+	if resp.Diagnostics.HasError() || files.IsNull() || files.IsUnknown() ||
+		!project.Equal(state.ProjectID) || !branch.Equal(state.Branch) {
+		return
+	}
+
+	planned := files.Elements()
+	elems := make(map[string]attr.Value, len(planned))
+	allKept := len(planned) == len(state.Files)
+	for p, v := range planned {
+		elems[p] = v
+		sf, inState := state.Files[p]
+		obj, isObj := v.(types.Object)
+		if !inState || !isObj || !fileKept(ctx, obj, sf) {
+			allKept = false
+			continue
+		}
+		attrs := maps.Clone(obj.Attributes())
+		attrs["blob_id"] = sf.BlobID
+		attrs["last_commit_id"] = sf.LastCommitID
+		kept, diags := types.ObjectValue(obj.AttributeTypes(ctx), attrs)
+		resp.Diagnostics.Append(diags...)
+		elems[p] = kept
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	// One SetAttribute for the whole map: each call transforms the whole
+	// plan value, so one per file would be quadratic in the file count.
+	keptFiles, diags := types.MapValue(files.ElementType(ctx), elems)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("files"), keptFiles)...)
+	if allKept {
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("commit_sha"), state.CommitSHA)...)
+	}
+}
+
+// fileKept reports whether planned, an element of the planned files map,
+// holds exactly the content, content_base64 and execute_filemode prior
+// holds, null-ness included. Prior state holds no unknowns, so an unknown
+// planned value never passes. The test is stricter than contentChanged: a
+// switch between content and content_base64 of the same bytes is not kept,
+// though Update commits nothing for it, and stays unknown.
+func fileKept(ctx context.Context, planned types.Object, prior fileModel) bool {
+	if planned.IsNull() || planned.IsUnknown() {
+		return false
+	}
+	var pf fileModel
+	if planned.As(ctx, &pf, basetypes.ObjectAsOptions{}).HasError() {
+		return false
+	}
+	return pf.Content.Equal(prior.Content) &&
+		pf.ContentBase64.Equal(prior.ContentBase64) &&
+		pf.ExecuteFilemode.Equal(prior.ExecuteFilemode)
 }
 
 // Create pushes one commit that materialises every file in the plan. If

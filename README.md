@@ -54,7 +54,14 @@ branch of one project. The provider:
   `optimistic_lock = false`) is probed first: a delete of a path that no
   longer holds a file is dropped, and a chmod of one fails. A delete of a
   path another resource took over in the same apply is dropped as well (see
-  Caveats).
+  Caveats). The plan shows `blob_id` and `last_commit_id` as known after
+  apply only for the files the apply adds, whose `content`,
+  `content_base64` or `execute_filemode` it changes (switching between
+  `content` and `content_base64` of the same bytes included, though that
+  makes no commit) or whose values are not known until apply, and
+  `commit_sha` only when some file is one of those or is removed, so a
+  one-file edit lists one file, and an edit to `commit_message` alone shows
+  no computed value changing.
 - **Delete** - pushes one commit that removes every managed file. With
   `optimistic_lock` the commit goes out without probing: GitLab checks each
   file's `last_commit_id` itself and rejects the commit when a file was
@@ -152,7 +159,7 @@ attribute on the provider block. In CI, prefer a CI variable such as
 | `optimistic_lock` | bool | no | Default `true`. Send each managed file's `last_commit_id`, as the last refresh or apply recorded it (for a file the apply adopts, as its probe during the apply reads it), so GitLab rejects the commit with HTTP 400 and the apply fails when the file changed after that point; with `detect_drift = true` a change made before the plan's refresh shows up in the plan and is overwritten by applying it (see Caveats). Set to `false` to opt out. Not sent on the first commit of a branch created from `create_branch_from`. For the destroy commit, read from the state of the last apply. |
 | `files` | map of object | yes | See below. Must not be empty: `files = {}` would mean "delete everything", which is what `terraform destroy` is for. An entry must not be null; omit its key to leave a file out. |
 | `id` | string | computed | Composite identifier `<project_id>::<branch>`. |
-| `commit_sha` | string | computed | SHA of the most recent commit produced by this resource. |
+| `commit_sha` | string | computed | SHA of the most recent commit produced by this resource. A plan that adds and removes no file and leaves every file's `content`, `content_base64` and `execute_filemode` as they are (all known at plan time) keeps it known. |
 
 ### `files` entry
 
