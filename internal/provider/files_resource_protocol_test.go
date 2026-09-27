@@ -245,7 +245,9 @@ func TestPlannedModel_MatchesFramework(t *testing.T) {
 // TestFilesSchema_ProjectAndBranchRequireReplace: project_id and branch
 // select the repository location, so changing either must replace the
 // resource. As an in-place Update, diffActions compares only files and would
-// record the files on a branch that never received them.
+// record the files on a branch that never received them. A value unknown at
+// plan time counts as a change, as the attribute descriptions say: the plan
+// cannot promise an in-place update that may turn into a replacement.
 func TestFilesSchema_ProjectAndBranchRequireReplace(t *testing.T) {
 	cases := []struct {
 		change      func(*filesResourceModel)
@@ -255,6 +257,10 @@ func TestFilesSchema_ProjectAndBranchRequireReplace(t *testing.T) {
 		{name: "project_id", change: func(m *filesResourceModel) { m.ProjectID = types.StringValue("other") },
 			wantReplace: tftypes.NewAttributePath().WithAttributeName("project_id")},
 		{name: "branch", change: func(m *filesResourceModel) { m.Branch = types.StringValue("other") },
+			wantReplace: tftypes.NewAttributePath().WithAttributeName("branch")},
+		{name: "project_id unknown", change: func(m *filesResourceModel) { m.ProjectID = types.StringUnknown() },
+			wantReplace: tftypes.NewAttributePath().WithAttributeName("project_id")},
+		{name: "branch unknown", change: func(m *filesResourceModel) { m.Branch = types.StringUnknown() },
 			wantReplace: tftypes.NewAttributePath().WithAttributeName("branch")},
 		{name: "content only", change: func(m *filesResourceModel) {
 			f := m.Files["f.txt"]

@@ -43,7 +43,9 @@ branch of one project. The provider:
   `update`, exec bit flipped -> `chmod`. If nothing changed, no commit is
   produced. A delete or chmod that carries no lock token (for example with
   `optimistic_lock = false`) is probed first: a delete of a path that no
-  longer holds a file is dropped, and a chmod of one fails.
+  longer holds a file is dropped, and a chmod of one fails. A delete of a
+  path another resource took over in the same apply is dropped as well (see
+  Caveats).
 - **Delete** - pushes one commit that removes every managed file. With
   `optimistic_lock` the commit goes out without probing: GitLab checks each
   file's `last_commit_id` itself and rejects the commit when a file was
@@ -52,7 +54,8 @@ branch of one project. The provider:
   at most one commit. A file without a lock token is probed before the commit.
   Files already absent are skipped (idempotent against external cleanup), and
   a destroy that finds none left makes no commit and says so in a warning.
-  Disable with `delete_on_destroy = false`.
+  A file another resource created or adopted in the same apply is kept, with
+  a warning (see Caveats). Disable with `delete_on_destroy = false`.
 
 The composite ID is `<project_id>::<branch>`. Import with that format; the
 files map starts empty and is reconciled on the next plan + apply.
@@ -128,8 +131,8 @@ attribute on the provider block. In CI, prefer a CI variable such as
 
 | Argument | Type | Required | Description |
 | --- | --- | --- | --- |
-| `project_id` | string | yes | Numeric project ID or plain project path (`group/subgroup/project`, not URL-encoded). Changing it forces replacement; see Caveats. |
-| `branch` | string | yes | Target branch (must exist, or set `create_branch_from`). Changing it forces replacement; see Caveats. |
+| `project_id` | string | yes | Numeric project ID or plain project path (`group/subgroup/project`, not URL-encoded). Changing it, respelling it, or a value unknown at plan time forces replacement; see Caveats. |
+| `branch` | string | yes | Target branch (must exist, or set `create_branch_from`). Changing it, or a value unknown at plan time, forces replacement; see Caveats. |
 | `commit_message` | string | yes | Used for any commit produced (create / update / destroy). |
 | `author_name` | string | no | Override commit author name. |
 | `author_email` | string | no | Override commit author email. |
@@ -234,16 +237,81 @@ converges without a commit.
   one provider configuration, so the `for_each` layout above never hits that;
   each resource still lands exactly one commit. Two things stay outside that
   guarantee: resources sharing a branch must spell `project_id` the same way
-  (a numeric ID and a path are different lock keys), and a second provider
+  (a numeric ID and a path are different lock keys; changing the spelling of
+  an existing resource is a replacement, see below), and a second provider
   block (alias) runs in its own process. Any other writer (another pipeline,
   a manual push, an aliased provider) is reported as "Branch changed while
   the commit was being created" and you re-run the apply.
-- **Changing `branch` or `project_id` replaces the resource.** Replacement is
-  destroy-then-create, and with the default `delete_on_destroy = true` the
-  destroy pushes a commit deleting every managed file from the OLD branch
-  before the files are created on the new one. To re-point without emptying
-  the old branch, set `delete_on_destroy = false` and apply first, or use a
-  new resource address.
+- **Within one apply, a file handed from one resource to another is kept.**
+  Moving a file from one resource's `files` to another's on the same branch,
+  renaming a resource address without a `moved` block, and a replacement
+  under `create_before_destroy` all make one resource delete a path that
+  another creates or adopts in the same apply, and Terraform does not order
+  the delete before the adoption. The provider remembers, in memory and for
+  the length of the run, every path a resource creates or adopts (all of a
+  new resource's files, the files an update adds). Another resource's delete
+  of such a path is dropped with a warning naming it, and a resource that
+  takes a path over looks at the repository only after any delete commit
+  already in flight on the branch has landed. Either way the file ends up on
+  the branch and in the state of the resource that now manages it; the
+  one-commit-per-resource rule is unchanged.
+  - A claim under another spelling of the same project (numeric ID vs path),
+    as a respelled replacement makes, is recognised too. When a delete meets
+    a claim under another spelling, two numeric IDs are compared as numbers
+    and each path spelling is looked up once per run; that also happens for
+    another project that shares the branch name and the path (the same
+    `.gitlab-ci.yml` on `main` in several projects) when either is spelled
+    by path. If a lookup fails, the operation fails and commits nothing, and
+    the error says how to go on: when both spellings name the same project,
+    simply applying again would delete the file. The wait for a delete in
+    flight comes from the branch lock, so it still needs the same spelling.
+  - Not covered: other runs, and a second provider block (alias), which is
+    another process. So move a file in one apply: adding it to the new
+    resource in one apply and removing it from the old one in a later apply
+    makes the later apply delete it, and the new resource finds it missing
+    on its next refresh. A re-run of a failed apply is another run too: when
+    a resource left a file in place for another one and then failed (its
+    lookup or its commit), applying again retries that operation, which
+    then deletes the file. To keep it, remove the failed resource from state
+    (`terraform state rm <address>`, which also drops a replaced object
+    still waiting for its destroy and leaves every file in place), import
+    it again if the configuration still declares it, and apply.
+- **Changing `branch` or `project_id` replaces the resource**, and so do
+  respelling the same project (a numeric ID vs a path),
+  `terraform apply -replace`, `terraform taint` and `replace_triggered_by`.
+  A value that is unknown at plan time counts as a change: when `project_id`
+  or `branch` comes from a data source read during apply (a data source or
+  module with `depends_on`) or from an attribute of a resource being
+  replaced, Terraform plans `(known after apply) # forces replacement` even
+  if the final value is the same. Keep both known at plan time (literals,
+  variables, data sources without `depends_on`); if they cannot be, an
+  applied `delete_on_destroy = false` makes such a replacement commit-free,
+  since the destroy then leaves the files and the create adopts them.
+  - Without `create_before_destroy`, replacement is destroy-then-create: with
+    the default `delete_on_destroy = true` the destroy pushes a commit
+    deleting every managed file from the OLD target before the files are
+    created on the new one. On the same branch that is two commits with none
+    of the files in between, which a push-triggered pipeline or an ArgoCD
+    sync with `prune` can act on.
+  - Under `create_before_destroy` (set on this resource, or imposed by
+    Terraform when a resource that depends on it has it) the new object is
+    created first. On another branch or project the old files are then
+    deleted; on the same branch and project the new object adopts them
+    (without a commit when they already match) and the old object's destroy
+    leaves them in place.
+  - To re-point without a delete commit, set `delete_on_destroy = false` and
+    apply before changing the target, or hand the files over: drop the old
+    instance from state without destroying it, with a
+    `removed { from = <address> lifecycle { destroy = false } }` block
+    (Terraform 1.7+) or `terraform state rm <address>`, then declare the
+    resource for the new target; its first apply adopts matching files
+    without a commit. Renaming the resource address alone does not help:
+    without a `moved` block the old address is destroyed, and with one a
+    changed target is still a replacement. For a pure address refactor
+    (a renamed resource or `for_each` key) use
+    `moved { from = <old address> to = <new address> }`.
+  - Replacing is never needed to re-push files: with `detect_drift = true`
+    (default) a plain `terraform apply` already restores drifted files.
 - **`delete_on_destroy` and `optimistic_lock` apply as last applied.**
   Terraform does not evaluate configuration during `terraform destroy`, so the
   destroy commit uses the values recorded in state by the last apply. Change

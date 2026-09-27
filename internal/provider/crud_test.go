@@ -85,26 +85,40 @@ func deleteRequest(t *testing.T, res *filesResource, state filesResourceModel) (
 // last_commit_id; an accepted commit is applied to the map. branchStatus,
 // commitStatus and probeStatus (per path) override the answers for GET
 // /branches/, a commit and a probe. Every file holds the content "x", which
-// a content fetch returns. Commits and probes (metadata requests) are
-// recorded, accepted or not.
+// a content fetch returns. Every project_id spelling reaches the same
+// branch; projects answers a project lookup with the numeric id for a
+// spelling (projectStatus overrides it), and while it is nil a lookup is an
+// unexpected call. beforeCommit, when set, runs as a commit arrives and
+// before it is handled, without holding the fake's lock. Commits, probes
+// (metadata requests) and project lookups are recorded, accepted or not.
 type repoFake struct {
-	files        map[string]string
-	probeStatus  map[string]int
-	commits      [][]string
-	probes       []string
-	mu           sync.Mutex
-	branchStatus int
-	commitStatus int
+	files         map[string]string
+	probeStatus   map[string]int
+	projects      map[string]int64
+	beforeCommit  func()
+	commits       [][]string
+	probes        []string
+	lookups       []string
+	mu            sync.Mutex
+	branchStatus  int
+	commitStatus  int
+	projectStatus int
 }
 
 func (f *repoFake) client(t *testing.T) *gitlab.Client {
 	t.Helper()
 	return newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && f.beforeCommit != nil {
+			f.beforeCommit()
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		_, filePath, isFile := strings.Cut(r.URL.Path, "/repository/files/")
+		project, isProject := strings.CutPrefix(r.URL.Path, "/api/v4/projects/")
+		isProject = isProject && !strings.Contains(project, "/")
 		switch {
-		case r.Method == http.MethodHead:
-			p := strings.TrimPrefix(r.URL.Path, "/api/v4/projects/proj/repository/files/")
+		case r.Method == http.MethodHead && isFile:
+			p := filePath
 			f.probes = append(f.probes, p+"@"+r.URL.Query().Get("ref"))
 			if status := f.probeStatus[p]; status != 0 {
 				http.Error(w, "probe", status)
@@ -116,8 +130,8 @@ func (f *repoFake) client(t *testing.T) *gitlab.Client {
 				return
 			}
 			metaHeaders(w, "blob-"+lcid, lcid, false)
-		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
-			p := strings.TrimPrefix(r.URL.Path, "/api/v4/projects/proj/repository/files/")
+		case r.Method == http.MethodGet && isFile:
+			p := filePath
 			lcid, ok := f.files[p]
 			if !ok {
 				http.Error(w, "404 File Not Found", http.StatusNotFound)
@@ -132,6 +146,18 @@ func (f *repoFake) client(t *testing.T) *gitlab.Client {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"head"}}`))
+		case r.Method == http.MethodGet && isProject && f.projects != nil:
+			f.lookups = append(f.lookups, project)
+			id, ok := f.projects[project]
+			switch {
+			case f.projectStatus != 0:
+				http.Error(w, "project lookup", f.projectStatus)
+			case !ok:
+				http.Error(w, "404 Project Not Found", http.StatusNotFound)
+			default:
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"id":%d}`, id)
+			}
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/commits"):
 			var opts gitlab.CreateCommitOptions
 			if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
@@ -196,6 +222,13 @@ func (f *repoFake) recorded() (commits [][]string, probes []string, files map[st
 	probes = slices.Clone(f.probes)
 	slices.Sort(probes)
 	return slices.Clone(f.commits), probes, maps.Clone(f.files)
+}
+
+// projectLookups returns the project lookups made so far, in order.
+func (f *repoFake) projectLookups() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.lookups)
 }
 
 // describeActions renders actions as "<action>:<path>", plus "@<token>" when

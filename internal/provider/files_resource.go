@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -56,10 +57,11 @@ type filesResource struct {
 }
 
 // resourceDeps is what the provider hands every resource through
-// ResourceData: the shared client, the per-branch commit locks shared by all
-// resource instances in this process, and whether the commit request may be
-// retried at all (false when max_retries = 0: a per-request retry policy
-// would otherwise bypass client-go's WithoutRetries).
+// ResourceData: the shared client, the per-branch commit locks and path
+// claims shared by all resource instances in this process, and whether the
+// commit request may be retried at all (false when max_retries = 0: a
+// per-request retry policy would otherwise bypass client-go's
+// WithoutRetries).
 type resourceDeps struct {
 	client       *gitlab.Client
 	locks        *branchLocks
@@ -67,20 +69,84 @@ type resourceDeps struct {
 }
 
 // branchLocks serialises commits per (project, branch) within one provider
-// process. Terraform applies resource instances concurrently (-parallelism),
-// and two CreateCommit calls racing on the same branch tip make GitLab reject
-// the loser with "reference update: reference does not point to expected
-// object"; holding the branch lock around the commit removes that race
-// without merging or splitting commits, so every resource still lands exactly
-// one. Writers outside this process are not covered and surface through
-// apiErrorDiag.
+// process and records the paths resources claim there. Terraform applies
+// resource instances concurrently (-parallelism), and two CreateCommit calls
+// racing on the same branch tip make GitLab reject the loser with "reference
+// update: reference does not point to expected object"; holding the branch
+// lock around the commit removes that race without merging or splitting
+// commits, so every resource still lands exactly one. Writers outside this
+// process are not covered and surface through apiErrorDiag.
+//
+// A claim is a path a resource creates or adopts: Create claims every path
+// it manages, Update the paths it adds. One apply can hand a path from one
+// resource to another (a file moved between two bundles, an address renamed
+// without a moved block, a replacement under create_before_destroy), and
+// Terraform runs the giver's delete and the receiver's adoption either
+// unordered or, under create_before_destroy, adoption first; an adoption of
+// identical content makes no commit, so the delete would still land on its
+// old last_commit_id. So the giver leaves out the delete of a claimed path
+// (commitLocked), and the receiver probes only after passing through the
+// branch lock once (claimPaths): a delete commit already in flight lands
+// before the probe, and any later one sees the claim. Claims live in memory
+// for the life of the process and are never released; a failed Create keeps
+// its claim, so the file stays, which is the safe direction. A later run, a
+// re-run of a failed apply included, cannot see them. projectIDs caches the
+// numeric ID behind each project_id path spelling, looked up only when a
+// claim and a delete meet on one branch and path under different spellings
+// (an all-digit spelling is its own ID).
 type branchLocks struct {
-	locks map[string]chan struct{}
-	mu    sync.Mutex
+	locks      map[string]chan struct{}
+	claims     map[claimKey]map[string]bool
+	projectIDs map[string]int64
+	mu         sync.Mutex
+}
+
+// claimKey is a path on a branch; claims maps it to the project_id
+// spellings it was claimed under.
+type claimKey struct {
+	branch, path string
 }
 
 func newBranchLocks() *branchLocks {
-	return &branchLocks{locks: map[string]chan struct{}{}}
+	return &branchLocks{
+		locks:      map[string]chan struct{}{},
+		claims:     map[claimKey]map[string]bool{},
+		projectIDs: map[string]int64{},
+	}
+}
+
+// claim records paths as claimed on (project, branch).
+func (b *branchLocks) claim(project, branch string, paths []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, p := range paths {
+		k := claimKey{branch: branch, path: p}
+		if b.claims[k] == nil {
+			b.claims[k] = map[string]bool{}
+		}
+		b.claims[k][project] = true
+	}
+}
+
+// claimants returns the project_id spellings path is claimed under on
+// branch, sorted.
+func (b *branchLocks) claimants(branch, path string) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return sortedKeys(b.claims[claimKey{branch: branch, path: path}])
+}
+
+func (b *branchLocks) projectID(project string) (int64, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	id, ok := b.projectIDs[project]
+	return id, ok
+}
+
+func (b *branchLocks) setProjectID(project string, id int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.projectIDs[project] = id
 }
 
 // acquire blocks until the (project, branch) lock is free or ctx is done and
@@ -103,6 +169,20 @@ func (b *branchLocks) acquire(ctx context.Context, project, branch string) (func
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// claimPaths records paths as claimed on (project, branch), then takes the
+// branch lock and releases it at once, so a delete commit another resource
+// has in flight on the branch lands before the caller probes the paths, and
+// a delete that takes the lock afterwards sees the claim.
+func (b *branchLocks) claimPaths(ctx context.Context, project, branch string, paths []string) error {
+	b.claim(project, branch, paths)
+	release, err := b.acquire(ctx, project, branch)
+	if err != nil {
+		return err
+	}
+	release()
+	return nil
 }
 
 // isCommitSHA reports whether s is a full SHA-1 or SHA-256 hex object id, the
@@ -155,7 +235,12 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"(typically per service) so each apply produces exactly one commit per service. " +
 			"Commits are serialised per branch within one provider configuration, so for_each resources sharing one " +
 			"branch never race on its tip, and the commit request is retried only on HTTP 429, never on 5xx, " +
-			"so one apply can never land two commits.",
+			"so one apply can never land two commits. Within one run of one provider configuration, no resource " +
+			"deletes a file on its branch after another resource created or adopted it there: that delete is dropped " +
+			"with a warning, so a file can move from one resource to another in one apply, and a replacement under " +
+			"create_before_destroy keeps the files the new object took over. A delete commit already in flight is " +
+			"waited for only when both resources spell project_id the same way. Later runs are not covered, a re-run " +
+			"of a failed apply included.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Description: "Composite identifier: \"<project_id>::<branch>\".",
@@ -166,8 +251,14 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			},
 			"project_id": schema.StringAttribute{
 				Description: "Numeric project ID or the plain project path (e.g. \"group/subgroup/project\"); do not URL-encode it, " +
-					"the provider escapes it. Changing it forces replacement: with the default delete_on_destroy = true the " +
-					"replacement first pushes a commit deleting every managed file from the old project and branch.",
+					"the provider escapes it. Changing it forces replacement, and so do respelling the same project (numeric ID " +
+					"vs path) and a value that is unknown at plan time, even one that turns out unchanged. Without " +
+					"create_before_destroy the old object is destroyed first: with the default delete_on_destroy = true that " +
+					"pushes a commit deleting every managed file from the old project and branch before they are created again. " +
+					"Under create_before_destroy the new object is created first, and when it targets the same project and " +
+					"branch (a respelling, or a value that turned out unchanged) the old object's destroy leaves in place " +
+					"every file the new object adopted or wrote. Keep it known at plan time (literals, variables), or apply " +
+					"delete_on_destroy = false first, which makes such a replacement commit-free.",
 				Required: true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
@@ -184,8 +275,13 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			},
 			"branch": schema.StringAttribute{
 				Description: "Target branch. Must already exist, or set create_branch_from to materialise it. " +
-					"Changing it forces replacement: with the default delete_on_destroy = true the replacement first pushes " +
-					"a commit deleting every managed file from the old branch before creating them on the new one.",
+					"Changing it forces replacement, and so does a value that is unknown at plan time, even one that turns " +
+					"out unchanged. Without create_before_destroy the old object is destroyed first: with the default " +
+					"delete_on_destroy = true that pushes a commit deleting every managed file from the old branch before " +
+					"they are created on the new one. Under create_before_destroy the new object is created first, and when " +
+					"the branch is in fact unchanged the old object's destroy leaves in place every file the new object " +
+					"adopted or wrote. Keep it known at plan time (literals, variables), or apply delete_on_destroy = false " +
+					"first, which makes such a replacement commit-free.",
 				Required: true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
@@ -226,7 +322,8 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"delete_on_destroy": schema.BoolAttribute{
 				Description: "If true (default), terraform destroy creates one commit that removes every managed file. " +
 					"Files already removed out of band are skipped; when none is left, destroy makes no commit and says " +
-					"so in a warning. Set to false to keep files in place when the resource is removed from state. " +
+					"so in a warning. A file another gitlabcommits_files resource adopted or wrote in the same run is kept, " +
+					"with a warning naming it. Set to false to keep files in place when the resource is removed from state. " +
 					"Terraform does not evaluate configuration during destroy, so this value is read from the state " +
 					"written by the last apply: a change made in HCL must be applied before terraform destroy honours it.",
 				Optional: true,
@@ -350,7 +447,10 @@ func (r *filesResource) Configure(_ context.Context, req resource.ConfigureReque
 
 // Create pushes one commit that materialises every file in the plan. If
 // adopt_existing is true (default), pre-existing paths are rewritten from
-// "create" to "update" so we don't fail with "file already exists".
+// "create" to "update" so we don't fail with "file already exists". Every
+// path is claimed before it is probed (see branchLocks), so no other
+// resource in this run deletes a file Create adopted or wrote, short of a
+// delete commit already in flight under another project_id spelling.
 func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan filesResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -384,6 +484,10 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 	}
 
 	paths := sortedKeys(plan.Files)
+	if err := r.locks.claimPaths(ctx, project, branch, paths); err != nil {
+		resp.Diagnostics.AddError("Cancelled while waiting for the branch lock", err.Error())
+		return
+	}
 	useLock := plan.optimisticLock()
 	// Adoption must be resolved against what the target branch will actually
 	// contain: the branch itself when it exists, otherwise the ref it is
@@ -413,9 +517,13 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 	// materialising the same branch must see each other's work, or the
 	// second one would try to create a branch that by then exists. The
 	// checks and probes above only read, so they ran unlocked; the branch is
-	// re-checked here. Probes taken against create_branch_from stay valid
-	// when the branch appeared meanwhile: it was created from that ref, and
-	// another instance's files are never this resource's paths.
+	// re-checked here. Probes of an existing target branch stay valid
+	// meanwhile as far as this process goes: they ran after the pass through
+	// the lock in claimPaths, so a delete commit of these paths by another
+	// resource had already landed, and a later one leaves the claimed paths
+	// alone. Probes of create_branch_from, taken while the branch is missing,
+	// read another branch, which the claims on this one do not cover; a
+	// branch that appeared meanwhile was created from that ref.
 	release, lockErr := r.locks.acquire(ctx, project, branch)
 	if lockErr != nil {
 		resp.Diagnostics.AddError("Cancelled while waiting for the branch lock", lockErr.Error())
@@ -729,7 +837,9 @@ func (e *pathError) Unwrap() error { return e.err }
 
 // Update reconciles plan vs state by emitting only the actions that are
 // actually needed (create / update / delete / chmod) and pushing them as one
-// commit. If nothing changed, no commit is produced.
+// commit. If nothing changed, no commit is produced. The paths it adds are
+// claimed before they are probed, and a delete of a path another resource
+// in this run claimed is left out (see branchLocks).
 func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state filesResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -737,37 +847,52 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	project := plan.ProjectID.ValueString()
+	branch := plan.Branch.ValueString()
+
+	if added := addedPaths(plan, state); len(added) > 0 {
+		if err := r.locks.claimPaths(ctx, project, branch, added); err != nil {
+			resp.Diagnostics.AddError("Cancelled while waiting for the branch lock", err.Error())
+			return
+		}
+	}
 
 	actions, probes, err := r.diffActions(ctx, plan, state)
 	if err != nil {
 		resp.Diagnostics.AddError("Error building actions", err.Error())
 		return
 	}
-	actions, _, diags := r.probeUnguarded(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), actions, probes, "before the update commit")
+	actions, _, diags := r.probeUnguarded(ctx, project, branch, actions, probes, "before the update commit")
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
+	var commit *gitlab.Commit
+	if len(actions) > 0 {
+		tflog.Debug(ctx, "Updating GitLab files commit", map[string]any{
+			"project_id": project,
+			"branch":     branch,
+			"actions":    len(actions),
+		})
+		commit, actions, diags, err = r.commitLocked(ctx, plan, actions)
+		resp.Diagnostics.Append(diags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if err != nil {
+			resp.Diagnostics.AddError(commitErrorDiag("pushing update commit", project, branch, err))
+			return
+		}
+	}
+
 	if len(actions) == 0 {
-		// Nothing to commit: keep computed fields from state, or from the
+		// Nothing was committed: keep computed fields from state, or from the
 		// adopt probe for paths that turned out to already match.
 		carryOver(plan.Files, state.Files, probes, nil)
 		plan.CommitSHA = state.CommitSHA
 		plan.ID = state.ID
 		resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
-		return
-	}
-
-	tflog.Debug(ctx, "Updating GitLab files commit", map[string]any{
-		"project_id": plan.ProjectID.ValueString(),
-		"branch":     plan.Branch.ValueString(),
-		"actions":    len(actions),
-	})
-
-	commit, err := r.commitLocked(ctx, plan, actions)
-	if err != nil {
-		resp.Diagnostics.AddError(commitErrorDiag("pushing update commit", plan.ProjectID.ValueString(), plan.Branch.ValueString(), err))
 		return
 	}
 	// See Create: a JSON-null body decodes to a nil *Commit with no error.
@@ -779,16 +904,16 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 
 	touched := touchedPaths(actions)
 	carryOver(plan.Files, state.Files, probes, touched)
-	resp.Diagnostics.Append(r.stampBlobs(ctx, plan.ProjectID.ValueString(), plan.Files, commit.ID, touched)...)
+	resp.Diagnostics.Append(r.stampBlobs(ctx, project, plan.Files, commit.ID, touched)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 	plan.CommitSHA = types.StringValue(commit.ID)
-	plan.ID = types.StringValue(buildID(plan.ProjectID.ValueString(), plan.Branch.ValueString()))
+	plan.ID = types.StringValue(buildID(project, branch))
 
 	tflog.Info(ctx, "GitLab files commit pushed", map[string]any{
-		"project_id": plan.ProjectID.ValueString(),
-		"branch":     plan.Branch.ValueString(),
+		"project_id": project,
+		"branch":     branch,
 		"commit_sha": commit.ID,
 		"actions":    len(actions),
 	})
@@ -804,7 +929,8 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 // nothing. Only a rejection (HTTP 400, or 404 when the project itself is
 // gone) makes Delete probe the paths and retry once without the ones
 // already gone, so at most one commit lands. A delete without a token is
-// probed up front (see probeUnguarded). Disabled by setting
+// probed up front (see probeUnguarded). A path another resource in this run
+// adopted or wrote is left in place (see branchLocks). Disabled by setting
 // delete_on_destroy = false.
 func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state filesResourceModel
@@ -841,12 +967,13 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 		return
 	}
 	if len(actions) == 0 {
-		resp.Diagnostics.AddWarning(nothingDeleted(project, branch, branchFound))
+		resp.Diagnostics.AddWarning(nothingDeleted(project, branch, branchFound, false))
 		return
 	}
 
-	_, err := r.commitLocked(ctx, state, actions)
-	if err == nil {
+	_, sent, diags, err := r.commitLocked(ctx, state, actions)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() || err == nil {
 		return
 	}
 	// GitLab answers a 400 (a file changed, removed or replaced out of band,
@@ -859,8 +986,8 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 		return
 	}
 
-	paths := make([]string, 0, len(actions))
-	for _, a := range actions {
+	paths := make([]string, 0, len(sent))
+	for _, a := range sent {
 		paths = append(paths, *a.FilePath)
 	}
 	absent, branchFound, diags := r.absentPaths(ctx, project, branch, paths, "after GitLab rejected the destroy commit")
@@ -874,24 +1001,32 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 		resp.Diagnostics.AddError(apiErrorDiag("pushing destroy commit", project, branch, err))
 		return
 	}
-	actions = withoutPaths(actions, absent)
+	keptForOthers := len(sent) < len(actions)
+	actions = withoutPaths(sent, absent)
 	if len(actions) == 0 {
-		resp.Diagnostics.AddWarning(nothingDeleted(project, branch, branchFound))
+		resp.Diagnostics.AddWarning(nothingDeleted(project, branch, branchFound, keptForOthers))
 		return
 	}
-	if _, err = r.commitLocked(ctx, state, actions); err != nil {
+	_, _, diags, err = r.commitLocked(ctx, state, actions)
+	resp.Diagnostics.Append(diags...)
+	if err != nil {
 		resp.Diagnostics.AddError(commitErrorDiag("pushing destroy commit without the files already gone", project, branch, err))
 	}
 }
 
 // nothingDeleted is the warning for a destroy that found every managed file
-// already gone and so made no commit.
-func nothingDeleted(project, branch string, branchFound bool) (string, string) {
+// already gone and so made no commit. keptForOthers says some were never
+// looked for, since they were left in place for another resource.
+func nothingDeleted(project, branch string, branchFound, keptForOthers bool) (string, string) {
+	lead := ""
+	if keptForOthers {
+		lead = "apart from the files left in place for another resource, "
+	}
 	if branchFound {
-		return "Nothing left to delete", fmt.Sprintf("none of the managed files exists on branch %q in project %q any more "+
+		return "Nothing left to delete", lead + fmt.Sprintf("none of the managed files exists on branch %q in project %q any more "+
 			"(removed out of band), so destroy made no commit", branch, project)
 	}
-	return "Nothing left to delete", fmt.Sprintf("no managed file is visible on branch %q in project %q, and neither is the branch "+
+	return "Nothing left to delete", lead + fmt.Sprintf("no managed file is visible on branch %q in project %q, and neither is the branch "+
 		"(deleted out of band, project removed, or the token lost access; GitLab answers 404 for all three), so destroy made "+
 		"no commit. If the token lost access, the files may still exist in the repository.", branch, project)
 }
@@ -980,13 +1115,7 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 	// would dominate the apply latency.
 	var probes map[string]remoteProbe
 	if plan.adoptExisting() {
-		var newPaths []string
-		for _, p := range sortedKeys(plan.Files) {
-			if _, ok := state.Files[p]; !ok {
-				newPaths = append(newPaths, p)
-			}
-		}
-		if len(newPaths) > 0 {
+		if newPaths := addedPaths(plan, state); len(newPaths) > 0 {
 			probes = r.probeRemote(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), newPaths, true)
 		}
 	}
@@ -1037,6 +1166,18 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 	}
 
 	return actions, probes, nil
+}
+
+// addedPaths lists, sorted, the paths the plan manages and state does not:
+// the paths an Update creates or adopts.
+func addedPaths(plan, state filesResourceModel) []string {
+	var added []string
+	for _, p := range sortedKeys(plan.Files) {
+		if _, ok := state.Files[p]; !ok {
+			added = append(added, p)
+		}
+	}
+	return added
 }
 
 // touchedPaths is the set of paths a commit's actions write to; every other
@@ -1322,15 +1463,146 @@ var errLockWait = errors.New("cancelled while waiting for the branch lock")
 
 // commitLocked lands actions as one commit while holding the branch lock, so
 // resource instances sharing a branch never race on its tip, and releases
-// the lock before it returns: whatever follows only reads.
-func (r *filesResource) commitLocked(ctx context.Context, m filesResourceModel, actions []*gitlab.CommitActionOptions) (*gitlab.Commit, error) {
-	release, err := r.locks.acquire(ctx, m.ProjectID.ValueString(), m.Branch.ValueString())
+// the lock before it returns: whatever follows only reads. Under the lock it
+// first leaves out the deletes of paths another resource in this process
+// has claimed (withoutClaimedDeletes); outside it, a resource could claim
+// and probe a path between that check and the commit. sent is what went
+// out, and when it is empty nothing was sent. diags carries a warning per
+// delete left out, or the error that stopped the commit before it was sent.
+func (r *filesResource) commitLocked(
+	ctx context.Context,
+	m filesResourceModel,
+	actions []*gitlab.CommitActionOptions,
+) (commit *gitlab.Commit, sent []*gitlab.CommitActionOptions, diags diag.Diagnostics, err error) {
+	project, branch := m.ProjectID.ValueString(), m.Branch.ValueString()
+	release, err := r.locks.acquire(ctx, project, branch)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", errLockWait, err)
+		return nil, nil, nil, fmt.Errorf("%w: %w", errLockWait, err)
 	}
 	defer release()
-	commit, _, err := r.client.Commits.CreateCommit(m.ProjectID.ValueString(), commitOptions(m, actions), r.commitRequestOptions(ctx)...)
-	return commit, err
+	sent, diags = r.withoutClaimedDeletes(ctx, project, branch, actions)
+	if diags.HasError() || len(sent) == 0 {
+		return nil, nil, diags, nil
+	}
+	commit, _, err = r.client.Commits.CreateCommit(project, commitOptions(m, sent), r.commitRequestOptions(ctx)...)
+	return commit, sent, diags, err
+}
+
+// withoutClaimedDeletes returns actions without the deletes of paths that
+// another resource in this process has claimed on branch, with a warning for
+// each. A resource never blocks its own deletes: it claims only paths it
+// adds, and those are never among the paths it deletes in the same
+// operation.
+func (r *filesResource) withoutClaimedDeletes(
+	ctx context.Context,
+	project, branch string,
+	actions []*gitlab.CommitActionOptions,
+) ([]*gitlab.CommitActionOptions, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	kept := make([]*gitlab.CommitActionOptions, 0, len(actions))
+	for _, a := range actions {
+		if *a.Action != gitlab.FileDelete {
+			kept = append(kept, a)
+			continue
+		}
+		p := *a.FilePath
+		claimedAs, err := r.claimedUnder(ctx, project, branch, p)
+		switch {
+		case err != nil:
+			diags.AddError("Cannot tell whether another resource owns a file",
+				fmt.Sprintf("%q on branch %q is to be deleted through project_id %q, and another gitlabcommits_files "+
+					"resource in this run adopted or wrote that path through project_id %q. Whether the two name the same "+
+					"project is unknown: looking them up failed (%s), so nothing was committed. If they name different "+
+					"projects, apply again. If they name the same project, do not simply apply again: a later run cannot "+
+					"see this run's claim and would delete the file the other resource now manages. Remove this resource "+
+					"from state instead (terraform state rm <address>, which also drops a replaced object still waiting "+
+					"for its destroy and leaves every file in place), import it again with terraform import if the "+
+					"configuration still declares it, and then apply.",
+					p, branch, project, claimedAs, err))
+			return nil, diags
+		case claimedAs == "":
+			kept = append(kept, a)
+		case claimedAs == project:
+			diags.AddWarning("File left in place for another resource",
+				fmt.Sprintf("another gitlabcommits_files resource in this run adopted or wrote %q on branch %q of project %q, "+
+					"so it was not deleted; it now belongs to that resource.", p, branch, project))
+		default:
+			diags.AddWarning("File left in place for another resource",
+				fmt.Sprintf("another gitlabcommits_files resource in this run adopted or wrote %q on branch %q through "+
+					"project_id %q, the same project as %q, so it was not deleted; it now belongs to that resource.",
+					p, branch, claimedAs, project))
+		}
+	}
+	return kept, diags
+}
+
+// claimedUnder returns the project_id spelling under which a resource in
+// this process claimed filePath on branch of project, or "" when none did. A
+// claim under another spelling counts when both name the same project; that
+// takes one GetProject per path spelling, made only then and cached for the
+// process. A failed lookup is an error, returned with the spelling it was
+// comparing against, since neither deleting the file nor keeping it would be
+// known to be right.
+func (r *filesResource) claimedUnder(ctx context.Context, project, branch, filePath string) (string, error) {
+	claimants := r.locks.claimants(branch, filePath)
+	if slices.Contains(claimants, project) {
+		return project, nil
+	}
+	for _, other := range claimants {
+		same, err := r.sameProject(ctx, project, other)
+		if err != nil {
+			return other, err
+		}
+		if same {
+			return other, nil
+		}
+	}
+	return "", nil
+}
+
+// sameProject reports whether two project_id spellings name one project, by
+// the numeric ID GitLab returns for each.
+func (r *filesResource) sameProject(ctx context.Context, a, b string) (bool, error) {
+	idA, err := r.projectNumericID(ctx, a)
+	if err != nil {
+		return false, err
+	}
+	idB, err := r.projectNumericID(ctx, b)
+	if err != nil {
+		return false, err
+	}
+	return idA == idB, nil
+}
+
+// projectNumericID resolves a project_id spelling to the project's numeric
+// ID, once per process. An all-digit spelling is that ID already: GitLab
+// resolves an all-digit project_id by ID (a project path always holds a
+// slash), so it needs no request, and "0123" is project 123.
+func (r *filesResource) projectNumericID(ctx context.Context, project string) (int64, error) {
+	if id, ok := allDigitProjectID(project); ok {
+		return id, nil
+	}
+	if id, ok := r.locks.projectID(project); ok {
+		return id, nil
+	}
+	proj, _, err := r.client.Projects.GetProject(project, nil, gitlab.WithContext(ctx))
+	if err != nil {
+		return 0, fmt.Errorf("looking up project %q: %w", project, err)
+	}
+	if proj == nil || proj.ID == 0 {
+		return 0, fmt.Errorf("looking up project %q: GitLab returned no project id", project)
+	}
+	r.locks.setProjectID(project, proj.ID)
+	return proj.ID, nil
+}
+
+// allDigitProjectID parses a project_id made of ASCII digits only.
+func allDigitProjectID(project string) (int64, bool) {
+	if project == "" || strings.ContainsFunc(project, func(c rune) bool { return c < '0' || c > '9' }) {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(project, 10, 64)
+	return id, err == nil
 }
 
 // commitErrorDiag is apiErrorDiag for an error from commitLocked.

@@ -35,10 +35,10 @@ as the unit of state - which is what users actually want to manage.
    `gitlabcommits_files` resource the provider does a preflight
    `GetFileMetaData` per path and rewrites `create` to `update` for
    already-existing paths, so the apply converges without "file already
-   exists" errors. Note that this first apply pushes **one adoption commit
-   per resource** (its updates simply re-write the same bytes when the
-   rendered content already matches the repo); only subsequent applies with
-   no changes produce zero commits.
+   exists" errors. A path whose content and mode already match the rendered
+   configuration needs no action at all, so a resource whose files all match
+   the repository makes no commit; one with differing files pushes one
+   adoption commit carrying only those.
 5. **Inspect once** - run `terraform plan` again; it should report no
    changes.
 
@@ -88,8 +88,9 @@ resource "gitlabcommits_files" "frontend" {
 }
 ```
 
-The first apply after the migration produces one adoption commit per
-resource; every later apply with no changes produces zero commits.
+The first apply after the migration produces at most one adoption commit per
+resource, none for a resource whose files already match the repository;
+every later apply with no changes produces zero commits.
 
 ## `blob_id` is now opaque
 
