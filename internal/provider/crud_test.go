@@ -663,6 +663,9 @@ func TestCommitErrors_UnrefreshedStateNote(t *testing.T) {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(c.status)
 					_, _ = w.Write([]byte(c.body))
+				case http.MethodGet:
+					// An Update looks the branch up after a 400.
+					branchJSON(w, "main", "head")
 				default:
 					t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
 					http.Error(w, "unexpected", http.StatusInternalServerError)
@@ -694,6 +697,67 @@ func TestCommitErrors_UnrefreshedStateNote(t *testing.T) {
 				if !strings.Contains(detail, w) {
 					t.Errorf("detail must mention %q, got: %s", w, detail)
 				}
+			}
+		})
+	}
+}
+
+// TestUpdate_BranchGoneBeforeCommit: a branch deleted after the plan (a
+// merge request merged with its source branch deleted) makes GitLab refuse
+// the commit with a 400 that names no branch. Update looks the branch up and
+// says the branch is gone, that nothing was committed, and how to recover,
+// which depends on the detect_drift value state records.
+func TestUpdate_BranchGoneBeforeCommit(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stale=%v", stale), func(t *testing.T) {
+			fake := &repoFake{files: map[string]string{"f.txt": "oldlcid"}, branchStatus: http.StatusNotFound}
+			plan, state := changedPlan()
+			state.DetectDrift = types.BoolValue(!stale)
+			plan.DetectDrift = types.BoolValue(!stale)
+
+			resp := runUpdate(t, fake.client(t), plan, state)
+
+			errs := resp.Diagnostics.Errors()
+			if len(errs) != 1 || errs[0].Summary() != "Branch no longer exists" {
+				t.Fatalf("want one \"Branch no longer exists\" error, got %v", resp.Diagnostics)
+			}
+			recovery := "Run terraform apply again"
+			if stale {
+				recovery = "detect_drift is false in this resource's state, so a refresh keeps the resource as it is: " +
+					"set detect_drift = true with `files` as last applied and apply (this makes no commit), then put " +
+					"your change back in `files` and plan again"
+			}
+			for _, want := range []string{`branch "main" no longer exists in project "proj"`, "nothing was committed",
+				"removes the resource from state", "create_branch_from", recovery} {
+				if !strings.Contains(errs[0].Detail(), want) {
+					t.Errorf("detail must mention %q, got: %s", want, errs[0].Detail())
+				}
+			}
+			if commits, _, _ := fake.recorded(); len(commits) != 1 {
+				t.Errorf("commits sent = %d, want the one GitLab refused", len(commits))
+			}
+		})
+	}
+}
+
+// TestUpdate_BranchLookupFailsAfterRejectedCommit: when the branch lookup
+// that follows a 400 on the update commit fails itself, nothing says the
+// branch is gone, so the commit's own diagnostic is reported rather than
+// "Branch no longer exists" and its recreate advice.
+func TestUpdate_BranchLookupFailsAfterRejectedCommit(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			fake := &repoFake{files: map[string]string{"f.txt": "otherlcid"}, branchStatus: status}
+			plan, state := changedPlan()
+
+			resp := runUpdate(t, fake.client(t), plan, state)
+
+			errs := resp.Diagnostics.Errors()
+			if len(errs) != 1 || errs[0].Summary() != "Concurrent modification detected (optimistic_lock)" {
+				t.Fatalf("want the commit's lock-conflict error, got %v", resp.Diagnostics)
+			}
+			if commits, _, _ := fake.recorded(); len(commits) != 1 {
+				t.Errorf("commits sent = %d, want the one GitLab refused", len(commits))
 			}
 		})
 	}

@@ -333,6 +333,14 @@ converges without a commit.
   Terraform does not evaluate configuration during `terraform destroy`, so the
   destroy commit uses the values recorded in state by the last apply. Change
   the flag in HCL, run `terraform apply`, then destroy.
+- **A branch deleted out of band is recreated.** When the branch is gone
+  (for example deleted when its merge request was merged), a refresh
+  removes the resource from state and the next apply creates it again,
+  materialising the branch from `create_branch_from`. When the branch goes
+  between the plan and the apply, the commit fails with "Branch no longer
+  exists" and nothing is committed; applying again recovers. With
+  `detect_drift = false` recorded in state, catch up first as the next
+  point describes.
 - **`detect_drift` applies as last applied, too.** With
   `detect_drift = false` a refresh leaves state as the last apply left it.
   A refresh is handed the state, not the configuration, so it reads the

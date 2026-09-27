@@ -1077,6 +1077,15 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 			return
 		}
 		if err != nil {
+			// GitLab answers a commit to a branch that no longer exists with a
+			// 400 whose text names no branch; a lookup tells that case apart
+			// from the other rejections.
+			if hasStatus(err, http.StatusBadRequest) {
+				if found, checkErr := r.branchExists(ctx, project, branch); checkErr == nil && !found {
+					resp.Diagnostics.AddError("Branch no longer exists", branchGoneDetail(state, project, branch))
+					return
+				}
+			}
 			summary, detail := commitErrorDiag("pushing update commit", project, branch, err)
 			resp.Diagnostics.AddError(summary, detail+unrefreshedNote(state, err, false))
 			return
@@ -1212,6 +1221,23 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 		summary, detail := commitErrorDiag("pushing destroy commit without the files already gone", project, branch, err)
 		resp.Diagnostics.AddError(summary, detail+unrefreshedNote(state, err, true))
 	}
+}
+
+// branchGoneDetail explains an Update commit that GitLab refused because the
+// branch is gone, and how to recover: once a refresh has found the branch
+// gone it removes the resource from state, and the next apply creates it
+// again. A refresh while state records detect_drift = false leaves state as
+// it is, so the value has to be recorded first.
+func branchGoneDetail(state filesResourceModel, project, branch string) string {
+	lead := fmt.Sprintf("branch %q no longer exists in project %q (deleted out of band, for example by merging a merge "+
+		"request that deletes its source branch), so GitLab refused the commit and nothing was committed. ", branch, project)
+	recreate := "the refresh finds the branch gone and removes the resource from state, and the apply then creates it " +
+		"again, materialising the branch from create_branch_from (set it if the resource has none)."
+	if state.detectDrift() {
+		return lead + "Run terraform apply again: " + recreate
+	}
+	return lead + "detect_drift is false in this resource's state, so a refresh keeps the resource as it is: " +
+		recordDetectDrift + replanWithChange + ": " + recreate
 }
 
 // nothingDeleted is the warning for a destroy that found every managed file
