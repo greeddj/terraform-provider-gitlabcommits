@@ -250,7 +250,8 @@ converges without a commit.
   an existing resource is a replacement, see below), and a second provider
   block (alias) runs in its own process. Any other writer (another pipeline,
   a manual push, an aliased provider) is reported as "Branch changed while
-  the commit was being created" and you re-run the apply.
+  the commit was being created" and you re-run the apply; if that repeats on
+  every run, look for a tag with the branch's name (see Limits).
 - **Within one apply, a file handed from one resource to another is kept.**
   Moving a file from one resource's `files` to another's on the same branch,
   renaming a resource address without a `moved` block, and a replacement
@@ -417,6 +418,17 @@ converges without a commit.
   and apply (this makes no commit), then put the change back in `files` and
   plan. A destroy can simply be run again, since files already deleted are
   skipped.
+- **A branch that shares its name with a tag is not supported.** GitLab
+  resolves the bare name to the tag first, and the provider, like GitLab's
+  commits API, names the branch that way. File reads (refreshes, adoption,
+  the probes before a delete) then see the tag's files, so a destroy can
+  leave in place files the tag does not hold, and GitLab checks each commit
+  against the tag: `last_commit_id` against its history, and the branch tip
+  it expects against the tagged commit, so every commit to the branch fails
+  unless the tag points at the branch tip. Such a failure reads as "Branch
+  changed while the commit was being created" or "Concurrent modification
+  detected", and both diagnostics say how to check for the tag
+  (`git ls-remote <remote> refs/tags/<branch>`). Rename or delete the tag.
 
 ## Development
 

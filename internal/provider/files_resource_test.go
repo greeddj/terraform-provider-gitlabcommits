@@ -669,7 +669,9 @@ func TestApiErrorDiag(t *testing.T) {
 			err: mkErr(400,
 				"The file has changed since you started editing it: config/app.yaml", nil),
 			wantSummary: "Concurrent modification detected (optimistic_lock)",
-			contains:    []string{"refresh-only"},
+			// GitLab checks last_commit_id against the bare branch name,
+			// which resolves to a tag of the same name first.
+			contains: []string{"refresh-only", `tag named "main"`, "refs/tags/main", "checks last_commit_id"},
 		},
 		{
 			// Verbatim single-file Files API / web editor message.
@@ -700,7 +702,10 @@ func TestApiErrorDiag(t *testing.T) {
 			name:        "400-ref-race",
 			err:         mkErr(400, "9:reference update: reference does not point to expected object.", nil),
 			wantSummary: "Branch changed while the commit was being created",
-			contains:    []string{"another writer", "re-run terraform apply"},
+			// GitLab takes the branch tip it expects from the bare name,
+			// which resolves to a tag of the same name first, so the
+			// rejection then repeats on every run.
+			contains: []string{"another writer", "re-run terraform apply", `tag named "main"`, "refs/tags/main", "every commit to the branch is refused"},
 		},
 		{
 			name: "409-conflict", err: mkErr(409, "last commit changed", nil),

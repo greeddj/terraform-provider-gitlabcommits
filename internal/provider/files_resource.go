@@ -2070,6 +2070,16 @@ func isLockConflict(err error) bool {
 		strings.Contains(lower, "has changed since")
 }
 
+// tagShadowHint names the other cause of a rejection that reads like
+// another writer's: a tag with the branch's name. GitLab resolves the bare
+// name to the tag first, and its commits API checks a commit against the
+// branch by that bare name; when names that check and what then fails.
+func tagShadowHint(branch, when string) string {
+	return fmt.Sprintf("check whether a tag named %q exists (`git ls-remote <remote> refs/tags/%s`, or the project's "+
+		"Code > Tags page): GitLab resolves the bare branch name to that tag when it %s until the tag is renamed or "+
+		"deleted. A branch that shares its name with a tag is not supported.", branch, branch, when)
+}
+
 // branchExists reports whether branch is present, distinguishing a genuine
 // 404 from transport/auth failures.
 func (r *filesResource) branchExists(ctx context.Context, project, branch string) (bool, error) {
@@ -2422,20 +2432,24 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			if isLockConflict(err) {
 				summary = "Concurrent modification detected (optimistic_lock)"
 				return summary, fmt.Sprintf("%s: a file was modified by someone else since this resource last touched it. "+
-					"Run `terraform apply -refresh-only` to pull current state, then re-plan. Body: %s", prefix, body)
+					"Run `terraform apply -refresh-only` to pull current state, then re-plan. If nobody else touched it, %s "+
+					"Body: %s", prefix, tagShadowHint(branch, "checks last_commit_id, so the check fails"), body)
 			}
 			// Gitaly refuses to move the ref when the branch tip changed between
 			// reading it and writing the commit: "reference update: reference
 			// does not point to expected object". Commits are serialised per
 			// branch inside this process, so this means a writer outside this
-			// terraform run.
+			// terraform run, or a tag of the same name: GitLab takes the tip it
+			// expects from the bare branch name, which resolves to the tag.
 			if strings.Contains(strings.ToLower(resp.Message), "expected object") {
 				summary = "Branch changed while the commit was being created"
 				return summary, fmt.Sprintf("%s: another writer pushed to the branch while GitLab was building this commit, "+
 					"so the ref update was refused and nothing was committed. This provider serialises its own commits per "+
 					"branch within one provider configuration (each provider block runs in its own process), so the other "+
 					"writer is another process: a different pipeline, a manual push, a bot, or a second provider block "+
-					"(alias) targeting the same branch. Wait for it to finish and re-run terraform apply. Body: %s", prefix, body)
+					"(alias) targeting the same branch. Wait for it to finish and re-run terraform apply. If this happens "+
+					"on every run with no other writer, %s Body: %s", prefix,
+					tagShadowHint(branch, "computes the branch tip it expects, so every commit to the branch is refused"), body)
 			}
 			return summary, fmt.Sprintf("%s: HTTP %d. Body: %s", prefix, status, body)
 		case 413:
