@@ -5,6 +5,7 @@ package provider
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -58,5 +59,34 @@ func TestBranchHeadDataSource_HappyPath(t *testing.T) {
 	}
 	if out.CommitSHA.ValueString() != "abc123" || !out.Protected.ValueBool() {
 		t.Errorf("commit_sha/protected = %q/%v, want abc123/true", out.CommitSHA.ValueString(), out.Protected.ValueBool())
+	}
+}
+
+// TestBranchHeadDataSource_NotFound: a 404 maps to the dedicated diagnostic
+// that names the branch. client-go answers every 404 with one shared error
+// before it reads the body, so a project the token cannot see looks exactly
+// like a missing branch, and the detail must not claim more than that.
+func TestBranchHeadDataSource_NotFound(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"404 Project Not Found"}`))
+	})
+
+	resp, _ := runBranchHeadDataSourceRead(t, client)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an error for a missing branch")
+	}
+	d := resp.Diagnostics.Errors()[0]
+	if got := d.Summary(); got != "Branch not found" {
+		t.Errorf("summary = %q, want %q", got, "Branch not found")
+	}
+	for _, want := range []string{
+		`branch "main" in project "proj" was not found`,
+		"the token cannot see the project",
+	} {
+		if !strings.Contains(d.Detail(), want) {
+			t.Errorf("detail %q does not contain %q", d.Detail(), want)
+		}
 	}
 }

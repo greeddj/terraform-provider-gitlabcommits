@@ -85,19 +85,33 @@ func TestFileDataSource_HappyPath(t *testing.T) {
 	}
 }
 
-// TestFileDataSource_NotFound: a 404 maps to the dedicated friendly
-// diagnostic, not a generic API error.
+// TestFileDataSource_NotFound: a 404 maps to the dedicated diagnostic that
+// names the file, not a generic API error. client-go answers every 404 with
+// one shared error before it reads the body, so a project the token cannot
+// see looks exactly like a missing file, and the detail must not claim more
+// than that.
 func TestFileDataSource_NotFound(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "gone", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"404 Project Not Found"}`))
 	})
 
 	resp, _ := runFileDataSourceRead(t, client)
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("expected an error for a missing file")
 	}
-	if got := resp.Diagnostics.Errors()[0].Summary(); got != "File not found" {
+	d := resp.Diagnostics.Errors()[0]
+	if got := d.Summary(); got != "File not found" {
 		t.Errorf("summary = %q, want %q", got, "File not found")
+	}
+	for _, want := range []string{
+		`file "f.bin" at ref "main" in project "proj" was not found`,
+		"the token cannot see the project",
+	} {
+		if !strings.Contains(d.Detail(), want) {
+			t.Errorf("detail %q does not contain %q", d.Detail(), want)
+		}
 	}
 }
 

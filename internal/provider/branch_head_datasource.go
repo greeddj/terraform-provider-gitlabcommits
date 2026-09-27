@@ -86,7 +86,8 @@ func (d *branchHeadDataSource) Read(ctx context.Context, req datasource.ReadRequ
 	if err != nil {
 		if errors.Is(err, gitlab.ErrNotFound) {
 			resp.Diagnostics.AddError("Branch not found",
-				fmt.Sprintf("branch %q does not exist in project %q", branch, project))
+				fmt.Sprintf("branch %q in project %q was not found: the branch or the project does not exist, "+
+					"or the token cannot see the project (GitLab answers 404 for missing access as well)", branch, project))
 			return
 		}
 		summary, detail := apiErrorDiag("reading branch", project, branch, err)

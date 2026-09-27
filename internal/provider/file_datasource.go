@@ -126,7 +126,8 @@ func (d *fileDataSource) Read(ctx context.Context, req datasource.ReadRequest, r
 	if err != nil {
 		if errors.Is(err, gitlab.ErrNotFound) {
 			resp.Diagnostics.AddError("File not found",
-				fmt.Sprintf("file %q on branch %q in project %q does not exist", path, branch, project))
+				fmt.Sprintf("file %q at ref %q in project %q was not found: the file, the ref or the project does not exist, "+
+					"or the token cannot see the project (GitLab answers 404 for missing access as well)", path, branch, project))
 			return
 		}
 		summary, detail := apiErrorDiag(fmt.Sprintf("reading file %q", path), project, branch, err)
