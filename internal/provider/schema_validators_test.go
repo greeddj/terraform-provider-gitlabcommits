@@ -66,8 +66,8 @@ func TestStringConflictsWithSibling(t *testing.T) {
 }
 
 // TestObjectFileContentRequired: a file object with neither content nor
-// content_base64 is rejected at validate time; setting either one passes; an
-// unknown value defers rather than false-positives.
+// content_base64, and a null entry, are rejected at validate time; setting
+// either one passes; an unknown value defers rather than false-positives.
 func TestObjectFileContentRequired(t *testing.T) {
 	attrTypes := map[string]attr.Type{
 		"content":        types.StringType,
@@ -93,6 +93,8 @@ func TestObjectFileContentRequired(t *testing.T) {
 		{"content set", mk(types.StringValue("x"), types.StringNull()), false},
 		{"base64 set", mk(types.StringNull(), types.StringValue("eA==")), false},
 		{"content unknown defers", mk(types.StringUnknown(), types.StringNull()), false},
+		{"null entry", types.ObjectNull(attrTypes), true},
+		{"unknown entry defers", types.ObjectUnknown(attrTypes), false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

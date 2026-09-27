@@ -71,6 +71,7 @@ func TestFilesSchema_ValidateResourceConfig(t *testing.T) {
 	}
 	cases := []struct {
 		wantPath    *tftypes.AttributePath
+		null        *tftypes.AttributePath
 		name        string
 		wantSummary string
 		config      filesResourceModel
@@ -114,6 +115,17 @@ func TestFilesSchema_ValidateResourceConfig(t *testing.T) {
 			wantSummary: "Missing file content",
 		},
 		{
+			name: "null entry",
+			config: func() filesResourceModel {
+				m := configOf(readState(""))
+				m.Files["g.txt"] = m.Files["f.txt"]
+				return m
+			}(),
+			null:        tftypes.NewAttributePath().WithAttributeName("files").WithElementKeyString("g.txt"),
+			wantPath:    tftypes.NewAttributePath().WithAttributeName("files").WithElementKeyString("g.txt"),
+			wantSummary: "Null file entry",
+		},
+		{
 			name: "traversal in a path",
 			config: func() filesResourceModel {
 				m := configOf(readState(""))
@@ -127,9 +139,13 @@ func TestFilesSchema_ValidateResourceConfig(t *testing.T) {
 	srv := protocolServer(t)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			config := filesValue(t, tc.config)
+			if tc.null != nil {
+				config = replacedAt(t, config, tc.null, false)
+			}
 			resp, err := srv.ValidateResourceConfig(t.Context(), &tfprotov6.ValidateResourceConfigRequest{
 				TypeName: "gitlabcommits_files",
-				Config:   filesValue(t, tc.config),
+				Config:   config,
 			})
 			if err != nil {
 				t.Fatalf("ValidateResourceConfig: %v", err)
@@ -298,4 +314,37 @@ func TestFilesSchema_ProjectAndBranchRequireReplace(t *testing.T) {
 			}
 		})
 	}
+}
+
+// replacedAt returns dv with the value at p made null (unknown false) or
+// unknown (unknown true), for values filesValue cannot encode.
+func replacedAt(t *testing.T, dv *tfprotov6.DynamicValue, p *tftypes.AttributePath, unknown bool) *tfprotov6.DynamicValue {
+	t.Helper()
+	ctx := t.Context()
+	sresp := &resource.SchemaResponse{}
+	(&filesResource{}).Schema(ctx, resource.SchemaRequest{}, sresp)
+	typ := sresp.Schema.Type().TerraformType(ctx)
+	raw, err := dv.Unmarshal(typ)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	found := false
+	raw, err = tftypes.Transform(raw, func(at *tftypes.AttributePath, v tftypes.Value) (tftypes.Value, error) {
+		if !at.Equal(p) {
+			return v, nil
+		}
+		found = true
+		if unknown {
+			return tftypes.NewValue(v.Type(), tftypes.UnknownValue), nil
+		}
+		return tftypes.NewValue(v.Type(), nil), nil
+	})
+	if err != nil || !found {
+		t.Fatalf("replacing %s: found=%v err=%v", p, found, err)
+	}
+	out, err := tfprotov6.NewDynamicValue(typ, raw)
+	if err != nil {
+		t.Fatalf("NewDynamicValue: %v", err)
+	}
+	return &out
 }

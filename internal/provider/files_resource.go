@@ -416,7 +416,8 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					"A new path where the branch holds a directory fails the apply, since the file would replace the " +
 					"directory with everything in it; the one exception is a directory holding only files this resource " +
 					"manages and drops from the map in the same apply. A new path also fails when another resource in the " +
-					"same apply adds or adopts a file inside a directory of that name.",
+					"same apply adds or adopts a file inside a directory of that name. An entry must not be null: omit the " +
+					"key to leave a file out.",
 				Required: true,
 				Validators: []validator.Map{
 					mapNonEmpty(),

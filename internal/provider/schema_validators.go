@@ -305,7 +305,10 @@ func validateRepoPath(p string) error {
 // is rejected during validate/plan instead of failing at apply with a runtime
 // "either content or content_base64 must be set". Combined with the per-attribute
 // stringConflictsWithSibling validators (the "not both" half), this gives the two
-// fields exactly-one-of semantics before any commit is attempted.
+// fields exactly-one-of semantics before any commit is attempted. A null entry
+// (`"path" = null`, easily produced by a conditional inside merge()) is
+// rejected too: it passes every other check, and apply could only fail on it
+// with an error that reads like a provider bug.
 func objectFileContentRequired() validator.Object {
 	return objectFileContentRequiredValidator{}
 }
@@ -319,7 +322,14 @@ func (v objectFileContentRequiredValidator) MarkdownDescription(ctx context.Cont
 	return v.Description(ctx)
 }
 func (v objectFileContentRequiredValidator) ValidateObject(_ context.Context, req validator.ObjectRequest, resp *validator.ObjectResponse) {
-	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+	if req.ConfigValue.IsUnknown() {
+		return
+	}
+	if req.ConfigValue.IsNull() {
+		resp.Diagnostics.AddAttributeError(req.Path,
+			"Null file entry",
+			"A files entry must be an object that sets content or content_base64. To leave a file out, omit its key "+
+				"instead of setting it to null, for example with `{ for k, v in m : k => v if v != null }`.")
 		return
 	}
 	attrs := req.ConfigValue.Attributes()
