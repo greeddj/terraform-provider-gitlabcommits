@@ -3,18 +3,18 @@
 page_title: "gitlabcommits_branch_head Data Source - gitlabcommits"
 subcategory: ""
 description: |-
-  Returns the SHA at the head of a branch. Useful for wiring up downstream pipelines or populating last_commit_id when bootstrapping optimistic locking.
+  Returns the SHA at the head of a branch and whether the branch is protected. Useful for wiring downstream pipelines to the exact SHA terraform saw.
 ---
 
 # gitlabcommits_branch_head (Data Source)
 
-Returns the SHA at the head of a branch. Useful for wiring up downstream pipelines or populating last_commit_id when bootstrapping optimistic locking.
+Returns the SHA at the head of a branch and whether the branch is protected. Useful for wiring downstream pipelines to the exact SHA terraform saw.
 
 ## Example Usage
 
 ```terraform
-# Read the branch HEAD, e.g. to bootstrap external last_commit_id flows or
-# to wire downstream pipelines to the exact SHA terraform saw.
+# Read the branch HEAD, e.g. to wire downstream pipelines to the exact SHA
+# terraform saw.
 data "gitlabcommits_branch_head" "main" {
   project_id = "platform/gitops"
   branch     = "main"

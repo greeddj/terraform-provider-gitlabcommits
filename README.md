@@ -179,7 +179,9 @@ attribute on the provider block. In CI, prefer a CI variable such as
   `project_id`, `branch`, `file_path`. Outputs: `content` (null when the file
   is not valid UTF-8), `content_base64` (always set), `blob_id`,
   `last_commit_id`, `execute_filemode`, `size`. Useful for comparing rendered
-  HCL with what is committed.
+  HCL with what is committed. The content and size are those of the git blob
+  stored at the path: for a Git LFS-tracked file the LFS pointer, not the
+  object, and for a symlink the link target.
 - `gitlabcommits_branch_head` returns `commit_sha` and `protected` for a
   branch, e.g. to wire downstream pipelines to the exact SHA terraform saw.
 

@@ -3,12 +3,12 @@
 page_title: "gitlabcommits_file Data Source - gitlabcommits"
 subcategory: ""
 description: |-
-  Reads a single file from a GitLab repository at the given branch ref. Useful for migration, comparison against rendered HCL, or wiring up other resources with the file's commit metadata.
+  Reads a single file from a GitLab repository at the given ref (branch, tag or commit SHA). Useful for migration, comparison against rendered HCL, or wiring up other resources with the file's commit metadata.
 ---
 
 # gitlabcommits_file (Data Source)
 
-Reads a single file from a GitLab repository at the given branch ref. Useful for migration, comparison against rendered HCL, or wiring up other resources with the file's commit metadata.
+Reads a single file from a GitLab repository at the given ref (branch, tag or commit SHA). Useful for migration, comparison against rendered HCL, or wiring up other resources with the file's commit metadata.
 
 ## Example Usage
 
@@ -43,8 +43,8 @@ output "renovate_content" {
 ### Read-Only
 
 - `blob_id` (String) Opaque blob identifier returned by GitLab (git SHA-1 today, possibly SHA-256 on SHA-256 repositories).
-- `content` (String) Decoded text content of the file. Null when the file is not valid UTF-8 (Terraform strings cannot hold arbitrary bytes without corruption); use content_base64 for binaries.
-- `content_base64` (String) Base64-encoded raw bytes of the file. Always set.
+- `content` (String) Decoded text of the git blob stored at the path: for a Git LFS-tracked file the LFS pointer, not the object; for a symlink the link target. Null when the blob is not valid UTF-8 (Terraform strings cannot hold arbitrary bytes without corruption); use content_base64 for binaries.
+- `content_base64` (String) Base64-encoded bytes of the git blob stored at the path. Always set. For a Git LFS-tracked file this is the LFS pointer, not the object; for a symlink it is the link target.
 - `execute_filemode` (Boolean) Whether the file has the executable bit set in the repo.
 - `last_commit_id` (String) SHA of the most recent commit that touched this file.
-- `size` (Number) Size of the file in bytes.
+- `size` (Number) Size of the git blob in bytes (for a Git LFS-tracked file, the size of the pointer).

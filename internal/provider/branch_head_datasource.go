@@ -42,8 +42,8 @@ func (d *branchHeadDataSource) Metadata(_ context.Context, req datasource.Metada
 
 func (d *branchHeadDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Returns the SHA at the head of a branch. Useful for wiring up downstream pipelines or " +
-			"populating last_commit_id when bootstrapping optimistic locking.",
+		Description: "Returns the SHA at the head of a branch and whether the branch is protected. Useful for wiring " +
+			"downstream pipelines to the exact SHA terraform saw.",
 		Attributes: map[string]schema.Attribute{
 			"project_id": schema.StringAttribute{Required: true,
 				Description: "Numeric project ID or the plain project path (e.g. \"group/subgroup/project\"); do not URL-encode it, the provider escapes it.",

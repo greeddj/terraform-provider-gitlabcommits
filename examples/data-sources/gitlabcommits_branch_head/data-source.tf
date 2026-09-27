@@ -1,5 +1,5 @@
-# Read the branch HEAD, e.g. to bootstrap external last_commit_id flows or
-# to wire downstream pipelines to the exact SHA terraform saw.
+# Read the branch HEAD, e.g. to wire downstream pipelines to the exact SHA
+# terraform saw.
 data "gitlabcommits_branch_head" "main" {
   project_id = "platform/gitops"
   branch     = "main"

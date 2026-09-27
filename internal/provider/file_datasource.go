@@ -49,7 +49,7 @@ func (d *fileDataSource) Metadata(_ context.Context, req datasource.MetadataRequ
 
 func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Reads a single file from a GitLab repository at the given branch ref. Useful for migration, " +
+		Description: "Reads a single file from a GitLab repository at the given ref (branch, tag or commit SHA). Useful for migration, " +
 			"comparison against rendered HCL, or wiring up other resources with the file's commit metadata.",
 		Attributes: map[string]schema.Attribute{
 			"project_id": schema.StringAttribute{
@@ -68,13 +68,15 @@ func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, r
 				Validators:  []validator.String{stringNotEmpty(), stringValidRepoPath()},
 			},
 			"content": schema.StringAttribute{
-				Description: "Decoded text content of the file. Null when the file is not valid UTF-8 " +
+				Description: "Decoded text of the git blob stored at the path: for a Git LFS-tracked file the LFS pointer, " +
+					"not the object; for a symlink the link target. Null when the blob is not valid UTF-8 " +
 					"(Terraform strings cannot hold arbitrary bytes without corruption); use content_base64 for binaries.",
 				Computed: true,
 			},
 			"content_base64": schema.StringAttribute{
-				Description: "Base64-encoded raw bytes of the file. Always set.",
-				Computed:    true,
+				Description: "Base64-encoded bytes of the git blob stored at the path. Always set. For a Git LFS-tracked " +
+					"file this is the LFS pointer, not the object; for a symlink it is the link target.",
+				Computed: true,
 			},
 			"blob_id": schema.StringAttribute{
 				Description: "Opaque blob identifier returned by GitLab (git SHA-1 today, possibly SHA-256 on SHA-256 repositories).",
@@ -89,7 +91,7 @@ func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, r
 				Computed:    true,
 			},
 			"size": schema.Int64Attribute{
-				Description: "Size of the file in bytes.",
+				Description: "Size of the git blob in bytes (for a Git LFS-tracked file, the size of the pointer).",
 				Computed:    true,
 			},
 		},
