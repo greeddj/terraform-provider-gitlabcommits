@@ -332,6 +332,9 @@ func TestConfigure_ZeroRetriesDisablesCommitRetryPolicy(t *testing.T) {
 	}
 }
 
+// TestConfigure_InvalidRetryBoundsError: retry settings out of range are
+// rejected, the caps included: beyond them a wait wraps time.Duration
+// negative or lasts days, and max_retries truncates on a 32-bit int.
 func TestConfigure_InvalidRetryBoundsError(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
 	cases := map[string]map[string]tftypes.Value{
@@ -344,6 +347,27 @@ func TestConfigure_InvalidRetryBoundsError(t *testing.T) {
 			"token":       tftypes.NewValue(tftypes.String, "tok"),
 			"max_retries": tftypes.NewValue(tftypes.Number, big.NewFloat(-1)),
 		},
+		"max_retries above the cap": {
+			"token":       tftypes.NewValue(tftypes.String, "tok"),
+			"max_retries": tftypes.NewValue(tftypes.Number, big.NewFloat(101)),
+		},
+		"max_retries that truncates on 32-bit int": {
+			"token":       tftypes.NewValue(tftypes.String, "tok"),
+			"max_retries": tftypes.NewValue(tftypes.Number, big.NewFloat(4294967296)),
+		},
+		"retry_wait_max_ms above the cap": {
+			"token":             tftypes.NewValue(tftypes.String, "tok"),
+			"retry_wait_max_ms": tftypes.NewValue(tftypes.Number, big.NewFloat(3600001)),
+		},
+		"retry_wait_max_ms that wraps time.Duration": {
+			"token":             tftypes.NewValue(tftypes.String, "tok"),
+			"retry_wait_max_ms": tftypes.NewValue(tftypes.Number, big.NewFloat(10000000000000)),
+		},
+		"retry_wait_min_ms above the cap": {
+			"token":             tftypes.NewValue(tftypes.String, "tok"),
+			"retry_wait_min_ms": tftypes.NewValue(tftypes.Number, big.NewFloat(3600001)),
+			"retry_wait_max_ms": tftypes.NewValue(tftypes.Number, big.NewFloat(3600001)),
+		},
 	}
 	for name, attrs := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -352,6 +376,14 @@ func TestConfigure_InvalidRetryBoundsError(t *testing.T) {
 			}
 		})
 	}
+	t.Run("the caps themselves are accepted", func(t *testing.T) {
+		configuredClient(t, map[string]tftypes.Value{
+			"token":             tftypes.NewValue(tftypes.String, "tok"),
+			"max_retries":       tftypes.NewValue(tftypes.Number, big.NewFloat(maxMaxRetries)),
+			"retry_wait_min_ms": tftypes.NewValue(tftypes.Number, big.NewFloat(maxRetryWaitMs)),
+			"retry_wait_max_ms": tftypes.NewValue(tftypes.Number, big.NewFloat(maxRetryWaitMs)),
+		})
+	})
 }
 
 // TestConfigure_UnknownRetrySettingsError: unknown retry values must be

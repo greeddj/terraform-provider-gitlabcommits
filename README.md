@@ -110,9 +110,9 @@ provider "gitlabcommits" {
 | --- | --- | --- |
 | `token` | `GITLAB_TOKEN` | Token for the REST API; see Authentication. |
 | `base_url` | `GITLAB_BASE_URL`, else `https://gitlab.com` | Base URL of a self-hosted instance. |
-| `max_retries` | `5` | Retries on 429 and transient 5xx for read and probe requests. The commit request is retried only on 429 and on connection failures before it is sent (see Limits and retries). `0` disables retries. |
-| `retry_wait_min_ms` | `1000` | Base wait between 429 retries; doubles per attempt and is extended by GitLab's `RateLimit-Reset` header. |
-| `retry_wait_max_ms` | `30000` | Bound on the random jitter added to each 429 wait, not on the total wait. |
+| `max_retries` | `5` | Retries on 429 and transient 5xx for read and probe requests. The commit request is retried only on 429 and on connection failures before it is sent (see Limits and retries). `0` disables retries; at most `100`. |
+| `retry_wait_min_ms` | `1000` | Base wait for 429 retries: until GitLab's `RateLimit-Reset` when it sends one (or this value, if longer), otherwise doubling per attempt. 5xx and connection retries wait 700-900 ms times the attempt number instead. At most `3600000` (one hour). |
+| `retry_wait_max_ms` | `30000` | Sets the random jitter added to each 429 wait, up to `retry_wait_max_ms - retry_wait_min_ms`; not a bound on the total wait. At most `3600000`. |
 
 ## Authentication
 
@@ -414,9 +414,12 @@ converges without a commit.
   `GITLAB_COMMITS_MAX_REQUEST_SIZE_BYTES` on self-managed GitLab.
 - **Rate limits.** Read and probe requests are retried on 429 and transient
   5xx (`max_retries`, default 5). `retry_wait_min_ms` is the base wait between
-  429 retries (it doubles per attempt and GitLab's `RateLimit-Reset` header
-  extends it); `retry_wait_max_ms` bounds the random jitter added on top, not
-  the total wait. 5xx retries use the client's fixed 700-900 ms schedule. On
+  429 retries: when GitLab sends `RateLimit-Reset` the wait lasts until the
+  reset (or `retry_wait_min_ms`, if that is longer), otherwise it doubles per
+  attempt. `retry_wait_max_ms` sets the random jitter added on top, up to
+  `retry_wait_max_ms - retry_wait_min_ms`, and does not bound the total wait.
+  5xx and connection retries use client-go's linear schedule instead: 700-900
+  ms times the attempt number, about 12 s in all with the default 5 retries. On
   GitLab.com, commit requests above 20 MB (3 per 30 s) and reads of blobs
   above 10 MB (5 per minute) are throttled separately; self-managed instances
   configure such limits independently. Those limits send no rate-limit

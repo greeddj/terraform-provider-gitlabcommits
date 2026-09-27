@@ -36,6 +36,16 @@ var (
 // starts once GitLab has the whole request.
 const responseHeaderTimeout = 5 * time.Minute
 
+// Upper bounds for the retry settings. A larger value is a typo rather than a
+// policy: a wait of days that only a cancelled run ends, a millisecond count
+// that wraps time.Duration negative (429 retries then fire back to back), or
+// a max_retries that the int conversion truncates on the 32-bit release
+// builds, silently disabling retries.
+const (
+	maxMaxRetries  = 100
+	maxRetryWaitMs = 3_600_000
+)
+
 // jobTokenPattern matches a CI job token: "glcbt-", after the instance token
 // prefix and its hyphen when the instance sets one (GitLab allows up to 20
 // alphanumerics there).
@@ -91,18 +101,20 @@ func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaReque
 				Description: "Maximum number of retries on transient failures (5xx, 429) for read and probe requests. " +
 					"The commit request (POST /repository/commits) is retried only on 429 and on connection failures that " +
 					"happen before the request is sent, never on 5xx, so one apply cannot land two commits. " +
-					"Default 5. Set to 0 to disable retries entirely.",
+					"Default 5, at most 100. Set to 0 to disable retries entirely.",
 				Optional: true,
 			},
 			"retry_wait_min_ms": schema.Int64Attribute{
-				Description: "Base wait (ms) between rate-limited (429) retries; it doubles with each attempt and the " +
-					"RateLimit-Reset header extends it when GitLab sends one. 5xx retries use the client's fixed 700-900 ms " +
-					"schedule instead. Default 1000.",
+				Description: "Base wait (ms) for rate-limited (429) retries. When GitLab sends a RateLimit-Reset header the " +
+					"wait lasts until the reset, or this value if that is longer; without the header it doubles with each " +
+					"attempt. 5xx and connection retries use client-go's linear schedule instead: 700-900 ms times the " +
+					"attempt number. Default 1000, at most 3600000 (one hour).",
 				Optional: true,
 			},
 			"retry_wait_max_ms": schema.Int64Attribute{
-				Description: "Bounds (ms) the random jitter added to each rate-limited (429) retry wait; the wait itself " +
-					"is the growing base plus that jitter and can exceed this value. Default 30000.",
+				Description: "Sets the random jitter (ms) added to each rate-limited (429) retry wait, which is up to " +
+					"retry_wait_max_ms - retry_wait_min_ms; the total wait can exceed this value. Must not be below " +
+					"retry_wait_min_ms. Default 30000, at most 3600000 (one hour).",
 				Optional: true,
 			},
 		},
@@ -230,8 +242,9 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	if !config.MaxRetries.IsNull() {
 		maxRetries = config.MaxRetries.ValueInt64()
 	}
-	if maxRetries < 0 {
-		resp.Diagnostics.AddAttributeError(path.Root("max_retries"), "Invalid value", "max_retries must be >= 0")
+	if maxRetries < 0 || maxRetries > maxMaxRetries {
+		resp.Diagnostics.AddAttributeError(path.Root("max_retries"), "Invalid value",
+			fmt.Sprintf("max_retries must be between 0 and %d", maxMaxRetries))
 		return
 	}
 	if maxRetries == 0 {
@@ -247,6 +260,21 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	waitMax := int64(30000)
 	if !config.RetryWaitMaxMs.IsNull() {
 		waitMax = config.RetryWaitMaxMs.ValueInt64()
+	}
+	for _, w := range []struct {
+		name  string
+		value int64
+	}{
+		{"retry_wait_min_ms", waitMin},
+		{"retry_wait_max_ms", waitMax},
+	} {
+		if w.value > maxRetryWaitMs {
+			resp.Diagnostics.AddAttributeError(path.Root(w.name), "Invalid value",
+				fmt.Sprintf("%s must be at most %d (one hour)", w.name, maxRetryWaitMs))
+		}
+	}
+	if resp.Diagnostics.HasError() {
+		return
 	}
 	if waitMin <= 0 || waitMax <= 0 || waitMin > waitMax {
 		resp.Diagnostics.AddError("Invalid retry wait bounds",
