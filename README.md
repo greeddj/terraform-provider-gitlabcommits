@@ -433,7 +433,8 @@ converges without a commit.
   answered 502/504 after GitLab had already accepted the commit, a retry
   would land a second commit for the same apply. The provider therefore
   retries the commit request only on 429 (rejected before processing) and on
-  connection failures that happen before the request is sent. A 5xx or a
+  connection failures that happen before the request is sent (name lookup,
+  connect, TLS handshake timeout, directly or through a proxy). A 5xx or a
   dropped connection fails the apply with the status in the diagnostic; run
   `terraform plan` to see whether the commit landed, and apply again if it
   did not. With `detect_drift = false` recorded in state the plan cannot

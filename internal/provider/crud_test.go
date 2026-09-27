@@ -5,6 +5,7 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1797,6 +1798,11 @@ func changedPlan() (plan, state filesResourceModel) {
 	return plan, state
 }
 
+// proxyErr wraps err as net/http reports a failure to connect through a proxy.
+func proxyErr(err error) error {
+	return &url.Error{Op: "Post", Err: &net.OpError{Op: "proxyconnect", Net: "tcp", Err: err}}
+}
+
 // TestCommitRetryPolicy pins which failures may replay the commit POST: rate
 // limiting and connection failures that happen before the request is sent,
 // nothing else - a replay after GitLab already landed the commit would be a
@@ -1820,6 +1826,13 @@ func TestCommitRetryPolicy(t *testing.T) {
 		{name: "dns nxdomain", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}}, retry: false},
 		{name: "tls handshake timeout", err: &url.Error{Op: "Post", Err: errors.New("net/http: TLS handshake timeout")}, retry: true},
 		{name: "unexpected eof", err: &url.Error{Op: "Post", Err: io.ErrUnexpectedEOF}, retry: false},
+		// net/http wraps every failure to connect through a proxy as
+		// OpError{Op: "proxyconnect"}; the error inside is judged as it would
+		// be on a direct connection.
+		{name: "proxy refused", err: proxyErr(&net.OpError{Op: "dial", Err: errors.New("connection refused")}), retry: true},
+		{name: "proxy tls handshake timeout", err: proxyErr(errors.New("net/http: TLS handshake timeout")), retry: true},
+		{name: "proxy dns nxdomain", err: proxyErr(&net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}), retry: false},
+		{name: "proxy certificate", err: proxyErr(&tls.CertificateVerificationError{Err: errors.New("x509: unknown authority")}), retry: false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

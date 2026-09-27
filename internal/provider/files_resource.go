@@ -2657,27 +2657,43 @@ func (r *filesResource) commitRequestOptions(ctx context.Context) []gitlab.Reque
 // 502/504 from a proxy after GitLab already landed the commit would replay
 // the POST and produce a second commit for the same apply. Retry only a 429
 // (rejected before processing) and failures that provably happened before
-// anything reached the wire (DNS, dial); everything else fails loudly and the
-// user reconciles with terraform plan.
+// anything reached the wire (see isPreWireTransportError); everything else
+// fails loudly and the user reconciles with terraform plan.
 func commitRetryPolicy(ctx context.Context, resp *http.Response, err error) (bool, error) {
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
 	if err != nil {
-		if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
-			return !dnsErr.IsNotFound, nil
+		// A name that does not resolve will not resolve on a retry either.
+		if dnsErr, ok := errors.AsType[*net.DNSError](err); ok && dnsErr.IsNotFound {
+			return false, nil
 		}
-		if opErr, ok := errors.AsType[*net.OpError](err); ok {
-			return opErr.Op == "dial", nil
-		}
-		// net/http reports a handshake timeout as a plain error string; the
-		// handshake precedes the request body, so it is pre-wire as well.
-		if strings.Contains(err.Error(), "net/http: TLS handshake timeout") {
-			return true, nil
-		}
-		return false, nil
+		return isPreWireTransportError(err), nil
 	}
 	return resp.StatusCode == http.StatusTooManyRequests, nil
+}
+
+// isPreWireTransportError reports whether err is a transport failure that
+// provably happened before any of the request was sent: a name lookup, a
+// dial, or a TLS handshake timeout, directly or while connecting through a
+// proxy. A commit request that failed this way did not land.
+func isPreWireTransportError(err error) bool {
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
+		return true
+	}
+	if opErr, ok := errors.AsType[*net.OpError](err); ok {
+		// net/http wraps every failure to connect through a proxy as
+		// OpError{Op: "proxyconnect"}, raised before the request is written;
+		// the error it wraps is judged by the same rules, so a permanent
+		// one (an https proxy's certificate, say) is not retried.
+		if opErr.Op == "proxyconnect" {
+			return isPreWireTransportError(opErr.Err)
+		}
+		return opErr.Op == "dial"
+	}
+	// net/http reports a handshake timeout as a plain error string; the
+	// handshake precedes the request, so it is pre-wire as well.
+	return strings.Contains(err.Error(), "net/http: TLS handshake timeout")
 }
 
 // commitOptions assembles CreateCommitOptions from the shared resource fields
