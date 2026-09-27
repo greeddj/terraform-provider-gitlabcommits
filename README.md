@@ -492,7 +492,7 @@ GITLAB_TEST_PROJECT_ID='you/sandbox' \
 GITLAB_TEST_BRANCH='tf-acc-test' \
 GITLAB_TEST_BRANCH_FROM='main' \
 GITLAB_BASE_URL='https://gitlab.example.com' \
-go test -v -timeout=20m -run '^TestAcc' ./internal/...
+go test -count=1 -v -timeout=20m -run '^TestAcc' ./internal/...
 ```
 
 `GITLAB_TEST_BRANCH` defaults to `tf-acc-test` and must pre-exist unless

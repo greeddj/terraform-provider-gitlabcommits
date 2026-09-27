@@ -46,8 +46,13 @@ export GITLAB_TOKEN='...'                  # api scope (see README Authenticatio
 export GITLAB_TEST_PROJECT_ID='you/sandbox'
 export GITLAB_TEST_BRANCH='tf-acc-test'    # optional; must pre-exist unless GITLAB_TEST_BRANCH_FROM is set
 export GITLAB_TEST_BRANCH_FROM='main'      # optional; create the branch from this ref, delete it after the test
-go test -v -timeout=20m -run '^TestAcc' ./internal/...
+go test -count=1 -v -timeout=20m -run '^TestAcc' ./internal/...
 ```
+
+`-count=1` matters: `go test` cannot see GitLab, so without it a rerun with
+the same environment replays the cached result without sending a request.
+`TestAccFiles_import` needs Terraform 1.7 or later (it uses a `removed`
+block) and skips on older versions.
 
 In CI they run via `.github/workflows/acceptance.yml` (manual trigger,
 nightly cron, and pushes to `main` that touch `internal/**`) on a branch
