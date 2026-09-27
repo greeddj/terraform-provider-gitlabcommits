@@ -434,14 +434,15 @@ converges without a commit.
   would land a second commit for the same apply. The provider therefore
   retries the commit request only on 429 (rejected before processing) and on
   connection failures that happen before the request is sent (name lookup,
-  connect, TLS handshake timeout, directly or through a proxy). A 5xx or a
-  dropped connection fails the apply with the status in the diagnostic; run
-  `terraform plan` to see whether the commit landed, and apply again if it
-  did not. With `detect_drift = false` recorded in state the plan cannot
-  show that: first set `detect_drift = true` with `files` as last applied
-  and apply (this makes no commit), then put the change back in `files` and
-  plan. A destroy can simply be run again, since files already deleted are
-  skipped.
+  connect, TLS handshake timeout, directly or through a proxy). A 5xx, or a
+  connection that fails once the request may have been sent (a reset, or
+  the five-minute wait for the response), fails the apply with a diagnostic
+  that says the commit may or may not have landed; run `terraform plan` to
+  see whether it did, and apply again if it did not. With
+  `detect_drift = false` recorded in state the plan cannot show that: first
+  set `detect_drift = true` with `files` as last applied and apply (this
+  makes no commit), then put the change back in `files` and plan. A destroy
+  can simply be run again, since files already deleted are skipped.
 - **A branch that shares its name with a tag is not supported.** GitLab
   resolves the bare name to the tag first, and the provider, like GitLab's
   commits API, names the branch that way. File reads (refreshes, adoption,

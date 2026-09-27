@@ -77,13 +77,14 @@ provider needs `POST /repository/commits`.
   connection failures that happen before it is sent (name lookup, connect,
   TLS handshake timeout, directly or through a proxy), never on 5xx, because
   a replay after GitLab already accepted the commit would land a second
-  commit for one apply. A 5xx on the commit fails the apply; run
-  `terraform plan` to see whether the commit landed. With
-  `detect_drift = false` recorded in state the plan cannot show that, since
-  a refresh reads the recorded value: first set `detect_drift = true` with
-  `files` as last applied and apply (this makes no commit), then put the
-  change back in `files` and plan. A destroy can simply be run again, since
-  files already deleted are skipped.
+  commit for one apply. A 5xx on the commit, or a connection that fails once
+  the request may have been sent, fails the apply with a diagnostic that says
+  the commit may or may not have landed; run `terraform plan` to see whether
+  it did. With `detect_drift = false` recorded in state the plan cannot show
+  that, since a refresh reads the recorded value: first set
+  `detect_drift = true` with `files` as last applied and apply (this makes no
+  commit), then put the change back in `files` and plan. A destroy can simply
+  be run again, since files already deleted are skipped.
 - **Gitaly failures on the Files API.** GitLab answers a Files API request
   with 404 when Gitaly times out resolving the ref, exactly as for a file
   that does not exist; releases up to at least 19.4 do the same when Gitaly

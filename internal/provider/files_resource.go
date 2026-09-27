@@ -765,7 +765,7 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 	// lock; release here rather than at the deferred return.
 	release()
 	if err != nil {
-		summary, detail := apiErrorDiag(action, project, branch, err)
+		summary, detail := commitErrorDiag(action, project, branch, err)
 		resp.Diagnostics.AddError(summary, detail)
 		return
 	}
@@ -1196,7 +1196,7 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 	if len(absent) == 0 {
 		// Every file is still there, so the rejection was about something
 		// else (a concurrent edit, a push rule, another writer on the branch).
-		summary, detail := apiErrorDiag("pushing destroy commit", project, branch, err)
+		summary, detail := commitErrorDiag("pushing destroy commit", project, branch, err)
 		resp.Diagnostics.AddError(summary, detail+unrefreshedNote(state, err, true))
 		return
 	}
@@ -2109,12 +2109,38 @@ func allDigitProjectID(project string) (int64, bool) {
 	return id, err == nil
 }
 
-// commitErrorDiag is apiErrorDiag for an error from commitLocked.
+// commitErrorDiag is apiErrorDiag for the error of a commit request, from
+// commitLocked or Create. Unlike a read, a commit request is never replayed
+// once it may have reached GitLab (see commitRetryPolicy), so when it may
+// have landed the detail says so.
 func commitErrorDiag(action, project, branch string, err error) (string, string) {
 	if errors.Is(err, errLockWait) {
 		return "Cancelled while waiting for the branch lock", err.Error()
 	}
-	return apiErrorDiag(action, project, branch, err)
+	summary, detail := apiErrorDiag(action, project, branch, err)
+	switch {
+	case isServerError(err):
+		detail += " A commit request is not retried by this provider (a replay could land a second commit), so the " +
+			"commit may or may not have landed: run `terraform plan` to see the repository state before applying again."
+	case commitMayHaveLanded(err):
+		detail += " The commit request may have reached GitLab before it failed, so the commit may or may not have " +
+			"landed: run `terraform plan` to see the repository state before applying again."
+	}
+	return summary, detail
+}
+
+// commitMayHaveLanded reports whether a commit request that failed with err
+// may still have landed: GitLab answered with a 5xx, or the request failed
+// without an answer from GitLab at a point where it may already have been
+// sent.
+func commitMayHaveLanded(err error) bool {
+	if isServerError(err) {
+		return true
+	}
+	if _, answered := errors.AsType[*gitlab.ErrorResponse](err); answered {
+		return false
+	}
+	return !errors.Is(err, errLockWait) && !isPreWireTransportError(err)
 }
 
 // recordDetectDrift is the way back to refreshes while state records
@@ -2132,11 +2158,11 @@ const replanWithChange = ", then put your change back in `files` and plan again"
 // unrefreshedNote is the advice to append to a commit error of Update, or of
 // Delete with destroy set, when state records detect_drift = false: a
 // refresh then leaves state as it is, so neither the refresh a lock conflict
-// suggests nor the plan a server error suggests can help. It is "" for any
-// other error, and when state records detect_drift = true. For Update the
-// lock can only be dropped as a shortcut: a token-less update of a file
-// deleted out of band still fails, and after a server error whose commit
-// landed it would commit the same change a second time.
+// suggests nor the plan suggested for a commit that may have landed can
+// help. It is "" for any other error, and when state records detect_drift =
+// true. For Update the lock can only be dropped as a shortcut: a token-less
+// update of a file deleted out of band still fails, and after a server error
+// whose commit landed it would commit the same change a second time.
 func unrefreshedNote(state filesResourceModel, err error, destroy bool) string {
 	if state.detectDrift() {
 		return ""
@@ -2155,10 +2181,10 @@ func unrefreshedNote(state filesResourceModel, err error, destroy bool) string {
 			"(then setting it back) is only a shortcut for overwriting an edit to a file that still exists: it does not " +
 			"help when a file was deleted out of band, and after a failed apply whose commit may have landed it would " +
 			"commit the same change a second time."
-	case isServerError(err) && destroy:
+	case commitMayHaveLanded(err) && destroy:
 		return lead + "terraform plan cannot show whether the destroy commit landed. Running terraform destroy again " +
 			"is safe: the files that commit already deleted are skipped."
-	case isServerError(err):
+	case commitMayHaveLanded(err):
 		return lead + "terraform plan cannot show whether the commit landed. To find out, " + recordDetectDrift +
 			replanWithChange + ": the refresh then reads the branch, and a change that already landed needs no commit."
 	}
@@ -2627,13 +2653,10 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			}
 		default:
 			if status >= 500 {
-				// A commit request is deliberately never replayed on 5xx (see
-				// commitRetryPolicy), so the user has to find out whether it
-				// landed; reads were already retried by the client.
+				// Reads were already retried by the client; what a failed
+				// commit request means is added by commitErrorDiag.
 				summary = fmt.Sprintf("GitLab server error (HTTP %d)", status)
-				return summary, fmt.Sprintf("%s: GitLab did not complete the request. A commit request is not retried by "+
-					"this provider (a replay could land a second commit), so if this was one the commit may or may not "+
-					"have landed: run `terraform plan` to see the repository state before applying again. Body: %s", prefix, body)
+				return summary, fmt.Sprintf("%s: GitLab did not complete the request. Body: %s", prefix, body)
 			}
 			return summary, fmt.Sprintf("%s: HTTP %d. Body: %s", where, status, body)
 		}

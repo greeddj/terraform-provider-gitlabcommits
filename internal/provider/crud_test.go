@@ -600,14 +600,15 @@ func TestCommitConflict_LeavesStateUntouched(t *testing.T) {
 // add how to recover, and only then. The recorded value counts, not the
 // plan's, and other rejections get no note. For Update the recovery puts
 // the change back before planning, and dropping the lock is offered only
-// as a shortcut, with the cases it cannot handle.
+// as a shortcut, with the cases it cannot handle. A connection dropped once
+// the commit request was sent leaves the outcome as open as a server error.
 func TestCommitErrors_UnrefreshedStateNote(t *testing.T) {
 	const conflict = `{"message":"The file has changed since you started editing it: f.txt"}`
 	cases := []struct {
-		name, body     string
-		want           []string
-		status         int
-		destroy, stale bool
+		name, body             string
+		want                   []string
+		status                 int
+		destroy, stale, hangUp bool
 	}{
 		{name: "update conflict", status: http.StatusBadRequest, body: conflict, stale: true, want: []string{
 			"To see the other edit, set detect_drift = true with `files` as last applied and apply (this makes no commit), " +
@@ -631,6 +632,16 @@ func TestCommitErrors_UnrefreshedStateNote(t *testing.T) {
 		{name: "destroy conflict refreshed", destroy: true, status: http.StatusBadRequest, body: conflict},
 		{name: "destroy server error", destroy: true, status: http.StatusBadGateway, stale: true, want: []string{"Running terraform destroy again is safe"}},
 		{name: "destroy server error refreshed", destroy: true, status: http.StatusBadGateway},
+		{name: "update connection lost", hangUp: true, stale: true, want: []string{
+			"may have reached GitLab before it failed",
+			"cannot show whether the commit landed",
+			"then put your change back in `files` and plan again",
+		}},
+		{name: "update connection lost refreshed", hangUp: true},
+		{name: "destroy connection lost", destroy: true, hangUp: true, stale: true, want: []string{
+			"may have reached GitLab before it failed",
+			"Running terraform destroy again is safe",
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -639,6 +650,16 @@ func TestCommitErrors_UnrefreshedStateNote(t *testing.T) {
 				case http.MethodHead:
 					metaHeaders(w, "oldblob", "remote-lcid", false)
 				case http.MethodPost:
+					if c.hangUp {
+						// The request arrived; the answer never does.
+						conn, _, err := http.NewResponseController(w).Hijack()
+						if err != nil {
+							t.Errorf("hijack: %v", err)
+							return
+						}
+						_ = conn.Close()
+						return
+					}
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(c.status)
 					_, _ = w.Write([]byte(c.body))
@@ -2303,6 +2324,9 @@ func TestCreate_CommitIsNotRetriedOn5xx(t *testing.T) {
 	}
 	if got := posts.Load(); got != 1 {
 		t.Errorf("commit POST attempts = %d, want exactly 1", got)
+	}
+	if d := resp.Diagnostics.Errors()[0].Detail(); !strings.Contains(d, "may or may not have landed") {
+		t.Errorf("the diagnostic must say the commit may have landed, got: %s", d)
 	}
 }
 

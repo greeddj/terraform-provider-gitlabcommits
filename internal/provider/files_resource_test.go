@@ -4,11 +4,14 @@
 package provider
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -755,16 +758,18 @@ func TestApiErrorDiag(t *testing.T) {
 			contains:    []string{"300 MB", "for_each"},
 		},
 		{
-			// 5xx: the commit request is never replayed, so the user must be
-			// told the commit may or may not have landed.
+			// What a failed commit request means is commitErrorDiag's to add;
+			// a read that got a 5xx has not committed anything.
 			name: "500-server", err: mkErr(500, "boom", nil),
 			wantSummary: "GitLab server error (HTTP 500)",
-			contains:    []string{"terraform plan", "boom"},
+			contains:    []string{"did not complete the request", "boom"},
+			absent:      []string{"landed"},
 		},
 		{
 			name: "502-server", err: mkErr(502, "bad gateway", nil),
 			wantSummary: "GitLab server error (HTTP 502)",
-			contains:    []string{"may or may not have landed", "bad gateway"},
+			contains:    []string{"did not complete the request", "bad gateway"},
+			absent:      []string{"landed"},
 		},
 		{
 			name: "422-default", err: mkErr(422, "unprocessable", nil),
@@ -809,16 +814,17 @@ func TestApiErrorDiag(t *testing.T) {
 
 }
 
-// TestErrorClassifiers pins isLockConflict and isServerError, which decide
-// the recovery advice Update and Delete add to a commit error.
+// TestErrorClassifiers pins isLockConflict, isServerError and
+// commitMayHaveLanded, which decide the recovery advice Update and Delete add
+// to a commit error.
 func TestErrorClassifiers(t *testing.T) {
 	mkErr := func(status int, msg string) error {
 		return &gitlab.ErrorResponse{StatusCode: status, Response: &http.Response{StatusCode: status}, Message: msg}
 	}
 	cases := []struct {
-		err            error
-		name           string
-		conflict, fail bool
+		err                    error
+		name                   string
+		conflict, fail, landed bool
 	}{
 		{name: "400 commits api conflict", err: mkErr(400, "The file has changed since you started editing it: f.txt"), conflict: true},
 		{name: "409 last commit", err: mkErr(409, "Last commit changed"), conflict: true},
@@ -828,9 +834,15 @@ func TestErrorClassifiers(t *testing.T) {
 		{name: "400 without a response", err: &gitlab.ErrorResponse{StatusCode: 400, Message: "has changed since"}},
 		{name: "404 sentinel", err: gitlab.ErrNotFound},
 		{name: "429", err: mkErr(429, "rate limited")},
-		{name: "500", err: mkErr(500, "boom"), fail: true},
-		{name: "wrapped 502", err: fmt.Errorf("pushing: %w", mkErr(502, "bad gateway")), fail: true},
-		{name: "transport", err: errors.New("connection reset by peer")},
+		{name: "500", err: mkErr(500, "boom"), fail: true, landed: true},
+		{name: "wrapped 502", err: fmt.Errorf("pushing: %w", mkErr(502, "bad gateway")), fail: true, landed: true},
+		{name: "transport", err: errors.New("connection reset by peer"), landed: true},
+		{name: "response header timeout", err: &url.Error{Op: "Post", Err: errors.New("net/http: timeout awaiting response headers")}, landed: true},
+		{name: "cancelled while sending", err: &url.Error{Op: "Post", Err: context.Canceled}, landed: true},
+		{name: "dial refused", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "dial", Err: errors.New("connection refused")}}},
+		{name: "dns nxdomain", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}}},
+		{name: "proxy refused", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "proxyconnect", Err: &net.OpError{Op: "dial", Err: errors.New("connection refused")}}}},
+		{name: "lock wait", err: fmt.Errorf("%w: %w", errLockWait, context.Canceled)},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -839,6 +851,59 @@ func TestErrorClassifiers(t *testing.T) {
 			}
 			if got := isServerError(c.err); got != c.fail {
 				t.Errorf("isServerError = %v, want %v", got, c.fail)
+			}
+			if got := commitMayHaveLanded(c.err); got != c.landed {
+				t.Errorf("commitMayHaveLanded = %v, want %v", got, c.landed)
+			}
+		})
+	}
+}
+
+// TestCommitErrorDiag: a commit request that may have landed says so, a 5xx
+// because the request is never replayed and a transport failure unless it
+// provably happened before anything was sent; an answer from GitLab that
+// rejected the commit, or a failure before the request left, does not.
+func TestCommitErrorDiag(t *testing.T) {
+	mkErr := func(status int, msg string) error {
+		return &gitlab.ErrorResponse{StatusCode: status, Response: &http.Response{StatusCode: status}, Message: msg}
+	}
+	const (
+		serverNote    = "A commit request is not retried by this provider"
+		transportNote = "may have reached GitLab before it failed"
+	)
+	cases := []struct {
+		err         error
+		name        string
+		wantSummary string
+		want        string
+	}{
+		{name: "502", err: mkErr(502, "bad gateway"), wantSummary: "GitLab server error (HTTP 502)", want: serverNote},
+		{
+			name:        "response header timeout",
+			err:         &url.Error{Op: "Post", URL: "https://gl/api/v4/projects/proj/repository/commits", Err: errors.New("net/http: timeout awaiting response headers")},
+			wantSummary: "GitLab API error: pushing commit",
+			want:        transportNote,
+		},
+		{name: "connection reset", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "read", Err: errors.New("connection reset by peer")}}, wantSummary: "GitLab API error: pushing commit", want: transportNote},
+		{name: "dial refused", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "dial", Err: errors.New("connection refused")}}, wantSummary: "GitLab API error: pushing commit"},
+		{name: "proxy refused", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "proxyconnect", Err: &net.OpError{Op: "dial", Err: errors.New("connection refused")}}}, wantSummary: "GitLab API error: pushing commit"},
+		{name: "400", err: mkErr(400, "validation failed"), wantSummary: "GitLab API error: pushing commit"},
+		{name: "404", err: gitlab.ErrNotFound, wantSummary: "GitLab resource not found (HTTP 404)"},
+		{name: "lock wait", err: fmt.Errorf("%w: %w", errLockWait, context.Canceled), wantSummary: "Cancelled while waiting for the branch lock"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			summary, detail := commitErrorDiag("pushing commit", "proj", "main", c.err)
+			if summary != c.wantSummary {
+				t.Errorf("summary = %q, want %q", summary, c.wantSummary)
+			}
+			for _, note := range []string{serverNote, transportNote} {
+				if got, want := strings.Contains(detail, note), note == c.want; got != want {
+					t.Errorf("detail says %q: %v, want %v; detail: %s", note, got, want, detail)
+				}
+			}
+			if c.want != "" && !strings.Contains(detail, "may or may not have landed: run `terraform plan`") {
+				t.Errorf("detail must send the user to terraform plan: %s", detail)
 			}
 		})
 	}
