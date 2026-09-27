@@ -600,8 +600,11 @@ func TestParseImportID(t *testing.T) {
 // TestApiErrorDiag pins the HTTP-status -> diagnostic mapping. Each branch
 // (401/403/404/400/409/429/default) carries actionable wording for the user;
 // asserting the summary plus key detail substrings here keeps the wording from
-// drifting silently and locks in the truncation + Retry-After behaviour.
+// drifting silently and locks in the truncation + Retry-After behaviour. The
+// caller's action appears exactly once, in the summary or the detail, and
+// absent lists what the detail must not say.
 func TestApiErrorDiag(t *testing.T) {
+	const action = `probing file "f.txt"`
 	mkErr := func(status int, msg string, headers http.Header) error {
 		if headers == nil {
 			headers = http.Header{}
@@ -618,6 +621,7 @@ func TestApiErrorDiag(t *testing.T) {
 		name        string
 		wantSummary string
 		contains    []string
+		absent      []string
 	}{
 		{
 			name: "401", err: mkErr(401, "invalid token", nil),
@@ -693,7 +697,7 @@ func TestApiErrorDiag(t *testing.T) {
 		},
 		{
 			name: "400-other", err: mkErr(400, "validation failed", nil),
-			wantSummary: "GitLab API error: act",
+			wantSummary: "GitLab API error: " + action,
 			contains:    []string{"HTTP 400", "validation failed"},
 		},
 		{
@@ -764,23 +768,23 @@ func TestApiErrorDiag(t *testing.T) {
 		},
 		{
 			name: "422-default", err: mkErr(422, "unprocessable", nil),
-			wantSummary: "GitLab API error: act",
+			wantSummary: "GitLab API error: " + action,
 			contains:    []string{"HTTP 422", "unprocessable"},
 		},
 		{
 			name: "plain-error", err: errors.New("connection refused"),
-			wantSummary: "GitLab API error: act",
+			wantSummary: "GitLab API error: " + action,
 			contains:    []string{"connection refused"},
 		},
 		{
 			name: "truncated-body", err: mkErr(400, strings.Repeat("x", 2000), nil),
-			wantSummary: "GitLab API error: act",
+			wantSummary: "GitLab API error: " + action,
 			contains:    []string{"truncated, 976 more chars"},
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			summary, detail := apiErrorDiag("act", "proj", "main", c.err)
+			summary, detail := apiErrorDiag(action, "proj", "main", c.err)
 			if summary != c.wantSummary {
 				t.Errorf("summary = %q, want %q", summary, c.wantSummary)
 			}
@@ -789,8 +793,16 @@ func TestApiErrorDiag(t *testing.T) {
 					t.Errorf("detail missing %q; full detail: %s", sub, detail)
 				}
 			}
+			for _, sub := range c.absent {
+				if strings.Contains(detail, sub) {
+					t.Errorf("detail must not say %q; full detail: %s", sub, detail)
+				}
+			}
 			if !strings.Contains(detail, `project="proj"`) || !strings.Contains(detail, `branch="main"`) {
 				t.Errorf("detail missing project/branch prefix: %s", detail)
+			}
+			if n := strings.Count(summary+"\n"+detail, action); n != 1 {
+				t.Errorf("the action must appear exactly once, got %d: %s / %s", n, summary, detail)
 			}
 		})
 	}

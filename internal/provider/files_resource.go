@@ -1842,16 +1842,24 @@ func (r *filesResource) absentPaths(ctx context.Context, project, branch string,
 		return r.probeFile(ctx, project, branch, p, false)
 	})
 	absent := map[string]bool{}
+	var failed []string
 	for _, p := range paths {
 		switch probe := probes[p]; {
 		case probe.err != nil:
-			summary, detail := apiErrorDiag(fmt.Sprintf("probing file %q %s", p, stage), project, branch, probe.err)
-			diags.AddError(summary, detail)
+			failed = append(failed, p)
 		case !probe.exists:
 			absent[p] = true
 		}
 	}
-	if diags.HasError() || len(absent) == 0 {
+	if len(failed) > 0 {
+		// One diagnostic, naming the other failures: a revoked token or an
+		// outage fails every probe alike, and a full diagnostic per path
+		// would repeat the same text for each file.
+		summary, detail := apiErrorDiag(fmt.Sprintf("probing file %q %s", failed[0], stage), project, branch, probes[failed[0]].err)
+		diags.AddError(summary, detail+alsoFailed(failed[1:]))
+		return nil, true, diags
+	}
+	if len(absent) == 0 {
 		return nil, true, diags
 	}
 	found, err := r.branchExists(ctx, project, branch)
@@ -1861,6 +1869,27 @@ func (r *filesResource) absentPaths(ctx context.Context, project, branch string,
 		return nil, false, diags
 	}
 	return absent, found, diags
+}
+
+// alsoFailed names, for a diagnostic that reports one failed probe in full,
+// the other paths whose probe failed too, the first few by name.
+func alsoFailed(paths []string) string {
+	const named = 5
+	switch {
+	case len(paths) == 0:
+		return ""
+	case len(paths) == 1:
+		return fmt.Sprintf(" Probing %q failed as well.", paths[0])
+	}
+	quoted := make([]string, 0, min(len(paths), named))
+	for _, p := range paths[:min(len(paths), named)] {
+		quoted = append(quoted, strconv.Quote(p))
+	}
+	list := strings.Join(quoted, ", ")
+	if len(paths) > named {
+		list += fmt.Sprintf(" and %d more", len(paths)-named)
+	}
+	return fmt.Sprintf(" Probing %d other files failed as well: %s.", len(paths), list)
 }
 
 // withoutPaths returns the actions whose path is not in drop.
@@ -2191,7 +2220,7 @@ func (r *filesResource) branchExists(ctx context.Context, project, branch string
 	if errors.Is(err, gitlab.ErrNotFound) {
 		return false, nil
 	}
-	return false, fmt.Errorf("checking branch %q: %w", branch, err)
+	return false, err
 }
 
 // missingBranchPreflight checks that an absent branch can be materialised
@@ -2493,12 +2522,15 @@ func truncateForDiag(s string) string {
 // diagnostic with HTTP status, response body, and the relevant project / branch
 // context. Recognises common cases (401/403 token issues, 404 missing
 // resource, 409 / 400 optimistic-lock conflicts, 429 rate limiting) and gives
-// the user actionable guidance instead of a bare error string.
+// the user actionable guidance instead of a bare error string. The caller's
+// action is in either the summary or the detail, never both: a recognised
+// case replaces the summary, so its detail names the action.
 //
 // Callers must guard on err != nil; this function does not.
 func apiErrorDiag(action, project, branch string, err error) (string, string) {
 	summary := fmt.Sprintf("GitLab API error: %s", action)
-	prefix := fmt.Sprintf("project=%q branch=%q", project, branch)
+	where := fmt.Sprintf("project=%q branch=%q", project, branch)
+	prefix := fmt.Sprintf("%s (%s)", action, where)
 
 	// ErrNotFound is itself an *ErrorResponse (StatusCode 404, nil Response)
 	// and (*ErrorResponse).Is matches on the status code alone, so errors.Is
@@ -2556,7 +2588,7 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 					"on every run with no other writer, %s Body: %s", prefix,
 					tagShadowHint(branch, "computes the branch tip it expects, so every commit to the branch is refused"), body)
 			}
-			return summary, fmt.Sprintf("%s: HTTP %d. Body: %s", prefix, status, body)
+			return summary, fmt.Sprintf("%s: HTTP %d. Body: %s", where, status, body)
 		case 413:
 			// GitLab rejects a commit request whose body exceeds a cap (default
 			// 300 MB / 314572800 bytes) with 413. one-commit-per-apply batches
@@ -2603,11 +2635,11 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 					"this provider (a replay could land a second commit), so if this was one the commit may or may not "+
 					"have landed: run `terraform plan` to see the repository state before applying again. Body: %s", prefix, body)
 			}
-			return summary, fmt.Sprintf("%s: HTTP %d. Body: %s", prefix, status, body)
+			return summary, fmt.Sprintf("%s: HTTP %d. Body: %s", where, status, body)
 		}
 	}
 
-	return summary, fmt.Sprintf("%s: %s", prefix, err.Error())
+	return summary, fmt.Sprintf("%s: %s", where, err.Error())
 }
 
 // commitRequestOptions returns the request options for POST /repository/commits:

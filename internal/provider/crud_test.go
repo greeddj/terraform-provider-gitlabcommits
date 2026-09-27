@@ -677,6 +677,76 @@ func TestCommitErrors_UnrefreshedStateNote(t *testing.T) {
 	}
 }
 
+// TestCreate_BranchLookupFailureNamesTheActionOnce: a transport failure on
+// the branch lookup reads as the action in the summary and the error in the
+// detail, without the lookup repeating the action there.
+func TestCreate_BranchLookupFailureNamesTheActionOnce(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	})
+	resp := runCreate(t, client, readState(""))
+	errs := resp.Diagnostics.Errors()
+	if len(errs) != 1 {
+		t.Fatalf("want one error, got %v", resp.Diagnostics)
+	}
+	if got := errs[0].Summary() + "\n" + errs[0].Detail(); strings.Count(got, "checking branch") != 1 {
+		t.Errorf("the action must appear once, got: %s", got)
+	}
+}
+
+// TestDelete_ProbeFailuresMakeOneDiagnostic: when the probes before a
+// destroy fail alike (a revoked token), the destroy reports one error that
+// names the first path in full and lists the others, rather than one error
+// per file, and commits nothing.
+func TestDelete_ProbeFailuresMakeOneDiagnostic(t *testing.T) {
+	fake := &repoFake{
+		files:       map[string]string{"a.txt": "la", "b.txt": "lb", "c.txt": "lc"},
+		probeStatus: map[string]int{"a.txt": http.StatusForbidden, "b.txt": http.StatusForbidden, "c.txt": http.StatusForbidden},
+	}
+	state := managedFiles(false, map[string]string{"a.txt": "la", "b.txt": "lb", "c.txt": "lc"})
+
+	resp := runDelete(t, fake.client(t), state)
+
+	errs := resp.Diagnostics.Errors()
+	if len(errs) != 1 {
+		t.Fatalf("want exactly one error, got %v", resp.Diagnostics)
+	}
+	if s := errs[0].Summary(); s != "GitLab permission denied (HTTP 403)" {
+		t.Errorf("summary = %q", s)
+	}
+	for _, want := range []string{`probing file "a.txt" before destroy (project="proj" branch="main")`,
+		`Probing 2 other files failed as well: "b.txt", "c.txt".`} {
+		if !strings.Contains(errs[0].Detail(), want) {
+			t.Errorf("detail must mention %q, got: %s", want, errs[0].Detail())
+		}
+	}
+	if commits, _, _ := fake.recorded(); len(commits) != 0 {
+		t.Errorf("commits = %q, want none", commits)
+	}
+}
+
+func TestAlsoFailed(t *testing.T) {
+	cases := []struct {
+		want  string
+		paths []string
+	}{
+		{want: ""},
+		{paths: []string{"b"}, want: ` Probing "b" failed as well.`},
+		{paths: []string{"b", "c"}, want: ` Probing 2 other files failed as well: "b", "c".`},
+		{paths: []string{"b", "c", "d", "e", "f", "g", "h"}, want: ` Probing 7 other files failed as well: "b", "c", "d", "e", "f" and 2 more.`},
+	}
+	for _, c := range cases {
+		if got := alsoFailed(c.paths); got != c.want {
+			t.Errorf("alsoFailed(%q) = %q, want %q", c.paths, got, c.want)
+		}
+	}
+}
+
 // TestDelete_RetryConflictUnrefreshedNote: a destroy whose first commit
 // GitLab rejects for a file deleted out of band is retried without it (the
 // two recorded commits), and when the retry is rejected in turn for a file
@@ -1501,8 +1571,8 @@ func TestBranchHelpers(t *testing.T) {
 		})
 		r := newTestResource(client)
 		_, err := r.branchExists(t.Context(), "proj", "main")
-		if err == nil || !strings.Contains(err.Error(), "checking branch") {
-			t.Fatalf("want a checking-branch error, got: %v", err)
+		if !hasStatus(err, http.StatusForbidden) {
+			t.Fatalf("want the 403 itself, got: %v", err)
 		}
 	})
 
