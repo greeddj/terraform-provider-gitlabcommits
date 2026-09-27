@@ -207,13 +207,39 @@ func TestStringValidRepoPath(t *testing.T) {
 	}
 }
 
+// TestStringBranchName pins git's ref-name rules: every name git accepts as
+// a branch or tag passes, whatever characters it holds, and a name git
+// refuses fails at plan time. ':' must stay rejected, since the resource
+// and import IDs join project_id and branch with "::".
 func TestStringBranchName(t *testing.T) {
-	cases := map[string]bool{"main": false, "release/1.2": false, "feature_x-1": false, "has space": true, "tab\tname": true}
-	for value, wantErr := range cases {
+	valid := []string{
+		"main", "release/1.2", "feature_x-1", "a.b", "x.lockfile", "a,b",
+		"feat+x", "v1.2.3+build.5", "pkg@1.2.3", "@scope/pkg@1.2.3", "issue#12", "фича/x",
+		"0123456789abcdef0123456789abcdef01234567",
+	}
+	invalid := []string{
+		"", "@", "has space", "tab\tname", "del\x7fname", "-a", "/a", "a/", "a//b", "a.", "a..b", "a@{1}",
+		"x.lock", "a/x.lock/b", ".hidden", "a/.b", "a:b", "a::b", "a~1", "a^", "a?", "a*", "a[b", `a\b`,
+	}
+	check := func(value string, wantErr bool) {
+		t.Helper()
 		resp := &validator.StringResponse{}
 		stringBranchName().ValidateString(t.Context(), validator.StringRequest{ConfigValue: types.StringValue(value), Path: path.Root("branch")}, resp)
 		if got := resp.Diagnostics.HasError(); got != wantErr {
-			t.Errorf("%q: hasError=%v want %v", value, got, wantErr)
+			t.Errorf("%q: hasError=%v want %v; diags=%v", value, got, wantErr, resp.Diagnostics)
+		}
+	}
+	for _, v := range valid {
+		check(v, false)
+	}
+	for _, v := range invalid {
+		check(v, true)
+	}
+	for _, v := range []types.String{types.StringNull(), types.StringUnknown()} {
+		resp := &validator.StringResponse{}
+		stringBranchName().ValidateString(t.Context(), validator.StringRequest{ConfigValue: v, Path: path.Root("branch")}, resp)
+		if resp.Diagnostics.HasError() {
+			t.Errorf("%s: unexpected error %v", v, resp.Diagnostics)
 		}
 	}
 }

@@ -109,16 +109,72 @@ func (v stringRegexValidator) ValidateString(_ context.Context, req validator.St
 	}
 }
 
-// stringBranchName is the shared shape check for branch and ref attributes: a
-// permissive character allowlist only (letters, digits, dot, underscore,
-// dash, slash). It does NOT reject "..", a leading or trailing slash, or
-// other git-invalid shapes; GitLab validates those server-side. This only
-// blocks whitespace and exotic characters.
+// stringBranchName is the shared check for branch and ref attributes: git's
+// ref-name rules (git check-ref-format, plus the leading dash --branch
+// rejects), so every name git accepts, "+", "@", "#" and non-ASCII
+// included, passes, and a name git would refuse fails at plan time. What
+// else GitLab refuses (a name like HEAD, a refs/heads/ prefix) is left to
+// GitLab. ':' is among git's forbidden characters and must stay rejected
+// here as well: the resource ID and the import ID join project_id and
+// branch with "::".
 func stringBranchName() validator.String {
-	return stringMatchesRegex(
-		`^[A-Za-z0-9_./-]+$`,
-		"branch name can only contain letters, digits, dot, underscore, dash, and slash",
-	)
+	return stringBranchNameValidator{}
+}
+
+type stringBranchNameValidator struct{}
+
+func (v stringBranchNameValidator) Description(_ context.Context) string {
+	return "must be a valid git ref name"
+}
+func (v stringBranchNameValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+func (v stringBranchNameValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if err := validateRefName(req.ConfigValue.ValueString()); err != nil {
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid ref name",
+			fmt.Sprintf("%q is not a valid git ref name: %s", req.ConfigValue.ValueString(), err))
+	}
+}
+
+func validateRefName(ref string) error {
+	switch {
+	case ref == "":
+		return errors.New("must not be empty")
+	case ref == "@":
+		return errors.New("must not be the single character \"@\"")
+	case strings.HasPrefix(ref, "-"):
+		return errors.New("must not start with a dash")
+	case strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/"):
+		return errors.New("must not start or end with a slash")
+	case strings.HasSuffix(ref, "."):
+		return errors.New("must not end with a dot")
+	case strings.Contains(ref, "//"):
+		return errors.New("must not contain consecutive slashes")
+	case strings.Contains(ref, ".."):
+		return errors.New("must not contain \"..\"")
+	case strings.Contains(ref, "@{"):
+		return errors.New("must not contain \"@{\"")
+	}
+	for _, c := range ref {
+		if c < 0x20 || c == 0x7f || c == ' ' {
+			return errors.New("must not contain spaces or control characters")
+		}
+		if strings.ContainsRune(`~^:?*[\`, c) {
+			return fmt.Errorf("must not contain %q", c)
+		}
+	}
+	for seg := range strings.SplitSeq(ref, "/") {
+		if strings.HasPrefix(seg, ".") {
+			return errors.New("no slash-separated part may start with a dot")
+		}
+		if strings.HasSuffix(seg, ".lock") {
+			return errors.New("no slash-separated part may end with \".lock\"")
+		}
+	}
+	return nil
 }
 
 // stringIsBase64 rejects a content_base64 value that does not decode, at plan

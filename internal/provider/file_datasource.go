@@ -58,7 +58,7 @@ func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, r
 				Validators:  []validator.String{stringNotEmpty()},
 			},
 			"branch": schema.StringAttribute{
-				Description: "Branch, tag or commit SHA to read the file from (letters, digits, dot, underscore, dash and slash).",
+				Description: "Branch, tag or commit SHA to read the file from. A name git refuses as a ref name (a space, \"..\", \":\", a trailing \".lock\" and the like) fails at plan time; any other name is passed to GitLab as it is.",
 				Required:    true,
 				Validators:  []validator.String{stringNotEmpty(), stringBranchName()},
 			},

@@ -36,7 +36,7 @@ output "renovate_content" {
 
 ### Required
 
-- `branch` (String) Branch, tag or commit SHA to read the file from (letters, digits, dot, underscore, dash and slash).
+- `branch` (String) Branch, tag or commit SHA to read the file from. A name git refuses as a ref name (a space, "..", ":", a trailing ".lock" and the like) fails at plan time; any other name is passed to GitLab as it is.
 - `file_path` (String) Path of the file inside the repository (relative, no leading slash).
 - `project_id` (String) Numeric project ID or the plain project path (e.g. "group/subgroup/project"); do not URL-encode it, the provider escapes it.
 
