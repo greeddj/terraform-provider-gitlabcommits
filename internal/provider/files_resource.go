@@ -393,9 +393,18 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 			},
 			"optimistic_lock": schema.BoolAttribute{
-				Description: "If true (default), update / delete / chmod actions send the file's last_commit_id to GitLab. " +
-					"GitLab rejects the action with HTTP 400 if the file has been modified by anyone else since " +
-					"this resource last touched it, preventing silent overwrites in concurrent pipelines. " +
+				Description: "If true (default), update / delete / chmod actions on a file this resource manages send the " +
+					"file's last_commit_id as the last refresh or apply recorded it, and GitLab rejects the commit with HTTP " +
+					"400 if the file changed after that point: the apply fails with nothing committed instead of overwriting " +
+					"a change another pipeline landed between the plan's refresh and the commit. A change made before that " +
+					"refresh does not fail the apply while detect_drift = true (default): the refresh records it, the plan " +
+					"shows reverting it as a change to the file, and applying the plan overwrites it. So review the plan: " +
+					"applying with -auto-approve overwrites such a change unseen, while applying a reviewed saved plan " +
+					"(terraform plan -out) fails instead of overwriting a file changed after the plan's refresh. With " +
+					"detect_drift = false a change made before that refresh fails the apply as well, at the cost described " +
+					"under detect_drift. A path the plan adds that already holds a file (see adopt_existing) is probed during " +
+					"the apply and updated with the last_commit_id that probe reads, so for it only a change landing between " +
+					"that probe and the commit fails the apply. " +
 					"Set to false to opt out (useful when an external process intentionally co-edits the same files). " +
 					"Without the token the provider probes each path before a delete or chmod, because GitLab would " +
 					"otherwise apply the action to whatever sits at the path, a directory included. " +
@@ -464,9 +473,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 							Computed: true,
 						},
 						"last_commit_id": schema.StringAttribute{
-							Description: "SHA of the last commit through which this resource touched the file. " +
-								"When optimistic_lock is enabled, sent to GitLab on update / delete to detect " +
-								"concurrent modifications.",
+							Description: "SHA of the last commit that modified the file, as the last refresh or apply " +
+								"recorded it; after a refresh that found the file changed, or an adoption, that is another " +
+								"writer's commit. When optimistic_lock is enabled, sent to GitLab on update / delete / chmod " +
+								"to detect a change made after that point.",
 							Computed: true,
 						},
 					},
@@ -2432,8 +2442,12 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 		case 400, 409:
 			if isLockConflict(err) {
 				summary = "Concurrent modification detected (optimistic_lock)"
-				return summary, fmt.Sprintf("%s: a file was modified by someone else since this resource last touched it. "+
-					"Run `terraform apply -refresh-only` to pull current state, then re-plan. If nobody else touched it, %s "+
+				return summary, fmt.Sprintf("%s: a file changed after its last_commit_id was recorded, in state by the "+
+					"last refresh or apply or, for a file this apply adopts, by the probe this apply made, so nothing was "+
+					"committed. Run `terraform apply -refresh-only` to pull current state, then re-plan. The refresh takes "+
+					"the other change into state as the new baseline (a file being adopted is simply probed again): the "+
+					"new plan shows what applying your configuration does to it, and applying that plan overwrites it, so "+
+					"review the plan first. If nobody else touched it, %s "+
 					"Body: %s", prefix, tagShadowHint(branch, "checks last_commit_id, so the check fails"), body)
 			}
 			// Gitaly refuses to move the ref when the branch tip changed between

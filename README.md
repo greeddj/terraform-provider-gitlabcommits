@@ -149,7 +149,7 @@ attribute on the provider block. In CI, prefer a CI variable such as
 | `detect_drift` | bool | no | Default `true`. If false, Read is a no-op. A refresh reads the value from state, so a new value affects refreshes only once an apply has recorded it; see Caveats. |
 | `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. Read from the state of the last apply; see Caveats. |
 | `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist, or to no action when their content already matches (needed for clean import). A path that cannot be read fails the apply without a commit. |
-| `optimistic_lock` | bool | no | Default `true`. Send each file's `last_commit_id` so GitLab rejects concurrent updates with HTTP 400. Set to `false` to opt out. Not sent on the first commit of a branch created from `create_branch_from`. For the destroy commit, read from the state of the last apply. |
+| `optimistic_lock` | bool | no | Default `true`. Send each managed file's `last_commit_id`, as the last refresh or apply recorded it (for a file the apply adopts, as its probe during the apply reads it), so GitLab rejects the commit with HTTP 400 and the apply fails when the file changed after that point; with `detect_drift = true` a change made before the plan's refresh shows up in the plan and is overwritten by applying it (see Caveats). Set to `false` to opt out. Not sent on the first commit of a branch created from `create_branch_from`. For the destroy commit, read from the state of the last apply. |
 | `files` | map of object | yes | See below. Must not be empty: `files = {}` would mean "delete everything", which is what `terraform destroy` is for. An entry must not be null; omit its key to leave a file out. |
 | `id` | string | computed | Composite identifier `<project_id>::<branch>`. |
 | `commit_sha` | string | computed | SHA of the most recent commit produced by this resource. |
@@ -162,7 +162,7 @@ attribute on the provider block. In CI, prefer a CI variable such as
 | `content_base64` | string | no | base64-encoded content (use for binaries); mutually exclusive with `content` |
 | `execute_filemode` | bool | no | default `false`; toggling triggers a `chmod` action |
 | `blob_id` | string | yes | opaque blob identifier returned by GitLab; used for drift detection (git SHA-1 today, possibly SHA-256 on SHA-256 repos) |
-| `last_commit_id` | string | yes | SHA of the last commit through which this resource touched the file; sent on update / delete when `optimistic_lock = true` |
+| `last_commit_id` | string | yes | SHA of the last commit that modified the file, as the last refresh or apply recorded it (after a refresh that found the file changed, or an adoption, another writer's commit); sent on update / delete / chmod when `optimistic_lock = true` |
 
 ## Data sources
 
@@ -345,11 +345,27 @@ converges without a commit.
 - **State holds your file content.** If you set `content_base64` to the bytes
   of a 10 MB binary, those bytes live in `terraform.tfstate`. Use a secrets
   backend and avoid committing huge binaries through this provider.
-- **Optimistic locking is on by default.** Each update / delete action sends
-  the file's `last_commit_id` so GitLab rejects the action with HTTP 400 if
-  someone else has touched the file since this resource last did. The
-  provider surfaces those as "Concurrent modification detected" diagnostics
-  with a hint to run `terraform apply -refresh-only` (with
+- **Optimistic locking is on by default.** Each update / delete / chmod
+  action on a managed file sends the file's `last_commit_id` as the last
+  refresh or apply recorded it, so GitLab rejects the commit with HTTP 400
+  if the file changed after that point: the apply fails with nothing
+  committed instead of overwriting a change another pipeline landed
+  between the plan's refresh and the commit. A change made *before* that
+  refresh does not fail the apply while `detect_drift = true` (default):
+  the refresh records it, the plan shows reverting it as a change to the
+  file, and applying the plan overwrites it. So review the plan: a pipeline
+  that applies with `-auto-approve` overwrites such a change unseen, while
+  applying a reviewed saved plan (`terraform plan -out`) fails instead of
+  overwriting a file changed after the plan's refresh. With
+  `detect_drift = false` a change made before that refresh fails the apply
+  as well, at the cost described above. A path the plan adds that already
+  holds a file (`adopt_existing`) is probed during the apply and updated
+  with the `last_commit_id` that probe reads, so for it only a change
+  landing between that probe and the commit fails the apply. The provider
+  surfaces a rejection as a "Concurrent modification detected" diagnostic
+  with a hint to run `terraform apply -refresh-only` and plan again; that
+  refresh takes the other change into state as the new baseline, so
+  applying the new plan overwrites it, and it is worth reviewing first (with
   `detect_drift = false` recorded in state that refresh changes nothing,
   and the diagnostic says what to do instead; see above). Set
   `optimistic_lock = false` per resource to opt out (e.g. when an external
