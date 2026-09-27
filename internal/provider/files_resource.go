@@ -2603,15 +2603,17 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 		switch status {
 		case 401:
 			summary = "GitLab authentication failed (HTTP 401)"
-			return summary, fmt.Sprintf("%s: token rejected. Verify the token has the `api` scope (or, for a fine-grained token, the required permissions) and is not expired. Body: %s", prefix, body)
+			return summary, fmt.Sprintf("%s: token rejected. Verify the token has the `api` scope (or, for a fine-grained token, the "+
+				"required permissions) and is not expired. A CI job token (CI_JOB_TOKEN) is not supported: GitLab does not "+
+				"accept one in the Private-Token header this provider sends; use a Personal / Project / Group access token. "+
+				"Body: %s", prefix, body)
 		case 403:
 			summary = "GitLab permission denied (HTTP 403)"
 			return summary, fmt.Sprintf("%s: %s Body: %s", prefix,
 				"The token was rejected by GitLab. Verify that: "+
 					"(1) the token has the `api` scope, or the fine-grained permissions Commit: Create, Repository: Read and Branch: Read (write_repository alone does not authenticate REST API calls); "+
 					"(2) the token's user has the Developer role on the project, or Maintainer for a protected branch; "+
-					"(3) if you are using CI_JOB_TOKEN, switch to a Personal / Project / Group access token - job tokens cannot POST to /repository/commits; "+
-					"(4) if your group or instance enforces fine-grained personal access tokens, a legacy `api` token is refused after the enforcement date and the body lists the permissions a fine-grained token needs.",
+					"(3) if your group or instance enforces fine-grained personal access tokens, a legacy `api` token is refused after the enforcement date and the body lists the permissions a fine-grained token needs.",
 				body)
 		case 400, 409:
 			if isLockConflict(err) {

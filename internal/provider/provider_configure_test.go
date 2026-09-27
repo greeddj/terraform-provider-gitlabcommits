@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -356,6 +357,50 @@ func TestConfigure_UnknownRetrySettingsError(t *testing.T) {
 			})
 			if !resp.Diagnostics.HasError() {
 				t.Fatalf("expected an error for unknown %s", attr)
+			}
+		})
+	}
+}
+
+// TestConfigure_RejectsJobTokens: a CI job token goes out as Private-Token,
+// which GitLab does not accept for one, so every request would fail as a
+// 401 or a 404 that points elsewhere; Configure refuses it up front, by its
+// prefix (after an instance prefix too) or by being the job's CI_JOB_TOKEN.
+func TestConfigure_RejectsJobTokens(t *testing.T) {
+	t.Setenv("GITLAB_BASE_URL", "")
+	cases := []struct {
+		name, token, jobToken string
+		rejected              bool
+	}{
+		{name: "prefixed job token", token: "glcbt-eyJhbGciOi.payload.sig", rejected: true},
+		{name: "instance prefix", token: "mycorp-glcbt-eyJhbGciOi.payload.sig", rejected: true},
+		{name: "the job's CI_JOB_TOKEN", token: "0123456789abcdef0123", jobToken: "0123456789abcdef0123", rejected: true},
+		{name: "personal access token", token: "glpat-0123456789abcdefghij"},
+		{name: "instance-prefixed personal access token", token: "mycorp-glpat-0123456789abcdefghij"},
+		{name: "glcbt inside another token", token: "glpat-abcglcbt-0123456789"},
+		{name: "prefix longer than GitLab allows", token: strings.Repeat("a", 21) + "-glcbt-0123456789"},
+		{name: "CI_JOB_TOKEN set to another value", token: "glpat-0123456789abcdefghij", jobToken: "0123456789abcdef0123"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("CI_JOB_TOKEN", c.jobToken)
+			t.Setenv("GITLAB_TOKEN", c.token)
+			resp := runConfigure(t, nil)
+			if !c.rejected {
+				if resp.Diagnostics.HasError() {
+					t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+				}
+				return
+			}
+			errs := resp.Diagnostics.Errors()
+			if len(errs) != 1 || errs[0].Summary() != "CI job tokens are not supported" {
+				t.Fatalf("want the job-token error, got %v", resp.Diagnostics)
+			}
+			if d, ok := errs[0].(interface{ Path() path.Path }); !ok || !d.Path().Equal(path.Root("token")) {
+				t.Errorf("the error must point at the token attribute, got %v", errs[0])
+			}
+			if !strings.Contains(errs[0].Detail(), "Private-Token") {
+				t.Errorf("detail must say why: %s", errs[0].Detail())
 			}
 		})
 	}

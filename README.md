@@ -138,10 +138,12 @@ attribute on the provider block. In CI, prefer a CI variable such as
 
 > The `write_repository` scope is for Git-over-HTTP (push/pull) and does
 > **not** authenticate REST API calls - of the legacy scopes only `api` does.
-> `CI_JOB_TOKEN` is not supported: GitLab's job-token allowlist permits only
-> GET on the Commits, Files and Branches APIs (fine-grained job token
-> permissions add nothing beyond `READ_REPOSITORIES` there), while this
-> provider needs `POST /repository/commits`.
+> `CI_JOB_TOKEN` is not supported, and the provider rejects a job token when
+> it is configured. It authenticates with the `Private-Token` header, which
+> GitLab does not accept for a job token: depending on the version GitLab
+> answers 401, or ignores the token and runs the request anonymously (a 404
+> on a private project, a 401 on the commit for a public one). GitLab's
+> job-token allowlist leaves out `POST /repository/commits` anyway.
 
 ## Resource: `gitlabcommits_files`
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -34,6 +35,11 @@ var (
 // Uploads are not bounded by it, which matters for large commits; it only
 // starts once GitLab has the whole request.
 const responseHeaderTimeout = 5 * time.Minute
+
+// jobTokenPattern matches a CI job token: "glcbt-", after the instance token
+// prefix and its hyphen when the instance sets one (GitLab allows up to 20
+// alphanumerics there).
+var jobTokenPattern = regexp.MustCompile(`^(?:[A-Za-z0-9]{1,20}-)?glcbt-`)
 
 // New is a helper function to simplify provider server and testing implementation.
 func New(version string) func() provider.Provider {
@@ -70,7 +76,9 @@ func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaReque
 			"token": schema.StringAttribute{
 				Description: "GitLab token used for REST API calls: a Personal, Project, or Group access token with the `api` scope, " +
 					"or a fine-grained personal access token (GitLab 19.2+) with Commit: Create, Repository: Read and Branch: Read " +
-					"(plus Branch: Create when create_branch_from is used). CI_JOB_TOKEN is not supported (its allowlist excludes POST /repository/commits). " +
+					"(plus Branch: Create when create_branch_from is used). A CI job token (CI_JOB_TOKEN) is rejected: the provider " +
+					"authenticates with the Private-Token header, which GitLab does not accept for a job token, and the job-token " +
+					"allowlist leaves out POST /repository/commits anyway. " +
 					"May also be provided via the GITLAB_TOKEN environment variable. See the provider documentation's Authentication section for details.",
 				Optional:  true,
 				Sensitive: true,
@@ -170,6 +178,18 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 			path.Root("token"),
 			"Malformed GitLab API Token",
 			"The token contains leading or trailing whitespace or a control character; check for a trailing newline if it came from a file or a shell substitution.",
+		)
+		return
+	}
+	if isJobToken(token) {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("token"),
+			"CI job tokens are not supported",
+			"The token is a CI job token (CI_JOB_TOKEN). The provider authenticates with the Private-Token header, which "+
+				"GitLab does not accept for a job token: depending on the version it answers 401 or ignores the token and "+
+				"runs the request anonymously. The job-token allowlist leaves out POST /repository/commits as well. Use a "+
+				"Personal, Project or Group access token with the `api` scope, or a fine-grained personal access token; "+
+				"see the provider documentation's Authentication section.",
 		)
 		return
 	}
@@ -312,4 +332,14 @@ func crossHostRedirectGuard(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 	return nil
+}
+
+// isJobToken reports whether token is a CI job token, by its prefix or, for
+// a job token from before the prefix or an instance prefix the pattern
+// misses, by being the job's own CI_JOB_TOKEN.
+func isJobToken(token string) bool {
+	if jobToken := os.Getenv("CI_JOB_TOKEN"); jobToken != "" && token == jobToken {
+		return true
+	}
+	return jobTokenPattern.MatchString(token)
 }

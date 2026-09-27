@@ -60,10 +60,12 @@ attribute on the provider block. In CI, prefer a CI variable such as
 
 The `write_repository` scope is for Git-over-HTTP (push/pull) and does
 **not** authenticate REST API calls; of the legacy scopes only `api` does.
-`CI_JOB_TOKEN` is not supported: GitLab's job-token allowlist permits only
-GET on the Commits, Files and Branches APIs (fine-grained job token
-permissions add nothing beyond `READ_REPOSITORIES` there), while this
-provider needs `POST /repository/commits`.
+`CI_JOB_TOKEN` is not supported, and the provider rejects a job token when it
+is configured. It authenticates with the `Private-Token` header, which GitLab
+does not accept for a job token: depending on the version GitLab answers 401,
+or ignores the token and runs the request anonymously (a 404 on a private
+project, a 401 on the commit for a public one). GitLab's job-token allowlist
+leaves out `POST /repository/commits` anyway.
 
 ## Limits, retries and timeouts
 
@@ -124,4 +126,4 @@ provider needs `POST /repository/commits`.
 - `max_retries` (Number) Maximum number of retries on transient failures (5xx, 429) for read and probe requests. The commit request (POST /repository/commits) is retried only on 429 and on connection failures that happen before the request is sent, never on 5xx, so one apply cannot land two commits. Default 5. Set to 0 to disable retries entirely.
 - `retry_wait_max_ms` (Number) Bounds (ms) the random jitter added to each rate-limited (429) retry wait; the wait itself is the growing base plus that jitter and can exceed this value. Default 30000.
 - `retry_wait_min_ms` (Number) Base wait (ms) between rate-limited (429) retries; it doubles with each attempt and the RateLimit-Reset header extends it when GitLab sends one. 5xx retries use the client's fixed 700-900 ms schedule instead. Default 1000.
-- `token` (String, Sensitive) GitLab token used for REST API calls: a Personal, Project, or Group access token with the `api` scope, or a fine-grained personal access token (GitLab 19.2+) with Commit: Create, Repository: Read and Branch: Read (plus Branch: Create when create_branch_from is used). CI_JOB_TOKEN is not supported (its allowlist excludes POST /repository/commits). May also be provided via the GITLAB_TOKEN environment variable. See the provider documentation's Authentication section for details.
+- `token` (String, Sensitive) GitLab token used for REST API calls: a Personal, Project, or Group access token with the `api` scope, or a fine-grained personal access token (GitLab 19.2+) with Commit: Create, Repository: Read and Branch: Read (plus Branch: Create when create_branch_from is used). A CI job token (CI_JOB_TOKEN) is rejected: the provider authenticates with the Private-Token header, which GitLab does not accept for a job token, and the job-token allowlist leaves out POST /repository/commits anyway. May also be provided via the GITLAB_TOKEN environment variable. See the provider documentation's Authentication section for details.

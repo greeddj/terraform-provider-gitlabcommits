@@ -629,12 +629,13 @@ func TestApiErrorDiag(t *testing.T) {
 		{
 			name: "401", err: mkErr(401, "invalid token", nil),
 			wantSummary: "GitLab authentication failed (HTTP 401)",
-			contains:    []string{"token rejected", "invalid token"},
+			contains:    []string{"token rejected", "invalid token", "CI_JOB_TOKEN", "Private-Token"},
 		},
 		{
 			name: "403", err: mkErr(403, "forbidden", nil),
 			wantSummary: "GitLab permission denied (HTTP 403)",
-			contains:    []string{"api", "Developer", "CI_JOB_TOKEN"},
+			contains:    []string{"api", "Developer"},
+			absent:      []string{"CI_JOB_TOKEN"},
 		},
 		{
 			// CheckResponse answers every 404 with this one shared value, so it
