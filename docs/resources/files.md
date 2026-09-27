@@ -84,7 +84,7 @@ resource "gitlabcommits_files" "service" {
 
 Optional:
 
-- `content` (String) Text content. Mutually exclusive with content_base64. Not intended for secret values: it is stored in plaintext in state and printed in plan / apply output (and thus CI logs). Deliver secrets via SealedSecrets / ExternalSecrets / Vault and reference them from the managed file.
+- `content` (String) Text content. Mutually exclusive with content_base64. Not intended for secret values: it is stored in plaintext in state and printed in plan / apply output (and thus CI logs). Deliver secrets via SealedSecrets / ExternalSecrets / Vault and reference them from the managed file. When the file drifts to bytes that are not valid UTF-8, which content cannot hold, a refresh records them in content_base64 instead, with a warning: the next apply restores this content, and switching the file to content_base64 keeps the new bytes.
 - `content_base64` (String) Base64-encoded content (use for binaries). Mutually exclusive with content. Not intended for secret values (see content).
 - `execute_filemode` (Boolean) Whether the file should have the executable bit set.
 

@@ -428,7 +428,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 						"content": schema.StringAttribute{
 							Description: "Text content. Mutually exclusive with content_base64. Not intended for secret " +
 								"values: it is stored in plaintext in state and printed in plan / apply output (and thus CI logs). " +
-								"Deliver secrets via SealedSecrets / ExternalSecrets / Vault and reference them from the managed file.",
+								"Deliver secrets via SealedSecrets / ExternalSecrets / Vault and reference them from the managed file. " +
+								"When the file drifts to bytes that are not valid UTF-8, which content cannot hold, a refresh " +
+								"records them in content_base64 instead, with a warning: the next apply restores this content, " +
+								"and switching the file to content_base64 keeps the new bytes.",
 							Optional: true,
 							Validators: []validator.String{
 								stringConflictsWithSibling("content_base64"),
@@ -847,24 +850,45 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 			f.LastCommitID = types.StringValue(res.file.LastCommitID)
 		}
 		f.ExecuteFilemode = types.BoolValue(res.file.ExecuteFilemode)
-		// Preserve whichever form the user originally chose.
-		if !f.ContentBase64.IsNull() {
-			f.ContentBase64 = types.StringValue(base64.StdEncoding.EncodeToString(raw))
-		} else {
-			// cty silently replaces invalid UTF-8 with U+FFFD, so storing
-			// binary drift into the text attribute would corrupt state and
-			// produce a diff that can never converge.
-			if !utf8.Valid(raw) {
-				resp.Diagnostics.AddError("Remote file is not valid UTF-8",
-					fmt.Sprintf("file %q drifted to binary content that cannot be represented in the text `content` attribute; manage this file via `content_base64` instead", p))
-				return
-			}
-			f.Content = types.StringValue(string(raw))
+		if misfit := setRemoteContent(&f, raw); misfit != "" {
+			resp.Diagnostics.AddWarning("Remote file recorded as content_base64",
+				fmt.Sprintf("file %q is managed through `content`, but its content on branch %q %s, which `content` cannot "+
+					"hold, so state records it in `content_base64`. The next apply restores the configured `content`. To "+
+					"keep the new bytes instead, manage the file through `content_base64`.", p, branch, misfit))
 		}
 		state.Files[p] = f
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+// setRemoteContent stores raw in f in the form f is managed through. Bytes
+// the text form cannot hold (see textContentMisfit) go to content_base64
+// instead, with content null, and misfit says why. Read never sees the
+// configuration, so an error there would block every refresh whatever the
+// file is switched to; content_base64 keeps the bytes exact, and the next
+// plan shows the configured content replacing them.
+func setRemoteContent(f *fileModel, raw []byte) (misfit string) {
+	if f.ContentBase64.IsNull() {
+		if misfit = textContentMisfit(raw); misfit == "" {
+			f.Content = types.StringValue(string(raw))
+			return ""
+		}
+		f.Content = types.StringNull()
+	}
+	f.ContentBase64 = types.StringValue(base64.StdEncoding.EncodeToString(raw))
+	return misfit
+}
+
+// textContentMisfit says why raw cannot be held in the text `content`
+// attribute, or returns "" when it can. cty replaces invalid UTF-8 with
+// U+FFFD, so such bytes stored as text would be corrupted in state and the
+// diff could never converge.
+func textContentMisfit(raw []byte) string {
+	if !utf8.Valid(raw) {
+		return "is not valid UTF-8"
+	}
+	return ""
 }
 
 func allDropped(results []fileRefreshResult) bool {

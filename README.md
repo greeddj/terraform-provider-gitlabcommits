@@ -41,7 +41,10 @@ branch of one project. The provider:
   (`GetFileMetaData`) and compares the GitLab-returned `blob_id` and exec
   bit with state. Only when the blob has actually drifted does it pull the
   full content. Any drift updates state, so the next plan shows real
-  differences against the repo.
+  differences against the repo. A file managed through `content` that
+  drifts to bytes that are not valid UTF-8 is recorded in `content_base64`
+  instead, with a warning: the next apply restores the configured text, and
+  switching the file to `content_base64` keeps the new bytes.
 - **Update** - diffs plan vs state and emits the **minimum** set of actions:
   gone paths -> `delete` (emitted first), new paths -> `create`, or nothing
   when the path already exists with identical content, content changed ->
@@ -155,7 +158,7 @@ attribute on the provider block. In CI, prefer a CI variable such as
 
 | Field | Type | Computed | Notes |
 | --- | --- | --- | --- |
-| `content` | string | no | text content; mutually exclusive with `content_base64` |
+| `content` | string | no | text content; mutually exclusive with `content_base64`; drift to bytes that are not valid UTF-8 is recorded in `content_base64` (see Read above) |
 | `content_base64` | string | no | base64-encoded content (use for binaries); mutually exclusive with `content` |
 | `execute_filemode` | bool | no | default `false`; toggling triggers a `chmod` action |
 | `blob_id` | string | yes | opaque blob identifier returned by GitLab; used for drift detection (git SHA-1 today, possibly SHA-256 on SHA-256 repos) |

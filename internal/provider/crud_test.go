@@ -85,14 +85,16 @@ func deleteRequest(t *testing.T, res *filesResource, state filesResourceModel) (
 // or with a stale last_commit_id; an accepted commit is applied to the map.
 // branchStatus, commitStatus and probeStatus (per path) override the answers
 // for GET /branches/, a commit and a probe. Every file holds the content
-// "x", which a content fetch returns. Every project_id spelling reaches the
-// same branch; projects answers a project lookup with the numeric id for a
-// spelling (projectStatus overrides it), and while it is nil a lookup is an
+// "x", which a content fetch returns, unless content holds other bytes for
+// its path. Every project_id spelling reaches the same branch; projects
+// answers a project lookup with the numeric id for a spelling
+// (projectStatus overrides it), and while it is nil a lookup is an
 // unexpected call. beforeCommit, when set, runs as a commit arrives and
 // before it is handled, without holding the fake's lock. Commits, probes
 // (metadata requests) and project lookups are recorded, accepted or not.
 type repoFake struct {
 	files         map[string]string
+	content       map[string][]byte
 	probeStatus   map[string]int
 	projects      map[string]int64
 	beforeCommit  func()
@@ -142,8 +144,12 @@ func (f *repoFake) handler(t *testing.T) http.HandlerFunc {
 				http.Error(w, "404 File Not Found", http.StatusNotFound)
 				return
 			}
+			content, ok := f.content[p]
+			if !ok {
+				content = []byte("x")
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write(fileJSON(p, "blob-"+lcid, lcid, []byte("x")))
+			_, _ = w.Write(fileJSON(p, "blob-"+lcid, lcid, content))
 		case isTreeRequest(r):
 			var entries []gitlab.TreeNode
 			for _, p := range slices.Sorted(maps.Keys(f.files)) {
