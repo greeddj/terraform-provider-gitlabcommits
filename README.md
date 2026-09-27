@@ -34,7 +34,9 @@ branch of one project. The provider:
   same operation as the commit (one push event); with nothing to commit it is
   created on its own. A branch name is resolved to its head commit first,
   and the files are compared with that commit and the branch created from
-  it, even if the source branch moves in the meantime.
+  it, even if the source branch moves in the meantime. In a repository with
+  no commits yet, leave `create_branch_from` unset: the first commit creates
+  the branch.
 - **Read** - probes each managed file via a HEAD-style metadata call
   (`GetFileMetaData`) and compares the GitLab-returned `blob_id` and exec
   bit with state. Only when the blob has actually drifted does it pull the
@@ -136,11 +138,11 @@ attribute on the provider block. In CI, prefer a CI variable such as
 | Argument | Type | Required | Description |
 | --- | --- | --- | --- |
 | `project_id` | string | yes | Numeric project ID or plain project path (`group/subgroup/project`, not URL-encoded). Changing it, respelling it, or a value unknown at plan time forces replacement; see Caveats. |
-| `branch` | string | yes | Target branch (must exist, or set `create_branch_from`). Changing it, or a value unknown at plan time, forces replacement; see Caveats. |
+| `branch` | string | yes | Target branch (must exist, or set `create_branch_from`; in a repository with no commits yet the first commit creates it). Changing it, or a value unknown at plan time, forces replacement; see Caveats. |
 | `commit_message` | string | yes | Used for any commit produced (create / update / destroy). |
 | `author_name` | string | no | Override commit author name. |
 | `author_email` | string | no | Override commit author email. |
-| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit, or on its own when there is nothing to commit. A branch name is resolved to its head commit once, when the resource is created. The branch is not deleted on destroy. |
+| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit, or on its own when there is nothing to commit. A branch name is resolved to its head commit once, when the resource is created. Must be unset in a repository with no commits yet. The branch is not deleted on destroy. |
 | `detect_drift` | bool | no | Default `true`. If false, Read is a no-op. |
 | `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. Read from the state of the last apply; see Caveats. |
 | `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist, or to no action when their content already matches (needed for clean import). A path that cannot be read fails the apply without a commit. |

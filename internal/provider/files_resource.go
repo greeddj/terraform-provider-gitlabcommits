@@ -301,7 +301,8 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 			},
 			"branch": schema.StringAttribute{
-				Description: "Target branch. Must already exist, or set create_branch_from to materialise it. " +
+				Description: "Target branch. Must already exist, or set create_branch_from to materialise it; in a repository " +
+					"with no commits yet, leave create_branch_from unset and the first commit creates the branch. " +
 					"Changing it forces replacement, and so does a value that is unknown at plan time, even one that turns " +
 					"out unchanged. Without create_before_destroy the old object is destroyed first: with the default " +
 					"delete_on_destroy = true that pushes a commit deleting every managed file from the old branch before " +
@@ -376,7 +377,7 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					"the first commit, as one push event (when adoption leaves nothing to commit, the branch is created on its own). " +
 					"A branch name is resolved to its head commit once, and both adoption and the new branch use that " +
 					"commit, so a commit pushed to the source branch in the meantime, by another resource in the same " +
-					"apply included, is not part of the new branch. " +
+					"apply included, is not part of the new branch. Must be unset in a repository with no commits yet. " +
 					"Only consulted by Create; once the branch exists, changing or removing this value is a " +
 					"state-only no-op (no destroy / recreate). A branch created this way is not deleted by " +
 					"terraform destroy; only the managed files are.",
@@ -515,7 +516,7 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 	}
 	// base is the commit a missing branch is created from, resolved once so
 	// the probes and the new branch read the same tree even when
-	// create_branch_from moves meanwhile.
+	// create_branch_from moves meanwhile; it stays "" on an empty repository.
 	var base string
 	if !branchExists {
 		var err error
@@ -589,7 +590,8 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 	if len(actions) == 0 {
 		// Every path was adopted with identical content and mode: nothing to
 		// commit. A missing branch is still materialised, as a bare branch
-		// creation (one push event, no commit).
+		// creation (one push event, no commit). base is never "" here: on an
+		// empty repository every path is a create.
 		if !branchExists {
 			if err := r.createBranch(ctx, project, branch, base); err != nil {
 				// client-go replays the POST after a 5xx, and a replay of a
@@ -622,7 +624,11 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 
 	opts := commitOptions(plan, actions)
 	action := "creating commit"
-	if !branchExists {
+	if !branchExists && base == "" {
+		// On an empty repository the commit carries the branch alone: GitLab
+		// makes it the root commit and creates the branch with it.
+		action = fmt.Sprintf("creating branch %q with the first commit of the empty repository", branch)
+	} else if !branchExists {
 		// start_sha makes GitLab create the branch and land the commit in one
 		// operation: a server-side rejection (push rule, pre-receive hook)
 		// leaves no empty orphaned branch behind, and CI sees one push event
@@ -1235,11 +1241,16 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 
 // createActions builds Create's actions: the paths are probed at ref (see
 // probeAdded) and each becomes a create, an adopt-update or nothing (see
-// adoptAwareActions).
+// adoptAwareActions). An empty ref is an empty repository, where nothing
+// exists to probe or adopt.
 func (r *filesResource) createActions(ctx context.Context, plan filesResourceModel, ref string, paths []string) ([]*gitlab.CommitActionOptions, map[string]remoteProbe, diag.Diagnostics) {
-	probes, diags := r.probeAdded(ctx, plan, ref, paths, nil)
-	if diags.HasError() {
-		return nil, nil, diags
+	var probes map[string]remoteProbe
+	if ref != "" {
+		var diags diag.Diagnostics
+		probes, diags = r.probeAdded(ctx, plan, ref, paths, nil)
+		if diags.HasError() {
+			return nil, nil, diags
+		}
 	}
 	actions := make([]*gitlab.CommitActionOptions, 0, len(paths))
 	for _, p := range paths {
@@ -1955,8 +1966,9 @@ func (r *filesResource) branchExists(ctx context.Context, project, branch string
 // start_sha, otherwise the head of that branch. Resolving it once keeps the
 // adopt probes and the new branch on one tree while the branch moves. A 404
 // on the project means the project itself is the problem (missing, or
-// invisible to the token), not the branch, and a repository with no commits
-// has no ref to start from at all.
+// invisible to the token), not the branch. A repository with no commits has
+// no ref to start from: without create_branch_from the first commit becomes
+// its root commit and creates the branch, so the commit returned is "".
 func (r *filesResource) missingBranchPreflight(ctx context.Context, project, branch, createFrom string) (string, error) {
 	proj, _, err := r.client.Projects.GetProject(project, nil, gitlab.WithContext(ctx))
 	if err != nil {
@@ -1967,8 +1979,11 @@ func (r *filesResource) missingBranchPreflight(ctx context.Context, project, bra
 		return "", fmt.Errorf("checking project %q: %w", project, err)
 	}
 	if proj != nil && proj.EmptyRepo {
-		return "", fmt.Errorf("repository %q has no commits, so branch %q cannot exist and create_branch_from has no ref to start from; "+
-			"create an initial commit first (for example initialize the project with a README)", project, branch)
+		if createFrom != "" {
+			return "", fmt.Errorf("repository %q has no commits, so create_branch_from %q has nothing to start from; "+
+				"remove create_branch_from and the first commit creates branch %q in the empty repository", project, createFrom, branch)
+		}
+		return "", nil
 	}
 	if createFrom == "" {
 		return "", fmt.Errorf("branch %q does not exist; set create_branch_from to materialise it", branch)

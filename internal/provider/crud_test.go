@@ -989,19 +989,30 @@ func TestUpdate_NoOpProducesNoCommit(t *testing.T) {
 	}
 }
 
-// TestCreate_EmptyRepositoryDiagnostics: on a project with zero commits every
-// branch lookup 404s and no ref exists to branch from, so the usual "set
-// create_branch_from" advice is a dead end. Create must say what actually
-// helps, with or without create_branch_from configured, and commit nothing.
-func TestCreate_EmptyRepositoryDiagnostics(t *testing.T) {
+// TestCreate_EmptyRepository: on a project with no commits every branch
+// lookup 404s and no ref exists to branch from. Without create_branch_from,
+// Create sends one commit naming the branch alone, which GitLab makes the
+// root commit together with the branch; nothing can exist yet, so nothing is
+// probed before it. With create_branch_from set the ref cannot exist, and
+// Create says to remove it rather than ignoring it.
+func TestCreate_EmptyRepository(t *testing.T) {
 	for _, withFrom := range []bool{false, true} {
 		t.Run(fmt.Sprintf("create_branch_from set %v", withFrom), func(t *testing.T) {
+			var bodies []string
 			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
 					http.Error(w, "no branch", http.StatusNotFound)
 				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
 					projectJSON(w, true)
+				case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "rootsha":
+					stampHeaders(w, "rootsha")
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/commits"):
+					b, _ := io.ReadAll(r.Body)
+					bodies = append(bodies, string(b))
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(`{"id":"rootsha"}`))
 				default:
 					t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
 					http.Error(w, "unexpected", http.StatusInternalServerError)
@@ -1013,7 +1024,32 @@ func TestCreate_EmptyRepositoryDiagnostics(t *testing.T) {
 				plan.CreateBranchFrom = types.StringValue("main")
 			}
 			resp := runCreate(t, client, plan)
-			wantDiag(t, "error", resp.Diagnostics.Errors(), "no commits")
+			if withFrom {
+				if !resp.Diagnostics.HasError() || !strings.Contains(resp.Diagnostics.Errors()[0].Detail(), "remove create_branch_from") {
+					t.Fatalf("want the diagnostic to say to remove create_branch_from, got: %v", resp.Diagnostics)
+				}
+				if len(bodies) != 0 {
+					t.Errorf("commits = %d, want none", len(bodies))
+				}
+				return
+			}
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+			if len(bodies) != 1 {
+				t.Fatalf("commits = %d, want 1", len(bodies))
+			}
+			body := bodies[0]
+			if !strings.Contains(body, `"branch":"main"`) || strings.Contains(body, "start_") || !strings.Contains(body, `"action":"create"`) {
+				t.Errorf("the first commit must name the branch alone and create the file, body: %s", body)
+			}
+			var out filesResourceModel
+			if d := resp.State.Get(t.Context(), &out); d.HasError() {
+				t.Fatalf("state.Get: %v", d)
+			}
+			if out.CommitSHA.ValueString() != "rootsha" || out.Files["f.txt"].LastCommitID.ValueString() != "rootsha" {
+				t.Errorf("state must record the root commit, got commit_sha=%q", out.CommitSHA.ValueString())
+			}
 		})
 	}
 }

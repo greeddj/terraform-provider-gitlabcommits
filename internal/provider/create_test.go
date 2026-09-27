@@ -655,7 +655,7 @@ func TestCreate_LogsTheActionCount(t *testing.T) {
 
 // TestMissingBranchPreflight_ResolvesBase pins the commit a missing branch
 // starts from: a commit SHA as it is (lowercased), a branch by its head, and
-// an error on an empty repository, which has nothing to start from.
+// no commit at all on an empty repository without create_branch_from.
 func TestMissingBranchPreflight_ResolvesBase(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	cases := []struct {
@@ -669,8 +669,8 @@ func TestMissingBranchPreflight_ResolvesBase(t *testing.T) {
 		{name: "branch lookup fails", from: "main", branchStatus: http.StatusForbidden, wantErr: `resolving create_branch_from branch "main"`},
 		{name: "branch without a head", from: "main", branchBody: `{"name":"main","commit":null}`, wantErr: "no head commit"},
 		{name: "branch head without an id", from: "main", branchBody: `{"name":"main","commit":{"id":""}}`, wantErr: "no head commit"},
-		{name: "empty repository", empty: true, wantErr: "no commits"},
-		{name: "empty repository with a source", from: "main", empty: true, wantErr: "no commits"},
+		{name: "empty repository", empty: true, want: ""},
+		{name: "empty repository with a source", from: "main", empty: true, wantErr: "remove create_branch_from"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
