@@ -20,8 +20,8 @@ import (
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 )
 
-// TestDecodeRemoteContent_NilFile pins the DOS-3 guard: a nil *File (which the
-// client returns for a 2xx JSON-null body) must produce an error, not a panic.
+// TestDecodeRemoteContent_NilFile: a nil *File, which the client returns for a
+// 2xx JSON-null body, must produce an error, not a panic.
 func TestDecodeRemoteContent_NilFile(t *testing.T) {
 	if _, err := decodeRemoteContent(nil); err == nil {
 		t.Fatal("decodeRemoteContent(nil) must return an error, not panic")
@@ -121,7 +121,7 @@ func TestCrossHostRedirect_EndToEnd(t *testing.T) {
 }
 
 // TestNullBodyDecodesToNilCommit documents the precondition the Create/Update
-// nil-guards (DOS-1) defend against: client-go decodes a 2xx JSON-null body into
+// nil-guards defend against: client-go decodes a 2xx JSON-null body into
 // a nil *Commit with no error. If a future client-go changes this, the guards can
 // be revisited.
 func TestNullBodyDecodesToNilCommit(t *testing.T) {
@@ -150,8 +150,8 @@ func TestNullBodyDecodesToNilCommit(t *testing.T) {
 }
 
 // TestBranchHeadDataSource_NilCommitNoPanic drives the branch_head data source
-// (DOS-2) against a server that returns a branch with a null commit, asserting a
-// clean error diagnostic instead of a nil-deref panic.
+// against a server that returns a branch with a null commit, asserting a clean
+// error diagnostic instead of a nil-deref panic.
 func TestBranchHeadDataSource_NilCommitNoPanic(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -227,8 +227,8 @@ func TestBranchHeadDataSource_HappyPath(t *testing.T) {
 	}
 }
 
-// TestDiffActions_AdoptForwardsLockToken pins CRU-1: when adopt_existing rewrites
-// a new-to-state path that already exists remotely into an update, the probed
+// TestDiffActions_AdoptForwardsLockToken: when adopt_existing rewrites a
+// new-to-state path that already exists remotely into an update, the probed
 // last_commit_id is forwarded under optimistic_lock so the overwrite is still
 // guarded against a concurrent writer; with optimistic_lock off, no token is sent.
 func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {

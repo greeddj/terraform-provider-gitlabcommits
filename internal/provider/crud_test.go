@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -76,12 +78,15 @@ func runUpdateOn(t *testing.T, res *filesResource, plan, state filesResourceMode
 	t.Helper()
 	req, resp := updateRequest(t, res, plan, state)
 	res.Update(t.Context(), req, resp)
+	checkUpdateResult(t, req, resp)
 	return resp
 }
 
-// updateRequest builds the plan/state pair for res.Update. Kept apart from
-// runUpdateOn so concurrency tests build requests on the test goroutine
-// (t.Fatalf must not run anywhere else) and only call Update from workers.
+// updateRequest builds the plan/state pair for res.Update the way fwserver
+// does: the plan carries the unknowns plannedModel adds, and the response
+// starts as the prior state. Kept apart from runUpdateOn so concurrency
+// tests build requests on the test goroutine (t.Fatalf must not run
+// anywhere else) and only call Update from workers.
 func updateRequest(t *testing.T, res *filesResource, plan, state filesResourceModel) (resource.UpdateRequest, *resource.UpdateResponse) {
 	t.Helper()
 	ctx := t.Context()
@@ -91,14 +96,15 @@ func updateRequest(t *testing.T, res *filesResource, plan, state filesResourceMo
 	sch := sresp.Schema
 
 	pl := tfsdk.Plan{Schema: sch}
-	if d := pl.Set(ctx, &plan); d.HasError() {
+	planned := plannedModel(plan, false)
+	if d := pl.Set(ctx, &planned); d.HasError() {
 		t.Fatalf("plan.Set: %v", d)
 	}
 	st := tfsdk.State{Schema: sch}
 	if d := st.Set(ctx, &state); d.HasError() {
 		t.Fatalf("state.Set: %v", d)
 	}
-	return resource.UpdateRequest{Plan: pl, State: st}, &resource.UpdateResponse{State: tfsdk.State{Schema: sch}}
+	return resource.UpdateRequest{Plan: pl, State: st}, &resource.UpdateResponse{State: tfsdk.State{Schema: sch, Raw: st.Raw.Copy()}}
 }
 
 func runCreate(t *testing.T, client *gitlab.Client, plan filesResourceModel) *resource.CreateResponse {
@@ -110,10 +116,12 @@ func runCreateOn(t *testing.T, res *filesResource, plan filesResourceModel) *res
 	t.Helper()
 	req, resp := createRequest(t, res, plan)
 	res.Create(t.Context(), req, resp)
+	checkCreateResult(t, resp)
 	return resp
 }
 
-// createRequest is the Create counterpart of updateRequest.
+// createRequest is the Create counterpart of updateRequest; the response
+// starts as the typed null state fwserver hands Create.
 func createRequest(t *testing.T, res *filesResource, plan filesResourceModel) (resource.CreateRequest, *resource.CreateResponse) {
 	t.Helper()
 	ctx := t.Context()
@@ -123,13 +131,70 @@ func createRequest(t *testing.T, res *filesResource, plan filesResourceModel) (r
 	sch := sresp.Schema
 
 	pl := tfsdk.Plan{Schema: sch}
-	if d := pl.Set(ctx, &plan); d.HasError() {
+	planned := plannedModel(plan, true)
+	if d := pl.Set(ctx, &planned); d.HasError() {
 		t.Fatalf("plan.Set: %v", d)
 	}
-	return resource.CreateRequest{Plan: pl}, &resource.CreateResponse{State: tfsdk.State{Schema: sch}}
+	empty := tftypes.NewValue(sch.Type().TerraformType(ctx), nil)
+	return resource.CreateRequest{Plan: pl}, &resource.CreateResponse{State: tfsdk.State{Schema: sch, Raw: empty}}
 }
 
-// TestCreate_NullCommitBodyErrors pins the DOS-1 guard in Create: a 2xx
+// plannedModel returns m as the framework plans it: every Computed attribute
+// with no default and no configured value is unknown (known after apply),
+// except id on Update, which UseStateForUnknown keeps at its prior value.
+// The files map is copied, so a state model sharing it never sees the
+// unknowns.
+func plannedModel(m filesResourceModel, create bool) filesResourceModel {
+	m.Files = maps.Clone(m.Files)
+	for p, f := range m.Files {
+		f.BlobID = types.StringUnknown()
+		f.LastCommitID = types.StringUnknown()
+		m.Files[p] = f
+	}
+	m.CommitSHA = types.StringUnknown()
+	if create {
+		m.ID = types.StringUnknown()
+	}
+	return m
+}
+
+// checkCreateResult pins what a Create may hand back. Success is a fully
+// known state: Terraform rejects unknowns after apply, when the commit has
+// already landed. Failure is no state at all: a Create that returns state
+// next to an error is tainted and replaced, which pushes a delete commit.
+// It only calls t.Error, so workers may use it.
+func checkCreateResult(t *testing.T, resp *resource.CreateResponse) {
+	t.Helper()
+	switch {
+	case resp.Diagnostics.HasError():
+		if !resp.State.Raw.IsNull() {
+			t.Errorf("a failed Create must return no state, got: %s", resp.State.Raw)
+		}
+	case resp.State.Raw.IsNull():
+		t.Error("a successful Create must return state")
+	case !resp.State.Raw.IsFullyKnown():
+		t.Errorf("Create returned state with unknown values: %s", resp.State.Raw)
+	}
+}
+
+// checkUpdateResult is the Update counterpart: success is a fully known
+// state, and failure leaves the prior state exactly as it was, since
+// anything else would record content that never landed.
+func checkUpdateResult(t *testing.T, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	t.Helper()
+	switch {
+	case resp.Diagnostics.HasError():
+		if !resp.State.Raw.Equal(req.State.Raw) {
+			t.Errorf("a failed Update must leave the prior state in place, got: %s", resp.State.Raw)
+		}
+	case resp.State.Raw.IsNull():
+		t.Error("a successful Update must return state")
+	case !resp.State.Raw.IsFullyKnown():
+		t.Errorf("Update returned state with unknown values: %s", resp.State.Raw)
+	}
+}
+
+// TestCreate_NullCommitBodyErrors pins the nil-commit guard in Create: a 2xx
 // JSON-null commit body must produce an error diagnostic, not a nil-deref panic.
 func TestCreate_NullCommitBodyErrors(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +218,7 @@ func TestCreate_NullCommitBodyErrors(t *testing.T) {
 	}
 }
 
-// TestUpdate_NullCommitBodyErrors pins the DOS-1 guard in Update.
+// TestUpdate_NullCommitBodyErrors pins the nil-commit guard in Update.
 func TestUpdate_NullCommitBodyErrors(t *testing.T) {
 	postCalled := false
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -179,6 +244,67 @@ func TestUpdate_NullCommitBodyErrors(t *testing.T) {
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("expected an error for a null commit body on Update")
 	}
+}
+
+// TestCommitConflict_LeavesStateUntouched: when GitLab rejects the commit
+// under optimistic_lock, Create returns no state (state next to an error is
+// tainted and replaced with a delete commit) and Update keeps the prior
+// state (the planned content never landed).
+func TestCommitConflict_LeavesStateUntouched(t *testing.T) {
+	conflict := func(t *testing.T, posts *atomic.Int32) *gitlab.Client {
+		return newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+			case r.Method == http.MethodHead:
+				metaHeaders(w, "remoteblob", "remote-lcid", false)
+			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(fileJSON("f.txt", "remoteblob", "remote-lcid", []byte("remote")))
+			case r.Method == http.MethodPost:
+				posts.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"message":"You are attempting to update a file that has changed since you started editing it."}`))
+			default:
+				t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+				http.Error(w, "unexpected", http.StatusInternalServerError)
+			}
+		})
+	}
+	wantConflict := func(t *testing.T, diags diag.Diagnostics, posts *atomic.Int32) {
+		t.Helper()
+		if !diags.HasError() || !strings.Contains(diags.Errors()[0].Summary(), "Concurrent modification detected") {
+			t.Fatalf("expected the concurrent-modification diagnostic, got %v", diags)
+		}
+		if got := posts.Load(); got != 1 {
+			t.Errorf("commit POSTs = %d, want 1", got)
+		}
+	}
+
+	t.Run("create", func(t *testing.T) {
+		var posts atomic.Int32
+		res := newTestResource(conflict(t, &posts))
+		req, resp := createRequest(t, res, readState("ignored"))
+		res.Create(t.Context(), req, resp)
+		wantConflict(t, resp.Diagnostics, &posts)
+		if !resp.State.Raw.IsNull() {
+			t.Errorf("a rejected Create must return no state, got: %s", resp.State.Raw)
+		}
+	})
+
+	t.Run("update", func(t *testing.T) {
+		var posts atomic.Int32
+		res := newTestResource(conflict(t, &posts))
+		plan, state := changedPlan()
+		req, resp := updateRequest(t, res, plan, state)
+		res.Update(t.Context(), req, resp)
+		wantConflict(t, resp.Diagnostics, &posts)
+		if !resp.State.Raw.Equal(req.State.Raw) {
+			t.Errorf("a rejected Update must keep the prior state, got: %s", resp.State.Raw)
+		}
+	})
 }
 
 // TestDelete_DeleteOnDestroyFalseSkipsAPI: delete_on_destroy=false is a
@@ -619,7 +745,6 @@ func TestCreate_StartBranchRejectionNamesRef(t *testing.T) {
 
 	plan := readState("ignored")
 	plan.Branch = types.StringValue("feature")
-	plan.ID = types.StringValue("proj::feature")
 	plan.CreateBranchFrom = types.StringValue("nope")
 
 	resp := runCreate(t, client, plan)
@@ -683,7 +808,6 @@ func TestCreate_AdoptsFromCreateBranchFromRef(t *testing.T) {
 
 	plan := readState("ignored")
 	plan.Branch = types.StringValue("feature")
-	plan.ID = types.StringValue("proj::feature")
 	plan.CreateBranchFrom = types.StringValue("main")
 
 	resp := runCreate(t, client, plan)
@@ -982,6 +1106,7 @@ func TestUpdate_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
 			if resp.Diagnostics.HasError() {
 				t.Errorf("unexpected error: %v", resp.Diagnostics.Errors())
 			}
+			checkUpdateResult(t, req, resp)
 		})
 	}
 	wg.Wait()
@@ -1039,7 +1164,6 @@ func TestCreate_ConcurrentBranchMaterialisationIsSerialised(t *testing.T) {
 		res := &filesResource{client: client, locks: locks}
 		plan := readState("ignored")
 		plan.Branch = types.StringValue("feature")
-		plan.ID = types.StringValue("proj::feature")
 		plan.CreateBranchFrom = types.StringValue("main")
 		req, resp := createRequest(t, res, plan)
 		wg.Go(func() {
@@ -1047,6 +1171,7 @@ func TestCreate_ConcurrentBranchMaterialisationIsSerialised(t *testing.T) {
 			if resp.Diagnostics.HasError() {
 				t.Errorf("unexpected error: %v", resp.Diagnostics.Errors())
 			}
+			checkCreateResult(t, resp)
 		})
 	}
 	wg.Wait()
@@ -1088,7 +1213,6 @@ func TestCreate_CommitSHASourceUsesStartSHA(t *testing.T) {
 
 	plan := readState("ignored")
 	plan.Branch = types.StringValue("feature")
-	plan.ID = types.StringValue("proj::feature")
 	plan.CreateBranchFrom = types.StringValue(sha)
 	if resp := runCreate(t, client, plan); resp.Diagnostics.HasError() {
 		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
@@ -1223,6 +1347,74 @@ func TestCreate_AdoptDifferentContentUpdates(t *testing.T) {
 	}
 }
 
+// TestCreate_AdoptIdenticalBesideNewPathCommitsOnlyTheNewPath: one path that
+// already matches the plan and one that does not exist yet make a single
+// commit carrying only the create. The adopted path is never probed at the
+// new commit; its computed fields come from the adopt probe.
+func TestCreate_AdoptIdenticalBesideNewPathCommitsOnlyTheNewPath(t *testing.T) {
+	var posts atomic.Int32
+	var body string
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		adopted := strings.Contains(r.URL.Path, "a.txt")
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "main" && adopted:
+			metaHeaders(w, "remoteblob", "remote-lcid", false)
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "main":
+			http.Error(w, "absent", http.StatusNotFound)
+		case r.Method == http.MethodGet && adopted:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(fileJSON("a.txt", "remoteblob", "remote-lcid", []byte("same")))
+		case r.Method == http.MethodHead && adopted:
+			t.Errorf("the adopted path was not committed and must not be probed: %s?%s", r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "newsha":
+			stampHeaders(w, "newsha")
+		case r.Method == http.MethodPost:
+			posts.Add(1)
+			b, _ := io.ReadAll(r.Body)
+			body = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"newsha"}`))
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	})
+
+	plan := readState("ignored")
+	plan.Files["a.txt"] = fileModel{
+		Content: types.StringValue("same"), ContentBase64: types.StringNull(),
+		BlobID: types.StringNull(), LastCommitID: types.StringNull(), ExecuteFilemode: types.BoolValue(false),
+	}
+	resp := runCreate(t, client, plan)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("commit POSTs = %d, want 1", got)
+	}
+	if strings.Contains(body, "a.txt") || !strings.Contains(body, `"action":"create"`) {
+		t.Errorf("the commit must create f.txt only, body: %s", body)
+	}
+	var out filesResourceModel
+	if d := resp.State.Get(t.Context(), &out); d.HasError() {
+		t.Fatalf("state.Get: %v", d)
+	}
+	if a := out.Files["a.txt"]; a.BlobID.ValueString() != "remoteblob" || a.LastCommitID.ValueString() != "remote-lcid" {
+		t.Errorf("adopted path must carry the probed blob/lcid, got %q/%q", a.BlobID.ValueString(), a.LastCommitID.ValueString())
+	}
+	if f := out.Files["f.txt"]; f.BlobID.ValueString() != "blob-newsha" || f.LastCommitID.ValueString() != "newsha" {
+		t.Errorf("created path must be stamped from the commit, got %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+	}
+	if out.CommitSHA.ValueString() != "newsha" {
+		t.Errorf("commit_sha = %q, want newsha", out.CommitSHA.ValueString())
+	}
+}
+
 // TestUpdate_AdoptIdenticalContentMakesNoCommit is the import round-trip:
 // empty state, a plan that matches the repository, no commit, and computed
 // fields filled from the probe so the framework sees no unknowns.
@@ -1233,14 +1425,8 @@ func TestUpdate_AdoptIdenticalContentMakesNoCommit(t *testing.T) {
 
 	state := readState("ignored")
 	state.Files = map[string]fileModel{}
-	plan := readState("ignored")
-	pf := plan.Files["f.txt"]
-	pf.BlobID = types.StringUnknown()
-	pf.LastCommitID = types.StringUnknown()
-	plan.Files["f.txt"] = pf
-	plan.CommitSHA = types.StringUnknown()
 
-	resp := runUpdate(t, client, plan, state)
+	resp := runUpdate(t, client, readState("ignored"), state)
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
 	}
@@ -1292,7 +1478,6 @@ func TestCreate_AdoptIdenticalOnMissingBranchCreatesBranchOnly(t *testing.T) {
 
 	plan := readState("ignored")
 	plan.Branch = types.StringValue("feature")
-	plan.ID = types.StringValue("proj::feature")
 	plan.CreateBranchFrom = types.StringValue("main")
 	resp := runCreate(t, client, plan)
 	if resp.Diagnostics.HasError() {
@@ -1303,8 +1488,105 @@ func TestCreate_AdoptIdenticalOnMissingBranchCreatesBranchOnly(t *testing.T) {
 	}
 }
 
+// TestCreate_MissingBranchFailureMakesNoCommit: when the branch still has to
+// be materialised, a failed re-check under the lock or a failed bare branch
+// creation fails Create before any commit, and without state.
+func TestCreate_MissingBranchFailureMakesNoCommit(t *testing.T) {
+	cases := []struct {
+		name string
+		// remoteContent is what the source ref holds for f.txt; "" means absent.
+		remoteContent string
+		recheckStatus int
+	}{
+		{name: "re-check under the lock fails", recheckStatus: http.StatusForbidden},
+		{name: "bare branch creation fails", remoteContent: "old", recheckStatus: http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var branchGets atomic.Int32
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+					if branchGets.Add(1) == 1 {
+						http.Error(w, "no branch yet", http.StatusNotFound)
+						return
+					}
+					http.Error(w, http.StatusText(tc.recheckStatus), tc.recheckStatus)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+				case r.Method == http.MethodHead && tc.remoteContent == "":
+					http.Error(w, "absent", http.StatusNotFound)
+				case r.Method == http.MethodHead:
+					metaHeaders(w, "srcblob", "src-lcid", false)
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write(fileJSON("f.txt", "srcblob", "src-lcid", []byte(tc.remoteContent)))
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/branches"):
+					http.Error(w, "forbidden", http.StatusForbidden)
+				default:
+					t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+					http.Error(w, "unexpected", http.StatusInternalServerError)
+				}
+			})
+
+			plan := readState("ignored")
+			plan.Branch = types.StringValue("feature")
+			plan.CreateBranchFrom = types.StringValue("main")
+			resp := runCreate(t, client, plan)
+			if !resp.Diagnostics.HasError() {
+				t.Fatal("expected Create to fail")
+			}
+			if !resp.State.Raw.IsNull() {
+				t.Errorf("a failed Create must return no state, got: %s", resp.State.Raw)
+			}
+		})
+	}
+}
+
+// TestCreate_AdoptExistingFalseCreatesWithoutProbing: with adopt_existing
+// off, Create never probes the branch for existing paths; it sends a plain,
+// unlocked create and leaves an existing file to fail loudly at GitLab.
+func TestCreate_AdoptExistingFalseCreatesWithoutProbing(t *testing.T) {
+	var body string
+	var committed atomic.Bool
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "newsha":
+			stampHeaders(w, "newsha")
+		case r.Method == http.MethodHead:
+			t.Errorf("adopt_existing = false must not probe the branch: %s?%s", r.URL.Path, r.URL.RawQuery)
+			metaHeaders(w, "remoteblob", "remote-lcid", false)
+		case r.Method == http.MethodPost && !committed.Swap(true):
+			b, _ := io.ReadAll(r.Body)
+			body = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"newsha"}`))
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	})
+
+	plan := readState("ignored")
+	plan.AdoptExisting = types.BoolValue(false)
+	resp := runCreate(t, client, plan)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if !strings.Contains(body, `"action":"create"`) || strings.Contains(body, "last_commit_id") {
+		t.Errorf("expected one plain create, body: %s", body)
+	}
+}
+
 // TestUpdate_StampsOnlyTouchedPaths: after a commit that changed one of two
-// files, the untouched file keeps its state values and is never probed.
+// files, the untouched file keeps its state values and is never probed. The
+// plan carries its computed fields as unknown, so only carrying them over
+// from state can fill them.
 func TestUpdate_StampsOnlyTouchedPaths(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1404,8 +1686,8 @@ func TestUpdate_MixedActionsProduceExactlyOneCommit(t *testing.T) {
 }
 
 // TestUpdate_NoOpPreservesUnknownComputedFields drives the zero-action
-// branch with the unknowns a real plan carries and asserts state ends up
-// fully known and equal to the prior state.
+// branch with every computed field unknown, id included, and asserts state
+// ends up fully known and equal to the prior state.
 func TestUpdate_NoOpPreservesUnknownComputedFields(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected API call %s %s for a no-op update", r.Method, r.URL.Path)
@@ -1413,11 +1695,6 @@ func TestUpdate_NoOpPreservesUnknownComputedFields(t *testing.T) {
 	})
 	state := readState("blob")
 	plan := readState("blob")
-	pf := plan.Files["f.txt"]
-	pf.BlobID = types.StringUnknown()
-	pf.LastCommitID = types.StringUnknown()
-	plan.Files["f.txt"] = pf
-	plan.CommitSHA = types.StringUnknown()
 	plan.ID = types.StringUnknown()
 
 	resp := runUpdate(t, client, plan, state)

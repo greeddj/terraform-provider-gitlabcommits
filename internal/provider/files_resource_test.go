@@ -335,10 +335,8 @@ func TestDecodeRemoteContent(t *testing.T) {
 
 // TestStampBlobsAfterCommit_FetchesMetadata verifies that stampBlobs issues
 // parallel HEAD probes at the created commit and populates BlobID from the
-// X-Gitlab-Blob-Id header. LastCommitID must come from the probe's
-// X-Gitlab-Last-Commit-Id, not the commitSHA argument verbatim, so files the
-// commit did not touch keep their older commit id instead of a token that
-// would trip a false optimistic-lock conflict.
+// X-Gitlab-Blob-Id header and LastCommitID from X-Gitlab-Last-Commit-Id,
+// not from the commitSHA argument.
 //
 // The test is parameterised on blob-id format to prove that stampBlobs is
 // opaque to blob-id length: both 40-char SHA-1 and 64-char SHA-256 IDs must
@@ -409,7 +407,7 @@ func TestStampBlobsAfterCommit_FetchesMetadata(t *testing.T) {
 				"b.txt": {Content: types.StringValue("world"), BlobID: types.StringNull()},
 			}
 
-			diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", nil)
+			diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", map[string]bool{"a.txt": true, "b.txt": true})
 			for _, d := range diags {
 				if d.Severity() == 1 { // error
 					t.Errorf("unexpected error diagnostic: %s: %s", d.Summary(), d.Detail())
@@ -789,7 +787,8 @@ func TestApiErrorDiag(t *testing.T) {
 //   - good-path: comes from the probe's X-Gitlab-Last-Commit-Id ("server-commit-good")
 //   - bad-path:  falls back to commitSHA ("deadbeef") because the probe failed
 //
-// This uniquely covers the fail-soft path of the new behaviour.
+// Both paths count as touched by the commit, which is the only case in
+// which stampBlobs probes a path at all.
 func TestStampBlobs_OneProbeFailure(t *testing.T) {
 	const (
 		goodBlob           = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"
@@ -834,7 +833,7 @@ func TestStampBlobs_OneProbeFailure(t *testing.T) {
 		"good-path": {Content: types.StringValue("good"), BlobID: types.StringNull()},
 	}
 
-	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", nil)
+	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", map[string]bool{"bad-path": true, "good-path": true})
 
 	if diags.HasError() {
 		t.Fatalf("expected no errors, got: %v", diags.Errors())
@@ -903,7 +902,7 @@ func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
 		"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
 	}
 
-	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", nil)
+	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", map[string]bool{"file.txt": true})
 
 	if diags.HasError() {
 		t.Fatalf("expected no errors, got: %v", diags.Errors())
@@ -944,7 +943,7 @@ func TestStampBlobs_HeaderlessProbeIsFailure(t *testing.T) {
 	res := &filesResource{client: client}
 	files := map[string]fileModel{"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()}}
 
-	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", nil)
+	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", map[string]bool{"file.txt": true})
 	if diags.HasError() || diags.WarningsCount() != 1 {
 		t.Fatalf("want exactly one warning, got %v", diags)
 	}
@@ -955,7 +954,9 @@ func TestStampBlobs_HeaderlessProbeIsFailure(t *testing.T) {
 }
 
 // TestStampBlobs_TouchedSubset: only the touched paths are probed and
-// restamped; the rest of the map is left exactly as handed in.
+// restamped; the rest of the map is left exactly as handed in. A nil set
+// touches nothing, so it can never stamp the commit's SHA as the lock token
+// of a file the commit did not modify.
 func TestStampBlobs_TouchedSubset(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "untouched") {
@@ -974,21 +975,35 @@ func TestStampBlobs_TouchedSubset(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 	res := &filesResource{client: client}
-	files := map[string]fileModel{
-		"touched.txt":   {Content: types.StringValue("a"), BlobID: types.StringNull()},
-		"untouched.txt": {Content: types.StringValue("b"), BlobID: types.StringValue("oldblob"), LastCommitID: types.StringValue("oldlcid")},
-	}
+	untouched := fileModel{Content: types.StringValue("b"), BlobID: types.StringValue("oldblob"), LastCommitID: types.StringValue("oldlcid")}
 
-	diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", map[string]bool{"touched.txt": true})
-	if diags.HasError() || diags.WarningsCount() != 0 {
-		t.Fatalf("unexpected diagnostics: %v", diags)
-	}
-	if f := files["touched.txt"]; f.BlobID.ValueString() != "newblob" || f.LastCommitID.ValueString() != "deadbeef" {
-		t.Errorf("touched path not stamped: %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
-	}
-	if f := files["untouched.txt"]; f.BlobID.ValueString() != "oldblob" || f.LastCommitID.ValueString() != "oldlcid" {
-		t.Errorf("untouched path must be left alone: %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
-	}
+	t.Run("subset", func(t *testing.T) {
+		files := map[string]fileModel{
+			"touched.txt":   {Content: types.StringValue("a"), BlobID: types.StringNull()},
+			"untouched.txt": untouched,
+		}
+		diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", map[string]bool{"touched.txt": true})
+		if diags.HasError() || diags.WarningsCount() != 0 {
+			t.Fatalf("unexpected diagnostics: %v", diags)
+		}
+		if f := files["touched.txt"]; f.BlobID.ValueString() != "newblob" || f.LastCommitID.ValueString() != "deadbeef" {
+			t.Errorf("touched path not stamped: %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+		}
+		if f := files["untouched.txt"]; f.BlobID.ValueString() != "oldblob" || f.LastCommitID.ValueString() != "oldlcid" {
+			t.Errorf("untouched path must be left alone: %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+		}
+	})
+
+	t.Run("nil set", func(t *testing.T) {
+		files := map[string]fileModel{"untouched.txt": untouched}
+		diags := res.stampBlobs(t.Context(), "proj", files, "deadbeef", nil)
+		if diags.HasError() || diags.WarningsCount() != 0 {
+			t.Fatalf("unexpected diagnostics: %v", diags)
+		}
+		if f := files["untouched.txt"]; f.BlobID.ValueString() != "oldblob" || f.LastCommitID.ValueString() != "oldlcid" {
+			t.Errorf("a nil touched set must stamp nothing, got %q/%q", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+		}
+	})
 }
 
 // TestStampBlobs_ProbesAtCreatedCommit is the directly-falsifying test for
@@ -1037,7 +1052,7 @@ func TestStampBlobs_ProbesAtCreatedCommit(t *testing.T) {
 		"file.txt": {Content: types.StringValue("hello"), BlobID: types.StringNull()},
 	}
 
-	diags := res.stampBlobs(t.Context(), "proj", files, ourCommitSHA, nil)
+	diags := res.stampBlobs(t.Context(), "proj", files, ourCommitSHA, map[string]bool{"file.txt": true})
 	if diags.HasError() {
 		t.Fatalf("unexpected error: %v", diags.Errors())
 	}

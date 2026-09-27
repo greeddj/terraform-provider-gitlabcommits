@@ -4,6 +4,7 @@
 package provider
 
 import (
+	"fmt"
 	"maps"
 	"math/big"
 	"net/http"
@@ -11,7 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
@@ -54,7 +57,7 @@ func TestConfigure_MissingTokenErrors(t *testing.T) {
 }
 
 // TestConfigure_PlaintextHTTPWarnsAndWiresRedirectGuard covers the http:// warning
-// and asserts the cross-host redirect guard (P1.3) is installed on the client.
+// and asserts the cross-host redirect guard is installed on the client.
 func TestConfigure_PlaintextHTTPWarnsAndWiresRedirectGuard(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
 	t.Setenv("GITLAB_BASE_URL", "")
@@ -83,6 +86,105 @@ func TestConfigure_PlaintextHTTPWarnsAndWiresRedirectGuard(t *testing.T) {
 	}
 	if client, ok := resp.DataSourceData.(*gitlab.Client); !ok || client == nil {
 		t.Errorf("expected data sources to receive the *gitlab.Client, got %T", resp.DataSourceData)
+	}
+}
+
+// TestConfigure_WiresEveryResourceAndDataSource hands what the provider's
+// Configure returns to every resource and data source it registers, as the
+// framework does. Each must accept its own kind of provider data, reject the
+// other kind, and ignore nil (the framework passes nil before the provider
+// is configured). The resource must end up with the shared client, this
+// configuration's branch locks and its commit retry setting; the data sources
+// with the shared client.
+func TestConfigure_WiresEveryResourceAndDataSource(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	t.Setenv("GITLAB_BASE_URL", "")
+	retries := map[string]tftypes.Value{
+		"default max_retries": tftypes.NewValue(tftypes.Number, nil),
+		"max_retries = 0":     tftypes.NewValue(tftypes.Number, big.NewFloat(0)),
+	}
+	for name, maxRetries := range retries {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			cfg := runConfigure(t, map[string]tftypes.Value{
+				"token":       tftypes.NewValue(tftypes.String, "tok"),
+				"max_retries": maxRetries,
+			})
+			if cfg.Diagnostics.HasError() {
+				t.Fatalf("configure: %v", cfg.Diagnostics.Errors())
+			}
+			deps := cfg.ResourceData.(*resourceDeps)
+			p := New("test")()
+
+			resources := p.Resources(ctx)
+			if len(resources) != 1 {
+				t.Fatalf("resources = %d, want 1", len(resources))
+			}
+			for _, newResource := range resources {
+				r, ok := newResource().(*filesResource)
+				if !ok {
+					t.Fatalf("unexpected resource type %T", newResource())
+				}
+				resp := &resource.ConfigureResponse{}
+				r.Configure(ctx, resource.ConfigureRequest{ProviderData: cfg.DataSourceData}, resp)
+				if !resp.Diagnostics.HasError() || r.client != nil {
+					t.Errorf("the resource must reject the data sources' *gitlab.Client, got %v", resp.Diagnostics)
+				}
+				resp = &resource.ConfigureResponse{}
+				r.Configure(ctx, resource.ConfigureRequest{}, resp)
+				if resp.Diagnostics.HasError() || r.client != nil {
+					t.Errorf("the resource must ignore nil provider data, got %v", resp.Diagnostics)
+				}
+				r.Configure(ctx, resource.ConfigureRequest{ProviderData: cfg.ResourceData}, resp)
+				if resp.Diagnostics.HasError() {
+					t.Fatalf("configure resource: %v", resp.Diagnostics.Errors())
+				}
+				if r.client != deps.client || r.locks != deps.locks || r.retryCommits != deps.retryCommits {
+					t.Errorf("resource wiring = client %p locks %p retry %v, want %p %p %v",
+						r.client, r.locks, r.retryCommits, deps.client, deps.locks, deps.retryCommits)
+				}
+			}
+
+			seen := map[string]bool{}
+			for _, newDataSource := range p.DataSources(ctx) {
+				d := newDataSource()
+				configurable, ok := d.(datasource.DataSourceWithConfigure)
+				if !ok {
+					t.Fatalf("data source %T has no Configure", d)
+				}
+				client := func() *gitlab.Client {
+					switch ds := d.(type) {
+					case *fileDataSource:
+						return ds.client
+					case *branchHeadDataSource:
+						return ds.client
+					}
+					t.Fatalf("unexpected data source type %T", d)
+					return nil
+				}
+				resp := &datasource.ConfigureResponse{}
+				configurable.Configure(ctx, datasource.ConfigureRequest{ProviderData: cfg.ResourceData}, resp)
+				if !resp.Diagnostics.HasError() || client() != nil {
+					t.Errorf("%T must reject *resourceDeps, got %v", d, resp.Diagnostics)
+				}
+				resp = &datasource.ConfigureResponse{}
+				configurable.Configure(ctx, datasource.ConfigureRequest{}, resp)
+				if resp.Diagnostics.HasError() || client() != nil {
+					t.Errorf("%T must ignore nil provider data, got %v", d, resp.Diagnostics)
+				}
+				configurable.Configure(ctx, datasource.ConfigureRequest{ProviderData: cfg.DataSourceData}, resp)
+				if resp.Diagnostics.HasError() {
+					t.Fatalf("configure %T: %v", d, resp.Diagnostics.Errors())
+				}
+				if client() != deps.client {
+					t.Errorf("%T client = %p, want the shared %p", d, client(), deps.client)
+				}
+				seen[fmt.Sprintf("%T", d)] = true
+			}
+			if len(seen) != 2 {
+				t.Errorf("data sources = %v, want the file and branch_head data sources", seen)
+			}
+		})
 	}
 }
 

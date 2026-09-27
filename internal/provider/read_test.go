@@ -5,9 +5,13 @@ package provider
 
 import (
 	"encoding/base64"
+	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,7 +49,9 @@ func readState(blobID string) filesResourceModel {
 }
 
 // runRead builds a ReadRequest from the model and invokes Read, returning the
-// response and (on success) the resulting state model.
+// response and (on success) the resulting state model. The response starts
+// as a copy of the current state, as fwserver seeds it, so a Read that means
+// to remove the resource has to say so.
 func runRead(t *testing.T, client *gitlab.Client, state filesResourceModel) (*resource.ReadResponse, filesResourceModel) {
 	t.Helper()
 	ctx := t.Context()
@@ -61,11 +67,14 @@ func runRead(t *testing.T, client *gitlab.Client, state filesResourceModel) (*re
 	}
 
 	req := resource.ReadRequest{State: st}
-	resp := &resource.ReadResponse{State: tfsdk.State{Schema: sch}}
+	resp := &resource.ReadResponse{State: tfsdk.State{Schema: sch, Raw: st.Raw.Copy()}}
 	res.Read(ctx, req, resp)
 
 	var out filesResourceModel
 	if !resp.Diagnostics.HasError() {
+		if !resp.State.Raw.IsFullyKnown() {
+			t.Errorf("Read returned state with unknown values: %s", resp.State.Raw)
+		}
 		resp.State.Get(ctx, &out)
 	}
 	return resp, out
@@ -106,10 +115,9 @@ func newRetryingResource(t *testing.T, h http.HandlerFunc) *filesResource {
 	return &filesResource{client: client, locks: newBranchLocks(), retryCommits: true}
 }
 
-// TestRead_DropsMissingFile covers the drift drop-pass (tests-coverage A): a
-// managed file that 404s on the metadata probe is removed from state so the
-// next plan recreates it. The branch itself still exists, so the resource
-// stays in state.
+// TestRead_DropsMissingFile covers the drift drop-pass: a managed file that
+// 404s on the metadata probe is removed from state so the next plan recreates
+// it. The branch itself still exists, so the resource stays in state.
 func TestRead_DropsMissingFile(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -188,6 +196,101 @@ func TestRead_EmptyFilesChecksBranch(t *testing.T) {
 	}
 }
 
+// TestRead_TwoFileProbeOutcomes pins how per-file probe outcomes combine: a
+// 404 drops only its own path and needs no branch check while another path
+// is still there, any other probe failure fails the refresh with nothing
+// dropped, and two 404s on a live branch empty the files map but keep the
+// resource.
+func TestRead_TwoFileProbeOutcomes(t *testing.T) {
+	cases := []struct {
+		status     map[string]int
+		name       string
+		wantFiles  []string
+		branchGets int32
+		wantErr    bool
+	}{
+		{name: "one gone", status: map[string]int{"a.txt": http.StatusNotFound, "f.txt": http.StatusOK}, wantFiles: []string{"f.txt"}},
+		{name: "one forbidden", status: map[string]int{"a.txt": http.StatusForbidden, "f.txt": http.StatusOK}, wantErr: true},
+		{name: "one gone one forbidden", status: map[string]int{"a.txt": http.StatusNotFound, "f.txt": http.StatusForbidden}, wantErr: true},
+		{name: "both gone on a live branch", status: map[string]int{"a.txt": http.StatusNotFound, "f.txt": http.StatusNotFound}, wantFiles: []string{}, branchGets: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var branchGets atomic.Int32
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/") {
+					branchGets.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"head"}}`))
+					return
+				}
+				for p, status := range tc.status {
+					if r.Method != http.MethodHead || !strings.HasSuffix(r.URL.Path, "/"+p) {
+						continue
+					}
+					if status == http.StatusOK {
+						metaHeaders(w, "oldblob", "oldlcid", false)
+					} else {
+						http.Error(w, http.StatusText(status), status)
+					}
+					return
+				}
+				t.Errorf("unexpected call %s %s", r.Method, r.URL.Path)
+				http.Error(w, "unexpected", http.StatusInternalServerError)
+			})
+			state := readState("oldblob")
+			state.Files["a.txt"] = state.Files["f.txt"]
+
+			resp, out := runRead(t, client, state)
+			if tc.wantErr {
+				if !resp.Diagnostics.HasError() {
+					t.Fatal("expected a non-404 probe failure to fail the refresh")
+				}
+				var kept filesResourceModel
+				if resp.State.Raw.IsNull() || resp.State.Get(t.Context(), &kept).HasError() || len(kept.Files) != 2 {
+					t.Errorf("a failed refresh must drop nothing, state: %s", resp.State.Raw)
+				}
+				return
+			}
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+			if resp.State.Raw.IsNull() {
+				t.Fatal("the resource must stay in state while the branch exists")
+			}
+			if got := slices.Sorted(maps.Keys(out.Files)); !slices.Equal(got, tc.wantFiles) {
+				t.Errorf("files in state = %v, want %v", got, tc.wantFiles)
+			}
+			for p, f := range out.Files {
+				if f.Content.ValueString() != "old" || f.BlobID.ValueString() != "oldblob" || f.LastCommitID.ValueString() != "oldlcid" {
+					t.Errorf("kept path %q must keep its values, got %q/%q/%q", p, f.Content.ValueString(), f.BlobID.ValueString(), f.LastCommitID.ValueString())
+				}
+			}
+			if got := branchGets.Load(); got != tc.branchGets {
+				t.Errorf("branch lookups = %d, want %d", got, tc.branchGets)
+			}
+		})
+	}
+}
+
+// TestRead_DriftedBlobFetchFailureFails: once the probe reports a new blob,
+// a failed content fetch must fail the refresh. Treating it as unchanged
+// would keep the old content in state while GitLab holds different bytes.
+func TestRead_DriftedBlobFetchFailureFails(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			metaHeaders(w, "newblob", "newlcid", false)
+			return
+		}
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+
+	resp, _ := runRead(t, client, readState("oldblob"))
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected a failed content fetch for a drifted blob to fail the refresh")
+	}
+}
+
 // TestRead_EmptyBlobIDErrors: a metadata response without X-Gitlab-Blob-Id
 // would compare equal to nothing forever; it is an error, not "unchanged".
 func TestRead_EmptyBlobIDErrors(t *testing.T) {
@@ -252,8 +355,8 @@ func TestRead_DriftUpdatesContent(t *testing.T) {
 	}
 }
 
-// TestRead_NullFileBodyOnDriftErrors pins ADD-4: a 2xx JSON-null GetFile body for
-// a drifted blob must surface an error, not be silently treated as unchanged.
+// TestRead_NullFileBodyOnDriftErrors: a 2xx JSON-null GetFile body for a
+// drifted blob must surface an error, not be silently treated as unchanged.
 func TestRead_NullFileBodyOnDriftErrors(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -273,7 +376,7 @@ func TestRead_NullFileBodyOnDriftErrors(t *testing.T) {
 	}
 }
 
-// TestRead_OversizedBlobIDIgnored pins CRU-2: an absurdly long blob_id from
+// TestRead_OversizedBlobIDIgnored: an absurdly long blob_id from
 // GetFile is not persisted; state keeps blob_id null and a warning is emitted.
 func TestRead_OversizedBlobIDIgnored(t *testing.T) {
 	oversized := strings.Repeat("a", maxBlobIDLen+1)
@@ -381,6 +484,49 @@ func TestRead_UnchangedBlobSkipsGetFile(t *testing.T) {
 			}
 			if f.BlobID.ValueString() != "oldblob" {
 				t.Errorf("BlobID = %q, want untouched %q", f.BlobID.ValueString(), "oldblob")
+			}
+		})
+	}
+}
+
+// TestRead_ExecBitOnlyDriftIsDetected: an out-of-band chmod leaves the blob
+// alone, so the exec bit alone must send Read to fetch the file and restamp
+// execute_filemode and last_commit_id from it, in either direction.
+func TestRead_ExecBitOnlyDriftIsDetected(t *testing.T) {
+	for _, remoteExec := range []bool{true, false} {
+		t.Run(fmt.Sprintf("remote exec %v", remoteExec), func(t *testing.T) {
+			var gets atomic.Int32
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead {
+					metaHeaders(w, "oldblob", "oldlcid", remoteExec)
+					return
+				}
+				gets.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"file_path":"f.txt","blob_id":"oldblob","content":%q,"encoding":"base64","last_commit_id":"chmodlcid","execute_filemode":%v,"size":3}`,
+					base64.StdEncoding.EncodeToString([]byte("old")), remoteExec)
+			})
+			state := readState("oldblob")
+			f := state.Files["f.txt"]
+			f.ExecuteFilemode = types.BoolValue(!remoteExec)
+			state.Files["f.txt"] = f
+
+			resp, out := runRead(t, client, state)
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+			if got := gets.Load(); got != 1 {
+				t.Errorf("GetFile calls = %d, want 1 for a flipped exec bit", got)
+			}
+			got := out.Files["f.txt"]
+			if got.ExecuteFilemode.ValueBool() != remoteExec {
+				t.Errorf("execute_filemode = %v, want the remote %v", got.ExecuteFilemode.ValueBool(), remoteExec)
+			}
+			if got.LastCommitID.ValueString() != "chmodlcid" {
+				t.Errorf("last_commit_id = %q, want chmodlcid from the fetched file", got.LastCommitID.ValueString())
+			}
+			if got.Content.ValueString() != "old" || got.BlobID.ValueString() != "oldblob" {
+				t.Errorf("content/blob_id = %q/%q, want them unchanged", got.Content.ValueString(), got.BlobID.ValueString())
 			}
 		})
 	}

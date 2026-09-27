@@ -65,9 +65,9 @@ func TestStringConflictsWithSibling(t *testing.T) {
 	})
 }
 
-// TestObjectFileContentRequired pins TF-1: a file object with neither content
-// nor content_base64 is rejected at validate time; setting either one passes;
-// an unknown value defers rather than false-positives.
+// TestObjectFileContentRequired: a file object with neither content nor
+// content_base64 is rejected at validate time; setting either one passes; an
+// unknown value defers rather than false-positives.
 func TestObjectFileContentRequired(t *testing.T) {
 	attrTypes := map[string]attr.Type{
 		"content":        types.StringType,

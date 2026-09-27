@@ -1306,12 +1306,12 @@ func (f fileModel) rawBytes() ([]byte, error) {
 }
 
 // stampBlobs refreshes BlobID and LastCommitID for the paths a successful
-// CreateCommit touched (every path when touched is nil). BlobID is pulled via
-// parallel GetFileMetaData probes (HEAD-style) so state reflects what GitLab
-// returns, including any future blob-id format (SHA-256 repos). Paths the
-// commit did not touch are not probed at all; the caller carries their
-// values over from state (carryOver), so a probe hiccup can never stamp this
-// commit's SHA next to a file it never modified.
+// CreateCommit touched. BlobID is pulled via parallel GetFileMetaData probes
+// (HEAD-style) so state reflects what GitLab returns, including any future
+// blob-id format (SHA-256 repos). Paths the commit did not touch are not
+// probed at all; the caller carries their values over from state
+// (carryOver), so a probe hiccup can never stamp this commit's SHA next to a
+// file it never modified. A nil touched set stamps nothing.
 //
 // Probes run at Ref = commitSHA (the commit just created), NOT at branch
 // HEAD: a writer landing between our CreateCommit and the probe would
@@ -1340,7 +1340,7 @@ func (r *filesResource) stampBlobs(
 
 	paths := make([]string, 0, len(files))
 	for _, p := range sortedKeys(files) {
-		if touched == nil || touched[p] {
+		if touched[p] {
 			paths = append(paths, p)
 		}
 	}
