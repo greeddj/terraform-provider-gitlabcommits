@@ -15,10 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
-	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
@@ -244,81 +242,30 @@ func TestNullBodyDecodesToNilCommit(t *testing.T) {
 	}
 }
 
-// TestBranchHeadDataSource_NilCommitNoPanic drives the branch_head data source
-// against a server that returns a branch with a null commit, asserting a clean
-// error diagnostic instead of a nil-deref panic.
-func TestBranchHeadDataSource_NilCommitNoPanic(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"name":"main","commit":null,"protected":false}`))
-	}))
-	defer srv.Close()
+// TestBranchHeadDataSource_NoHeadCommit drives the branch_head data source
+// against a server that returns a branch without a usable head commit (a
+// null or omitted commit, or one with no id), asserting a clean error
+// diagnostic instead of a nil-deref panic or an empty commit_sha.
+func TestBranchHeadDataSource_NoHeadCommit(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{name: "null commit", body: `{"name":"main","commit":null,"protected":false}`},
+		{name: "omitted commit", body: `{"name":"main","protected":false}`},
+		{name: "commit without id", body: `{"name":"main","commit":{},"protected":false}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newReadClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			})
 
-	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-
-	d := &branchHeadDataSource{client: client}
-	ctx := t.Context()
-
-	schemaResp := &datasource.SchemaResponse{}
-	d.Schema(ctx, datasource.SchemaRequest{}, schemaResp)
-	sch := schemaResp.Schema
-
-	raw := tftypes.NewValue(sch.Type().TerraformType(ctx), map[string]tftypes.Value{
-		"project_id": tftypes.NewValue(tftypes.String, "proj"),
-		"branch":     tftypes.NewValue(tftypes.String, "main"),
-		"commit_sha": tftypes.NewValue(tftypes.String, nil),
-		"protected":  tftypes.NewValue(tftypes.Bool, nil),
-	})
-
-	req := datasource.ReadRequest{Config: tfsdk.Config{Schema: sch, Raw: raw}}
-	resp := &datasource.ReadResponse{State: tfsdk.State{Schema: sch}}
-
-	d.Read(ctx, req, resp)
-
-	if !resp.Diagnostics.HasError() {
-		t.Fatal("expected an error diagnostic for a branch with nil commit, got none")
-	}
-}
-
-// TestBranchHeadDataSource_HappyPath: commit_sha and protected come straight
-// from the branch response.
-func TestBranchHeadDataSource_HappyPath(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"name":"main","protected":true,"commit":{"id":"abc123"}}`))
-	}))
-	defer srv.Close()
-	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"))
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-
-	d := &branchHeadDataSource{client: client}
-	ctx := t.Context()
-	schemaResp := &datasource.SchemaResponse{}
-	d.Schema(ctx, datasource.SchemaRequest{}, schemaResp)
-	sch := schemaResp.Schema
-	raw := tftypes.NewValue(sch.Type().TerraformType(ctx), map[string]tftypes.Value{
-		"project_id": tftypes.NewValue(tftypes.String, "proj"),
-		"branch":     tftypes.NewValue(tftypes.String, "main"),
-		"commit_sha": tftypes.NewValue(tftypes.String, nil),
-		"protected":  tftypes.NewValue(tftypes.Bool, nil),
-	})
-	resp := &datasource.ReadResponse{State: tfsdk.State{Schema: sch}}
-	d.Read(ctx, datasource.ReadRequest{Config: tfsdk.Config{Schema: sch, Raw: raw}}, resp)
-	if resp.Diagnostics.HasError() {
-		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
-	}
-	var out branchHeadModel
-	if diags := resp.State.Get(ctx, &out); diags.HasError() {
-		t.Fatalf("state.Get: %v", diags)
-	}
-	if out.CommitSHA.ValueString() != "abc123" || !out.Protected.ValueBool() {
-		t.Errorf("commit_sha/protected = %q/%v, want abc123/true", out.CommitSHA.ValueString(), out.Protected.ValueBool())
+			resp, _ := runBranchHeadDataSourceRead(t, client)
+			if !resp.Diagnostics.HasError() {
+				t.Fatal("expected an error diagnostic for a branch with no head commit, got none")
+			}
+			if got := resp.Diagnostics.Errors()[0].Summary(); got != "GitLab returned a branch with no commit" {
+				t.Errorf("summary = %q, want %q", got, "GitLab returned a branch with no commit")
+			}
+		})
 	}
 }
 

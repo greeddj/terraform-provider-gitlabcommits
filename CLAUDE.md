@@ -92,7 +92,7 @@ Custom validators live in `schema_validators.go`; defaults use the framework's `
 
 ### Hardening guards worth keeping
 
-Nil guards exist for a 2xx JSON-null body from `CreateCommit` (nil `*Commit`), `GetFile` (nil `*File`), `GetBranch` (nil `Commit`, in the branch-head data source and when resolving `create_branch_from`) and `ListTree` (a nil entry or one without a path); `decodeRemoteContent` fails loudly on an unknown encoding. `hardening_test.go` and `create_test.go` pin these.
+Nil guards exist for a 2xx JSON-null body from `CreateCommit` (nil `*Commit`), `GetFile` (nil `*File`), `GetBranch` (nil `Commit` or an empty commit id, in the branch-head data source and when resolving `create_branch_from`) and `ListTree` (a nil entry or one without a path); `decodeRemoteContent` fails loudly on an unknown encoding. `hardening_test.go` and `create_test.go` pin these.
 
 ## Testing patterns
 
