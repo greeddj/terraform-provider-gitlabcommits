@@ -2599,15 +2599,21 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 					"Body: %s", prefix, tagShadowHint(branch, "checks last_commit_id, so the check fails"), body)
 			}
 			// Gitaly refuses to move the ref when the branch tip changed between
-			// reading it and writing the commit: "reference update: reference
-			// does not point to expected object". Commits are serialised per
-			// branch inside this process, so this means a writer outside this
+			// reading it and writing the commit ("reference update: reference
+			// does not point to expected object") or when another writer held
+			// the ref lock past git's lock timeout ("reference update:
+			// reference is already locked"). Commits are serialised per branch
+			// inside this process, so this means a writer outside this
 			// terraform run, or a tag of the same name: GitLab takes the tip it
-			// expects from the bare branch name, which resolves to the tag.
-			if strings.Contains(strings.ToLower(resp.Message), "expected object") {
+			// expects from the bare branch name, which resolves to the tag. The
+			// "reference update:" prefix alone is not matched: it also carries
+			// causes a re-run cannot fix, such as a file/directory conflict
+			// between ref names.
+			if lower := strings.ToLower(resp.Message); strings.Contains(lower, "expected object") ||
+				strings.Contains(lower, "already locked") {
 				summary = "Branch changed while the commit was being created"
-				return summary, fmt.Sprintf("%s: another writer pushed to the branch while GitLab was building this commit, "+
-					"so the ref update was refused and nothing was committed. This provider serialises its own commits per "+
+				return summary, fmt.Sprintf("%s: another writer pushed to the branch, or held its ref lock, while GitLab was "+
+					"building this commit, so the ref update was refused and nothing was committed. This provider serialises its own commits per "+
 					"branch within one provider configuration (each provider block runs in its own process), so the other "+
 					"writer is another process: a different pipeline, a manual push, a bot, or a second provider block "+
 					"(alias) targeting the same branch. Wait for it to finish and re-run terraform apply. If this happens "+

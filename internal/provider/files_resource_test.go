@@ -715,6 +715,23 @@ func TestApiErrorDiag(t *testing.T) {
 			contains: []string{"another writer", "re-run terraform apply", `tag named "main"`, "refs/tags/main", "every commit to the branch is refused"},
 		},
 		{
+			// Gitaly's text when another writer held the ref lock past git's
+			// lock timeout: the same race.
+			name:        "400-ref-locked",
+			err:         mkErr(400, "9:reference update: reference is already locked.", nil),
+			wantSummary: "Branch changed while the commit was being created",
+			contains:    []string{"held its ref lock", "nothing was committed", "re-run terraform apply"},
+		},
+		{
+			// The same Gitaly prefix with a cause a re-run cannot fix: it must
+			// not read as a race with another writer.
+			name:        "400-ref-update-other",
+			err:         mkErr(400, "9:reference update: file directory conflict.", nil),
+			wantSummary: "GitLab API error: " + action,
+			contains:    []string{"HTTP 400", "file directory conflict"},
+			absent:      []string{"another writer"},
+		},
+		{
 			name: "409-conflict", err: mkErr(409, "last commit changed", nil),
 			wantSummary: "Concurrent modification detected (optimistic_lock)",
 			contains:    []string{"refresh-only"},
