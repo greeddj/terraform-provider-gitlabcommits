@@ -139,7 +139,8 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 		resp.Diagnostics.AddAttributeError(
 			path.Root("token"),
 			"Unknown GitLab API Token",
-			"Token must be a known value at provider configure time. Use a static value or `target apply` the source first.",
+			"Token must be a known value at provider configure time. Use a static value, set GITLAB_TOKEN and leave token "+
+				"unset, or create the source first with `terraform apply -target=<address>`.",
 		)
 	}
 	if config.BaseURL.IsUnknown() {
