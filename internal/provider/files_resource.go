@@ -339,10 +339,15 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"detect_drift": schema.BoolAttribute{
 				Description: "If true (default), Read fetches each managed file from GitLab and updates state " +
 					"when the remote blob differs, so terraform plan reflects the real repository state. " +
-					"With false, Read is a no-op: a file deleted out of band stays in state until detect_drift is " +
-					"re-enabled and a refresh runs. Until then an update that removes it fails with GitLab's 400 when " +
-					"optimistic_lock sends its last_commit_id; without the token the provider probes the path first and " +
-					"drops the delete.",
+					"With false, Read is a no-op and state keeps what the last apply recorded: under optimistic_lock an " +
+					"update, chmod or delete of a file changed out of band fails with GitLab's 400 on every apply, and a " +
+					"file deleted out of band stays in state (an update that removes it from files probes the path first " +
+					"and drops the delete). A refresh reads the value recorded in state, not the configuration, and a " +
+					"failed apply keeps that value, so a new detect_drift value only affects refreshes once an apply has " +
+					"recorded it. To catch up with the repository, set detect_drift = true with files as last applied " +
+					"and apply (this makes no commit), then put back any change you were applying and plan again: that " +
+					"plan compares files with the branch, so with files still as last applied it would revert what " +
+					"changed there.",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
@@ -951,7 +956,7 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	actions, _, diags = r.probeUnguarded(ctx, project, branch, actions, probes, "before the update commit")
+	actions, _, diags = r.probeUnguarded(ctx, project, branch, actions, probes, !state.detectDrift(), "before the update commit")
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -971,7 +976,8 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 			return
 		}
 		if err != nil {
-			resp.Diagnostics.AddError(commitErrorDiag("pushing update commit", project, branch, err))
+			summary, detail := commitErrorDiag("pushing update commit", project, branch, err)
+			resp.Diagnostics.AddError(summary, detail+unrefreshedNote(state, err, false))
 			return
 		}
 	}
@@ -1051,7 +1057,7 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 		actions = append(actions, a)
 	}
 
-	actions, branchFound, diags := r.probeUnguarded(ctx, project, branch, actions, nil, "before destroy")
+	actions, branchFound, diags := r.probeUnguarded(ctx, project, branch, actions, nil, false, "before destroy")
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -1072,7 +1078,8 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 	// 5xx may have landed, and a 403 or a cancelled lock wait will not
 	// change on a retry.
 	if !hasStatus(err, http.StatusBadRequest) && !errors.Is(err, gitlab.ErrNotFound) {
-		resp.Diagnostics.AddError(commitErrorDiag("pushing destroy commit", project, branch, err))
+		summary, detail := commitErrorDiag("pushing destroy commit", project, branch, err)
+		resp.Diagnostics.AddError(summary, detail+unrefreshedNote(state, err, true))
 		return
 	}
 
@@ -1088,7 +1095,8 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 	if len(absent) == 0 {
 		// Every file is still there, so the rejection was about something
 		// else (a concurrent edit, a push rule, another writer on the branch).
-		resp.Diagnostics.AddError(apiErrorDiag("pushing destroy commit", project, branch, err))
+		summary, detail := apiErrorDiag("pushing destroy commit", project, branch, err)
+		resp.Diagnostics.AddError(summary, detail+unrefreshedNote(state, err, true))
 		return
 	}
 	keptForOthers := len(sent) < len(actions)
@@ -1100,7 +1108,8 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 	_, _, diags, err = r.commitLocked(ctx, state, actions)
 	resp.Diagnostics.Append(diags...)
 	if err != nil {
-		resp.Diagnostics.AddError(commitErrorDiag("pushing destroy commit without the files already gone", project, branch, err))
+		summary, detail := commitErrorDiag("pushing destroy commit without the files already gone", project, branch, err)
+		resp.Diagnostics.AddError(summary, detail+unrefreshedNote(state, err, true))
 	}
 }
 
@@ -1660,22 +1669,31 @@ func hasPathUnder(paths map[string]bool, dir string) bool {
 // the paths fresh already resolved to a file. Without the token GitLab has
 // no guard of its own: it applies the action to whatever tree entry sits at
 // the path, so a delete removes a directory that replaced the file and a
-// chmod gives a directory a file mode. A delete whose path no longer holds a
-// file is dropped; a chmod on one fails. With the lock on and every token
-// present nothing is probed. branchFound is as absentPaths reports it.
+// chmod gives a directory a file mode. With unrefreshed (detect_drift false
+// in state, so no refresh dropped a file deleted out of band) every delete
+// is probed, a locked one included: GitLab rejects the locked delete of a
+// missing file with a 400 on every apply, the one that re-enables
+// detect_drift included, since a failed apply keeps the stored value. Its
+// token is kept, so a file changed out of band still fails the commit. A
+// delete whose path no longer holds a file is dropped; a chmod on one
+// fails. With the lock on, every token present and a refreshed state
+// nothing is probed. branchFound is as absentPaths reports it.
 func (r *filesResource) probeUnguarded(
 	ctx context.Context,
 	project, branch string,
 	actions []*gitlab.CommitActionOptions,
 	fresh map[string]remoteProbe,
+	unrefreshed bool,
 	stage string,
 ) ([]*gitlab.CommitActionOptions, bool, diag.Diagnostics) {
 	var paths []string
 	for _, a := range actions {
-		if a.LastCommitID != nil || fresh[*a.FilePath].exists {
+		if fresh[*a.FilePath].exists {
 			continue
 		}
-		if *a.Action == gitlab.FileDelete || *a.Action == gitlab.FileChmod {
+		unguardedDelete := *a.Action == gitlab.FileDelete && (a.LastCommitID == nil || unrefreshed)
+		unguardedChmod := *a.Action == gitlab.FileChmod && a.LastCommitID == nil
+		if unguardedDelete || unguardedChmod {
 			paths = append(paths, *a.FilePath)
 		}
 	}
@@ -1686,12 +1704,16 @@ func (r *filesResource) probeUnguarded(
 	if diags.HasError() {
 		return nil, branchFound, diags
 	}
+	next := "Refresh the state with detect_drift enabled and review the plan."
+	if unrefreshed {
+		next = "detect_drift is false in this resource's state, so a refresh keeps the file there: " + recordDetectDrift +
+			replanWithChange + "."
+	}
 	for _, a := range actions {
 		if absent[*a.FilePath] && *a.Action == gitlab.FileChmod {
 			diags.AddAttributeError(path.Root("files").AtMapKey(*a.FilePath), "File no longer exists",
 				fmt.Sprintf("cannot change execute_filemode of %q: the path no longer holds a file on branch %q "+
-					"(deleted, or replaced by a directory, out of band). Refresh the state with detect_drift enabled "+
-					"and review the plan.", *a.FilePath, branch))
+					"(deleted, or replaced by a directory, out of band). %s", *a.FilePath, branch, next))
 		}
 	}
 	if diags.HasError() {
@@ -1965,10 +1987,87 @@ func commitErrorDiag(action, project, branch string, err error) (string, string)
 	return apiErrorDiag(action, project, branch, err)
 }
 
+// recordDetectDrift is the way back to refreshes while state records
+// detect_drift = false: a refresh reads the stored value, not the
+// configuration, and a failed apply keeps it, so the new value has to be
+// recorded by an apply that changes nothing else.
+const recordDetectDrift = "set detect_drift = true with `files` as last applied and apply (this makes no commit)"
+
+// replanWithChange follows recordDetectDrift when an apply was making a
+// change. The plan after the recording apply compares files with the
+// branch, so with files still as last applied it would revert whatever
+// changed there, the change itself included when its commit had landed.
+const replanWithChange = ", then put your change back in `files` and plan again"
+
+// unrefreshedNote is the advice to append to a commit error of Update, or of
+// Delete with destroy set, when state records detect_drift = false: a
+// refresh then leaves state as it is, so neither the refresh a lock conflict
+// suggests nor the plan a server error suggests can help. It is "" for any
+// other error, and when state records detect_drift = true. For Update the
+// lock can only be dropped as a shortcut: a token-less update of a file
+// deleted out of band still fails, and after a server error whose commit
+// landed it would commit the same change a second time.
+func unrefreshedNote(state filesResourceModel, err error, destroy bool) string {
+	if state.detectDrift() {
+		return ""
+	}
+	const lead = " detect_drift is false in this resource's state, so "
+	switch {
+	case isLockConflict(err) && destroy:
+		return lead + "the refresh before destroy leaves the stored last_commit_id values as they are and destroying " +
+			"again fails the same way. To delete the files whatever the other edit changed, set optimistic_lock = false " +
+			"with `files` as last applied and apply (this makes no commit), then destroy again; to review the edit " +
+			"first, " + recordDetectDrift + ", then plan again."
+	case isLockConflict(err):
+		return lead + "a refresh leaves the stored last_commit_id values as they are and applying again fails the same " +
+			"way. To see the other edit, " + recordDetectDrift + replanWithChange + ": the refresh then reads the " +
+			"branch, and the plan shows your change against what is there. Applying once with optimistic_lock = false " +
+			"(then setting it back) is only a shortcut for overwriting an edit to a file that still exists: it does not " +
+			"help when a file was deleted out of band, and after a failed apply whose commit may have landed it would " +
+			"commit the same change a second time."
+	case isServerError(err) && destroy:
+		return lead + "terraform plan cannot show whether the destroy commit landed. Running terraform destroy again " +
+			"is safe: the files that commit already deleted are skipped."
+	case isServerError(err):
+		return lead + "terraform plan cannot show whether the commit landed. To find out, " + recordDetectDrift +
+			replanWithChange + ": the refresh then reads the branch, and a change that already landed needs no commit."
+	}
+	return ""
+}
+
 // hasStatus reports whether err is a GitLab answer with the given HTTP status.
 func hasStatus(err error, status int) bool {
 	resp, ok := errors.AsType[*gitlab.ErrorResponse](err)
 	return ok && resp.Response != nil && resp.Response.StatusCode == status
+}
+
+// isServerError reports whether err is a GitLab answer with a 5xx status.
+func isServerError(err error) bool {
+	resp, ok := errors.AsType[*gitlab.ErrorResponse](err)
+	return ok && resp.Response != nil && resp.Response.StatusCode >= 500
+}
+
+// isLockConflict reports whether err is GitLab's optimistic-lock rejection:
+// a 400 or 409 saying a file changed since the last_commit_id sent. The
+// commits API (Files::MultiService) answers "The file has changed since you
+// started editing it: <path>"; the single-file Files API and the web editor
+// use "You are attempting to update a file that has changed since you
+// started editing it." Three substrings are matched - `last_commit_id`
+// (snake_case, future-proof if the API ever exposes the parameter name),
+// `last commit` (current prose form), and `has changed since` (most stable
+// phrase) - so any one surviving a future rewording keeps it recognised.
+func isLockConflict(err error) bool {
+	resp, ok := errors.AsType[*gitlab.ErrorResponse](err)
+	if !ok || resp.Response == nil {
+		return false
+	}
+	if s := resp.Response.StatusCode; s != http.StatusBadRequest && s != http.StatusConflict {
+		return false
+	}
+	lower := strings.ToLower(resp.Message)
+	return strings.Contains(lower, "last_commit_id") ||
+		strings.Contains(lower, "last commit") ||
+		strings.Contains(lower, "has changed since")
 }
 
 // branchExists reports whether branch is present, distinguishing a genuine
@@ -2320,18 +2419,7 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 					"(4) if your group or instance enforces fine-grained personal access tokens, a legacy `api` token is refused after the enforcement date and the body lists the permissions a fine-grained token needs.",
 				body)
 		case 400, 409:
-			// 400 with optimistic-lock failure. The commits API (Files::MultiService)
-			// answers "The file has changed since you started editing it: <path>";
-			// the single-file Files API and the web editor use "You are attempting
-			// to update a file that has changed since you started editing it."
-			// We match three substrings - `last_commit_id` (snake_case, future-proof if
-			// the API ever exposes the parameter name), `last commit` (current prose
-			// form), and `has changed since` (most stable phrase) - so any one
-			// surviving a future rewording keeps the diagnostic accurate.
-			lower := strings.ToLower(resp.Message)
-			if strings.Contains(lower, "last_commit_id") ||
-				strings.Contains(lower, "last commit") ||
-				strings.Contains(lower, "has changed since") {
+			if isLockConflict(err) {
 				summary = "Concurrent modification detected (optimistic_lock)"
 				return summary, fmt.Sprintf("%s: a file was modified by someone else since this resource last touched it. "+
 					"Run `terraform apply -refresh-only` to pull current state, then re-plan. Body: %s", prefix, body)
@@ -2341,7 +2429,7 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			// does not point to expected object". Commits are serialised per
 			// branch inside this process, so this means a writer outside this
 			// terraform run.
-			if strings.Contains(lower, "expected object") {
+			if strings.Contains(strings.ToLower(resp.Message), "expected object") {
 				summary = "Branch changed while the commit was being created"
 				return summary, fmt.Sprintf("%s: another writer pushed to the branch while GitLab was building this commit, "+
 					"so the ref update was refused and nothing was committed. This provider serialises its own commits per "+

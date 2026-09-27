@@ -146,7 +146,7 @@ attribute on the provider block. In CI, prefer a CI variable such as
 | `author_name` | string | no | Override commit author name. |
 | `author_email` | string | no | Override commit author email. |
 | `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit, or on its own when there is nothing to commit. A branch name is resolved to its head commit once, when the resource is created. Must be unset in a repository with no commits yet. The branch is not deleted on destroy. |
-| `detect_drift` | bool | no | Default `true`. If false, Read is a no-op. |
+| `detect_drift` | bool | no | Default `true`. If false, Read is a no-op. A refresh reads the value from state, so a new value affects refreshes only once an apply has recorded it; see Caveats. |
 | `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. Read from the state of the last apply; see Caveats. |
 | `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist, or to no action when their content already matches (needed for clean import). A path that cannot be read fails the apply without a commit. |
 | `optimistic_lock` | bool | no | Default `true`. Send each file's `last_commit_id` so GitLab rejects concurrent updates with HTTP 400. Set to `false` to opt out. Not sent on the first commit of a branch created from `create_branch_from`. For the destroy commit, read from the state of the last apply. |
@@ -325,6 +325,22 @@ converges without a commit.
   Terraform does not evaluate configuration during `terraform destroy`, so the
   destroy commit uses the values recorded in state by the last apply. Change
   the flag in HCL, run `terraform apply`, then destroy.
+- **`detect_drift` applies as last applied, too.** With
+  `detect_drift = false` a refresh leaves state as the last apply left it.
+  A refresh is handed the state, not the configuration, so it reads the
+  recorded value, and an apply that fails keeps that value: turning
+  `detect_drift` back on takes effect only once an apply has recorded it.
+  Until then, under `optimistic_lock` an update, chmod or delete of a file
+  changed out of band fails with GitLab's 400 on every apply and every
+  destroy, and `terraform apply -refresh-only` changes nothing. A file
+  deleted out of band stays in state; an update that removes it from
+  `files` probes the path and drops the delete, and a destroy skips it. To
+  catch up with the repository, set `detect_drift = true` with `files` as
+  last applied and apply (this makes no commit), then put back any change
+  you were applying and plan again: that plan compares `files` with the
+  branch, so with `files` still as last applied it would revert what
+  changed there. A failed commit's diagnostic gives this advice when it
+  applies.
 - **State holds your file content.** If you set `content_base64` to the bytes
   of a 10 MB binary, those bytes live in `terraform.tfstate`. Use a secrets
   backend and avoid committing huge binaries through this provider.
@@ -332,7 +348,9 @@ converges without a commit.
   the file's `last_commit_id` so GitLab rejects the action with HTTP 400 if
   someone else has touched the file since this resource last did. The
   provider surfaces those as "Concurrent modification detected" diagnostics
-  with a hint to run `terraform apply -refresh-only`. Set
+  with a hint to run `terraform apply -refresh-only` (with
+  `detect_drift = false` recorded in state that refresh changes nothing,
+  and the diagnostic says what to do instead; see above). Set
   `optimistic_lock = false` per resource to opt out (e.g. when an external
   bot intentionally co-edits the same files); the trade-off is silent
   last-write-wins. Without the token the provider probes each path before a
@@ -394,7 +412,11 @@ converges without a commit.
   connection failures that happen before the request is sent. A 5xx or a
   dropped connection fails the apply with the status in the diagnostic; run
   `terraform plan` to see whether the commit landed, and apply again if it
-  did not.
+  did not. With `detect_drift = false` recorded in state the plan cannot
+  show that: first set `detect_drift = true` with `files` as last applied
+  and apply (this makes no commit), then put the change back in `files` and
+  plan. A destroy can simply be run again, since files already deleted are
+  skipped.
 
 ## Development
 

@@ -551,6 +551,131 @@ func TestCommitConflict_LeavesStateUntouched(t *testing.T) {
 	})
 }
 
+// TestCommitErrors_UnrefreshedStateNote: while state records detect_drift =
+// false a refresh changes nothing, so the refresh a lock conflict suggests
+// and the plan a server error suggests cannot help; Update and Delete then
+// add how to recover, and only then. The recorded value counts, not the
+// plan's, and other rejections get no note. For Update the recovery puts
+// the change back before planning, and dropping the lock is offered only
+// as a shortcut, with the cases it cannot handle.
+func TestCommitErrors_UnrefreshedStateNote(t *testing.T) {
+	const conflict = `{"message":"The file has changed since you started editing it: f.txt"}`
+	cases := []struct {
+		name, body     string
+		want           []string
+		status         int
+		destroy, stale bool
+	}{
+		{name: "update conflict", status: http.StatusBadRequest, body: conflict, stale: true, want: []string{
+			"To see the other edit, set detect_drift = true with `files` as last applied and apply (this makes no commit), " +
+				"then put your change back in `files` and plan again",
+			"only a shortcut for overwriting an edit to a file that still exists",
+			"does not help when a file was deleted out of band",
+			"commit the same change a second time",
+		}},
+		{name: "update conflict refreshed", status: http.StatusBadRequest, body: conflict},
+		{name: "update server error", status: http.StatusBadGateway, stale: true, want: []string{
+			"cannot show whether the commit landed",
+			"then put your change back in `files` and plan again",
+		}},
+		{name: "update server error refreshed", status: http.StatusBadGateway},
+		{name: "update other rejection", status: http.StatusBadRequest, body: `{"message":"validation failed"}`, stale: true},
+		{name: "destroy conflict", destroy: true, status: http.StatusBadRequest, body: conflict, stale: true, want: []string{
+			"then destroy again",
+			"to review the edit first, set detect_drift = true with `files` as last applied and apply (this makes no " +
+				"commit), then plan again.",
+		}},
+		{name: "destroy conflict refreshed", destroy: true, status: http.StatusBadRequest, body: conflict},
+		{name: "destroy server error", destroy: true, status: http.StatusBadGateway, stale: true, want: []string{"Running terraform destroy again is safe"}},
+		{name: "destroy server error refreshed", destroy: true, status: http.StatusBadGateway},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodHead:
+					metaHeaders(w, "oldblob", "remote-lcid", false)
+				case http.MethodPost:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(c.status)
+					_, _ = w.Write([]byte(c.body))
+				default:
+					t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+					http.Error(w, "unexpected", http.StatusInternalServerError)
+				}
+			})
+			plan, state := changedPlan()
+			state.DetectDrift = types.BoolValue(!c.stale)
+			plan.DetectDrift = types.BoolValue(c.stale)
+			var diags diag.Diagnostics
+			if c.destroy {
+				diags = runDelete(t, client, state).Diagnostics
+			} else {
+				diags = runUpdate(t, client, plan, state).Diagnostics
+			}
+			if len(diags.Errors()) != 1 {
+				t.Fatalf("want exactly one error, got %v", diags)
+			}
+			detail := diags.Errors()[0].Detail()
+			if len(c.want) == 0 {
+				if strings.Contains(detail, "detect_drift is false") {
+					t.Errorf("unexpected detect_drift note: %s", detail)
+				}
+				return
+			}
+			if !strings.Contains(detail, "detect_drift is false in this resource's state") {
+				t.Errorf("detail must carry the detect_drift note, got: %s", detail)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(detail, w) {
+					t.Errorf("detail must mention %q, got: %s", w, detail)
+				}
+			}
+		})
+	}
+}
+
+// TestDelete_RetryConflictUnrefreshedNote: a destroy whose first commit
+// GitLab rejects for a file deleted out of band is retried without it (the
+// two recorded commits), and when the retry is rejected in turn for a file
+// edited out of band, that one error carries the same recovery as the first
+// commit's would, and only while state records detect_drift = false.
+func TestDelete_RetryConflictUnrefreshedNote(t *testing.T) {
+	for _, stale := range []bool{true, false} {
+		t.Run(fmt.Sprintf("stale=%v", stale), func(t *testing.T) {
+			fake := &repoFake{files: map[string]string{"edited.txt": "moved"}}
+			state := managedFiles(true, map[string]string{"edited.txt": "le", "gone.txt": "lg"})
+			state.DetectDrift = types.BoolValue(!stale)
+
+			resp := runDelete(t, fake.client(t), state)
+
+			commits, probes, files := fake.recorded()
+			wantCommits := [][]string{{"delete:edited.txt@le", "delete:gone.txt@lg"}, {"delete:edited.txt@le"}}
+			if !slices.EqualFunc(commits, wantCommits, slices.Equal[[]string]) {
+				t.Errorf("commits = %q, want %q", commits, wantCommits)
+			}
+			if want := []string{"edited.txt@main", "gone.txt@main"}; !slices.Equal(probes, want) {
+				t.Errorf("probes = %q, want %q", probes, want)
+			}
+			if _, kept := files["edited.txt"]; !kept {
+				t.Error("a rejected retry must leave edited.txt on the branch")
+			}
+			errs := resp.Diagnostics.Errors()
+			if len(errs) != 1 {
+				t.Fatalf("want exactly one error, got %v", resp.Diagnostics)
+			}
+			if s := errs[0].Summary(); s != "Concurrent modification detected (optimistic_lock)" {
+				t.Errorf("the retry's rejection must read as a lock conflict, got summary %q", s)
+			}
+			note := strings.Contains(errs[0].Detail(), "detect_drift is false in this resource's state") &&
+				strings.Contains(errs[0].Detail(), "then destroy again")
+			if note != stale {
+				t.Errorf("detect_drift note present = %v, want %v: %s", note, stale, errs[0].Detail())
+			}
+		})
+	}
+}
+
 // TestDelete_DeleteOnDestroyFalseSkipsAPI: delete_on_destroy=false is a
 // state-only drop and must not touch the API.
 func TestDelete_DeleteOnDestroyFalseSkipsAPI(t *testing.T) {
@@ -835,18 +960,23 @@ func TestDelete_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
 // delete of a path that no longer holds a file is dropped and a chmod of one
 // fails. With the lock on and every token present nothing is probed before
 // the commit, and a path the adopt probe has just found is not probed again.
+// A state that recorded detect_drift = false was never refreshed, so there
+// every delete is probed, a locked one included (GitLab would reject the
+// locked delete of a missing file on every apply), and once only, whether
+// the plan turns detect_drift back on (stale) or keeps it off (keepOff too).
 // Every plan drops rm.txt and sets run.sh's exec bit to chmod; adopt adds
 // new.sh, executable, with the content the branch already holds.
 func TestUpdate_UnguardedDeleteAndChmodAreProbed(t *testing.T) {
 	cases := []struct {
-		repo               map[string]string
-		tokens             map[string]string
-		name               string
-		wantError          string
-		wantCommits        [][]string
-		wantProbes         []string
-		branchStatus       int
-		lock, chmod, adopt bool
+		repo                               map[string]string
+		tokens                             map[string]string
+		probeStatus                        map[string]int
+		name                               string
+		wantError                          string
+		wantCommits                        [][]string
+		wantProbes                         []string
+		branchStatus                       int
+		lock, chmod, adopt, stale, keepOff bool
 	}{
 		{
 			name:        "locked actions are not probed",
@@ -906,17 +1036,97 @@ func TestUpdate_UnguardedDeleteAndChmodAreProbed(t *testing.T) {
 			wantCommits: [][]string{{"delete:rm.txt", "chmod:new.sh"}},
 			wantProbes:  []string{"new.sh@main", "new.sh@sha1", "rm.txt@main"},
 		},
+		{
+			name:        "an unrefreshed state probes a locked delete and keeps its token",
+			lock:        true,
+			stale:       true,
+			repo:        map[string]string{"rm.txt": "lr", "run.sh": "ls"},
+			wantCommits: [][]string{{"delete:rm.txt@lr"}},
+			wantProbes:  []string{"rm.txt@main"},
+		},
+		{
+			name:       "an unrefreshed state drops a locked delete of a file already gone",
+			lock:       true,
+			stale:      true,
+			repo:       map[string]string{"run.sh": "ls"},
+			wantProbes: []string{"rm.txt@main"},
+		},
+		{
+			name:        "a state that stays unrefreshed probes a locked delete and keeps its token",
+			lock:        true,
+			stale:       true,
+			keepOff:     true,
+			repo:        map[string]string{"rm.txt": "lr", "run.sh": "ls"},
+			wantCommits: [][]string{{"delete:rm.txt@lr"}},
+			wantProbes:  []string{"rm.txt@main"},
+		},
+		{
+			name:       "a state that stays unrefreshed drops a locked delete of a file already gone",
+			lock:       true,
+			stale:      true,
+			keepOff:    true,
+			repo:       map[string]string{"run.sh": "ls"},
+			wantProbes: []string{"rm.txt@main"},
+		},
+		{
+			name:        "an unrefreshed state leaves a locked chmod unprobed",
+			lock:        true,
+			stale:       true,
+			chmod:       true,
+			repo:        map[string]string{"run.sh": "ls"},
+			wantCommits: [][]string{{"chmod:run.sh@ls"}},
+			wantProbes:  []string{"rm.txt@main", "run.sh@sha1"},
+		},
+		{
+			name:        "an unrefreshed state probes an unguarded delete once",
+			stale:       true,
+			chmod:       true,
+			repo:        map[string]string{"rm.txt": "lr", "run.sh": "ls"},
+			wantCommits: [][]string{{"delete:rm.txt", "chmod:run.sh"}},
+			wantProbes:  []string{"rm.txt@main", "run.sh@main", "run.sh@sha1"},
+		},
+		{
+			name:       "an unrefreshed state says how to recover from a chmod of a missing file",
+			stale:      true,
+			chmod:      true,
+			repo:       map[string]string{"rm.txt": "lr"},
+			wantProbes: []string{"rm.txt@main", "run.sh@main"},
+			wantError: "set detect_drift = true with `files` as last applied and apply (this makes no commit), " +
+				"then put your change back in `files` and plan again.",
+		},
+		{
+			name:        "an unrefreshed state fails on a probe error",
+			lock:        true,
+			stale:       true,
+			repo:        map[string]string{"rm.txt": "lr", "run.sh": "ls"},
+			probeStatus: map[string]int{"rm.txt": http.StatusForbidden},
+			wantProbes:  []string{"rm.txt@main"},
+			wantError:   "HTTP 403",
+		},
+		{
+			name:         "an unrefreshed state trusts a 404 only once the branch lookup succeeds",
+			lock:         true,
+			stale:        true,
+			repo:         map[string]string{"run.sh": "ls"},
+			branchStatus: http.StatusInternalServerError,
+			wantProbes:   []string{"rm.txt@main"},
+			wantError:    "Gitaly times out",
+		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			fake := &repoFake{files: maps.Clone(c.repo), branchStatus: c.branchStatus}
+			fake := &repoFake{files: maps.Clone(c.repo), probeStatus: c.probeStatus, branchStatus: c.branchStatus}
 			tokens := c.tokens
 			if tokens == nil {
 				tokens = map[string]string{"rm.txt": "lr", "run.sh": "ls"}
 			}
 			state := managedFiles(c.lock, tokens)
 			plan := managedFiles(c.lock, tokens)
+			state.DetectDrift = types.BoolValue(!c.stale)
+			if c.keepOff {
+				plan.DetectDrift = types.BoolValue(false)
+			}
 			delete(plan.Files, "rm.txt")
 			run := plan.Files["run.sh"]
 			run.ExecuteFilemode = types.BoolValue(c.chmod)

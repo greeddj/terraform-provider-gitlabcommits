@@ -474,6 +474,68 @@ func TestAccFiles_destroyAfterOutOfBandDelete(t *testing.T) {
 	})
 }
 
+// TestAccFiles_removeAfterOutOfBandDelete: with detect_drift=false state
+// still lists a file someone deleted by hand, and its locked delete would be
+// rejected on every apply. Removing it from files, in the same apply that
+// turns detect_drift back on, must probe the path, drop the delete and
+// commit nothing.
+func TestAccFiles_removeAfterOutOfBandDelete(t *testing.T) {
+	testAccPreCheck(t)
+
+	project := os.Getenv("GITLAB_TEST_PROJECT_ID")
+	branch := accBranch(t)
+	keep := accTestPathPrefix + "oobrm/keep.txt"
+	gone := accTestPathPrefix + "oobrm/gone.txt"
+
+	cfg := func(detectDrift bool, paths ...string) string {
+		var b strings.Builder
+		b.WriteString(accResourceHeader(project, branch))
+		fmt.Fprintf(&b, "  detect_drift = %t\n  files = {\n", detectDrift)
+		for _, p := range paths {
+			fmt.Fprintf(&b, "    %q = { content = %q }\n", p, "content\n")
+		}
+		b.WriteString("  }\n}\n")
+		return b.String()
+	}
+
+	var commitSHA string
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             accCheckFileGone(project, branch, keep),
+		Steps: []resource.TestStep{
+			{
+				Config: cfg(false, keep, gone),
+				Check: resource.TestCheckResourceAttrWith("gitlabcommits_files.test", "commit_sha", func(v string) error {
+					commitSHA = v
+					return nil
+				}),
+			},
+			{
+				PreConfig: func() {
+					c, err := accClient()
+					if err != nil {
+						t.Fatalf("accClient: %v", err)
+					}
+					_, err = c.RepositoryFiles.DeleteFile(project, gone, &gitlab.DeleteFileOptions{
+						Branch:        new(branch),
+						CommitMessage: new("tf-acc-test out-of-band delete"),
+					}, gitlab.WithContext(context.Background()))
+					if err != nil {
+						t.Fatalf("out-of-band delete: %v", err)
+					}
+				},
+				// A commit would have moved commit_sha; the post-apply plan
+				// check fails if state still lists the deleted file.
+				Config: cfg(true, keep),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					accCheckFileExists(project, branch, keep),
+					resource.TestCheckResourceAttrPtr("gitlabcommits_files.test", "commit_sha", &commitSHA),
+				),
+			},
+		},
+	})
+}
+
 // TestAccFiles_chmodCycle flips the executable bit both ways without touching
 // content and asserts the bit actually lands in the repository each time.
 func TestAccFiles_chmodCycle(t *testing.T) {

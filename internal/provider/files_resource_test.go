@@ -792,6 +792,41 @@ func TestApiErrorDiag(t *testing.T) {
 
 }
 
+// TestErrorClassifiers pins isLockConflict and isServerError, which decide
+// the recovery advice Update and Delete add to a commit error.
+func TestErrorClassifiers(t *testing.T) {
+	mkErr := func(status int, msg string) error {
+		return &gitlab.ErrorResponse{StatusCode: status, Response: &http.Response{StatusCode: status}, Message: msg}
+	}
+	cases := []struct {
+		err            error
+		name           string
+		conflict, fail bool
+	}{
+		{name: "400 commits api conflict", err: mkErr(400, "The file has changed since you started editing it: f.txt"), conflict: true},
+		{name: "409 last commit", err: mkErr(409, "Last commit changed"), conflict: true},
+		{name: "wrapped conflict", err: fmt.Errorf("pushing: %w", mkErr(400, "last_commit_id mismatch")), conflict: true},
+		{name: "422 with conflict text", err: mkErr(422, "has changed since")},
+		{name: "400 other", err: mkErr(400, "validation failed")},
+		{name: "400 without a response", err: &gitlab.ErrorResponse{StatusCode: 400, Message: "has changed since"}},
+		{name: "404 sentinel", err: gitlab.ErrNotFound},
+		{name: "429", err: mkErr(429, "rate limited")},
+		{name: "500", err: mkErr(500, "boom"), fail: true},
+		{name: "wrapped 502", err: fmt.Errorf("pushing: %w", mkErr(502, "bad gateway")), fail: true},
+		{name: "transport", err: errors.New("connection reset by peer")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isLockConflict(c.err); got != c.conflict {
+				t.Errorf("isLockConflict = %v, want %v", got, c.conflict)
+			}
+			if got := isServerError(c.err); got != c.fail {
+				t.Errorf("isServerError = %v, want %v", got, c.fail)
+			}
+		})
+	}
+}
+
 // TestStampBlobs_OneProbeFailure verifies the fail-soft contract: when one
 // HEAD probe returns a server error, stampBlobs appends a warning (not an
 // error), leaves that file's BlobID null, and still stamps BlobID correctly
