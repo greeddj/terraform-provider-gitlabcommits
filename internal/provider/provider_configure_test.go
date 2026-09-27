@@ -4,6 +4,8 @@
 package provider
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"maps"
 	"math/big"
@@ -18,6 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
+	"github.com/hashicorp/terraform-plugin-log/tflogtest"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 )
 
@@ -25,7 +28,13 @@ import (
 // overrides (any attribute not supplied defaults to null).
 func runConfigure(t *testing.T, attrs map[string]tftypes.Value) *provider.ConfigureResponse {
 	t.Helper()
-	ctx := t.Context()
+	return runConfigureCtx(t.Context(), t, attrs)
+}
+
+// runConfigureCtx is runConfigure with the context Configure runs in, for a
+// test that captures what it logs.
+func runConfigureCtx(ctx context.Context, t *testing.T, attrs map[string]tftypes.Value) *provider.ConfigureResponse {
+	t.Helper()
 	p := New("test")()
 
 	sresp := &provider.SchemaResponse{}
@@ -404,4 +413,61 @@ func TestConfigure_RejectsJobTokens(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestConfigure_BaseURLCredentialsStayOutOfLogs: a base_url may carry a
+// basic-auth proxy's credentials (net/http sends them on every request).
+// Neither the configure log line nor the invalid-URL diagnostic may repeat
+// them.
+func TestConfigure_BaseURLCredentialsStayOutOfLogs(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	t.Setenv("GITLAB_BASE_URL", "")
+	t.Run("log", func(t *testing.T) {
+		var out bytes.Buffer
+		resp := runConfigureCtx(tflogtest.RootLogger(t.Context(), &out), t, map[string]tftypes.Value{
+			"token":    tftypes.NewValue(tftypes.String, "tok"),
+			"base_url": tftypes.NewValue(tftypes.String, "https://ci:s3cret@gitlab.example.com"),
+		})
+		if resp.Diagnostics.HasError() {
+			t.Fatalf("configure: %v", resp.Diagnostics.Errors())
+		}
+		entries, err := tflogtest.MultilineJSONDecode(&out)
+		if err != nil {
+			t.Fatalf("decoding the log: %v", err)
+		}
+		var logged []any
+		for _, e := range entries {
+			if e["@message"] == "GitLab Commits provider configured" {
+				logged = append(logged, e["base_url"])
+			}
+		}
+		if len(logged) != 1 || logged[0] != "https://xxxxx@gitlab.example.com" {
+			t.Errorf("logged base_url = %v, want the host with the userinfo masked", logged)
+		}
+		if strings.Contains(out.String(), "s3cret") || strings.Contains(out.String(), "ci:") {
+			t.Errorf("the log carries the credentials: %s", out.String())
+		}
+	})
+	for _, raw := range []string{"htps://ci:s3cret@gitlab.example.com", "ci:s3cret@gitlab.example.com", "https://ci:s3%zz@gitlab.example.com"} {
+		t.Run("diagnostic "+raw, func(t *testing.T) {
+			resp := runConfigure(t, map[string]tftypes.Value{
+				"token":    tftypes.NewValue(tftypes.String, "tok"),
+				"base_url": tftypes.NewValue(tftypes.String, raw),
+			})
+			errs := resp.Diagnostics.Errors()
+			if len(errs) != 1 || errs[0].Summary() != "Invalid GitLab base URL" {
+				t.Fatalf("want the invalid-URL error, got %v", resp.Diagnostics)
+			}
+			if d := errs[0].Detail(); strings.Contains(d, "s3") || !strings.Contains(d, "from base_url") {
+				t.Errorf("detail must name the source and not the value: %s", d)
+			}
+		})
+	}
+	t.Run("diagnostic from GITLAB_BASE_URL", func(t *testing.T) {
+		t.Setenv("GITLAB_BASE_URL", "ci:s3cret@gitlab.example.com")
+		resp := runConfigure(t, map[string]tftypes.Value{"token": tftypes.NewValue(tftypes.String, "tok")})
+		if errs := resp.Diagnostics.Errors(); len(errs) != 1 || !strings.Contains(errs[0].Detail(), "from GITLAB_BASE_URL") {
+			t.Fatalf("want the invalid-URL error naming GITLAB_BASE_URL, got %v", resp.Diagnostics)
+		}
+	})
 }

@@ -195,18 +195,26 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	}
 
 	clientOpts := []gitlab.ClientOptionFunc{}
+	logURL := ""
 	if baseURL != "" {
 		// client-go only logs its own URL validation failure and carries on,
 		// so a schemeless value would surface much later as a transport error.
+		// The value is not echoed: it may carry a proxy's credentials.
 		u, err := url.Parse(baseURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			source := "base_url"
+			if config.BaseURL.IsNull() {
+				source = "GITLAB_BASE_URL"
+			}
 			resp.Diagnostics.AddAttributeError(
 				path.Root("base_url"),
 				"Invalid GitLab base URL",
-				fmt.Sprintf("%q must be an absolute http:// or https:// URL with a host, for example https://gitlab.example.com", baseURL),
+				fmt.Sprintf("The base URL from %s must be an absolute http:// or https:// URL with a host, for example "+
+					"https://gitlab.example.com", source),
 			)
 			return
 		}
+		logURL = withoutUserinfo(u)
 		clientOpts = append(clientOpts, gitlab.WithBaseURL(baseURL))
 		if strings.HasPrefix(strings.ToLower(baseURL), "http://") {
 			resp.Diagnostics.AddAttributeWarning(
@@ -273,7 +281,7 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	}
 
 	tflog.Info(ctx, "GitLab Commits provider configured", map[string]any{
-		"base_url":    baseURL,
+		"base_url":    logURL,
 		"max_retries": maxRetries,
 	})
 
@@ -342,4 +350,16 @@ func isJobToken(token string) bool {
 		return true
 	}
 	return jobTokenPattern.MatchString(token)
+}
+
+// withoutUserinfo renders u with its userinfo masked, for the log: a
+// basic-auth proxy's credentials, or a token in the user part as git URLs
+// carry one, must not reach a TF_LOG file that CI keeps.
+func withoutUserinfo(u *url.URL) string {
+	if u.User == nil {
+		return u.String()
+	}
+	masked := *u
+	masked.User = url.User("xxxxx")
+	return masked.String()
 }
