@@ -197,21 +197,31 @@ func TestRead_EmptyFilesChecksBranch(t *testing.T) {
 }
 
 // TestRead_TwoFileProbeOutcomes pins how per-file probe outcomes combine: a
-// 404 drops only its own path and needs no branch check while another path
-// is still there, any other probe failure fails the refresh with nothing
-// dropped, and two 404s on a live branch empty the files map but keep the
-// resource.
+// 404 drops only its own path, and only once the branch lookup has answered
+// (a Gitaly failure reaches the Files API as a 404 but fails the branch
+// lookup, which fails the refresh with nothing dropped); any other probe
+// failure fails the refresh with nothing dropped; and two 404s on a live
+// branch empty the files map but keep the resource.
 func TestRead_TwoFileProbeOutcomes(t *testing.T) {
 	cases := []struct {
-		status     map[string]int
-		name       string
-		wantFiles  []string
-		branchGets int32
-		wantErr    bool
+		status       map[string]int
+		name         string
+		wantErr      string
+		wantFiles    []string
+		branchStatus int
+		branchGets   int32
 	}{
-		{name: "one gone", status: map[string]int{"a.txt": http.StatusNotFound, "f.txt": http.StatusOK}, wantFiles: []string{"f.txt"}},
-		{name: "one forbidden", status: map[string]int{"a.txt": http.StatusForbidden, "f.txt": http.StatusOK}, wantErr: true},
-		{name: "one gone one forbidden", status: map[string]int{"a.txt": http.StatusNotFound, "f.txt": http.StatusForbidden}, wantErr: true},
+		{name: "one gone", status: map[string]int{"a.txt": http.StatusNotFound, "f.txt": http.StatusOK}, wantFiles: []string{"f.txt"}, branchGets: 1},
+		{
+			name: "one gone while the branch lookup fails", status: map[string]int{"a.txt": http.StatusNotFound, "f.txt": http.StatusOK},
+			branchStatus: http.StatusInternalServerError, wantErr: "Gitaly times out", branchGets: 1,
+		},
+		{
+			name: "one gone on a branch that answers 404", status: map[string]int{"a.txt": http.StatusNotFound, "f.txt": http.StatusOK},
+			branchStatus: http.StatusNotFound, wantFiles: []string{"f.txt"}, branchGets: 1,
+		},
+		{name: "one forbidden", status: map[string]int{"a.txt": http.StatusForbidden, "f.txt": http.StatusOK}, wantErr: "HTTP 403"},
+		{name: "one gone one forbidden", status: map[string]int{"a.txt": http.StatusNotFound, "f.txt": http.StatusForbidden}, wantErr: "HTTP 403"},
 		{name: "both gone on a live branch", status: map[string]int{"a.txt": http.StatusNotFound, "f.txt": http.StatusNotFound}, wantFiles: []string{}, branchGets: 1},
 	}
 	for _, tc := range cases {
@@ -220,6 +230,10 @@ func TestRead_TwoFileProbeOutcomes(t *testing.T) {
 			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/") {
 					branchGets.Add(1)
+					if tc.branchStatus != 0 {
+						http.Error(w, http.StatusText(tc.branchStatus), tc.branchStatus)
+						return
+					}
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"head"}}`))
 					return
@@ -242,10 +256,11 @@ func TestRead_TwoFileProbeOutcomes(t *testing.T) {
 			state.Files["a.txt"] = state.Files["f.txt"]
 
 			resp, out := runRead(t, client, state)
-			if tc.wantErr {
-				if !resp.Diagnostics.HasError() {
-					t.Fatal("expected a non-404 probe failure to fail the refresh")
-				}
+			if got := branchGets.Load(); got != tc.branchGets {
+				t.Errorf("branch lookups = %d, want %d", got, tc.branchGets)
+			}
+			if tc.wantErr != "" {
+				wantDiag(t, "error", resp.Diagnostics.Errors(), tc.wantErr)
 				var kept filesResourceModel
 				if resp.State.Raw.IsNull() || resp.State.Get(t.Context(), &kept).HasError() || len(kept.Files) != 2 {
 					t.Errorf("a failed refresh must drop nothing, state: %s", resp.State.Raw)
@@ -256,7 +271,7 @@ func TestRead_TwoFileProbeOutcomes(t *testing.T) {
 				t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
 			}
 			if resp.State.Raw.IsNull() {
-				t.Fatal("the resource must stay in state while the branch exists")
+				t.Fatal("the resource must stay in state")
 			}
 			if got := slices.Sorted(maps.Keys(out.Files)); !slices.Equal(got, tc.wantFiles) {
 				t.Errorf("files in state = %v, want %v", got, tc.wantFiles)
@@ -265,9 +280,6 @@ func TestRead_TwoFileProbeOutcomes(t *testing.T) {
 				if f.Content.ValueString() != "old" || f.BlobID.ValueString() != "oldblob" || f.LastCommitID.ValueString() != "oldlcid" {
 					t.Errorf("kept path %q must keep its values, got %q/%q/%q", p, f.Content.ValueString(), f.BlobID.ValueString(), f.LastCommitID.ValueString())
 				}
-			}
-			if got := branchGets.Load(); got != tc.branchGets {
-				t.Errorf("branch lookups = %d, want %d", got, tc.branchGets)
 			}
 		})
 	}

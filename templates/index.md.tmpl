@@ -60,6 +60,16 @@ provider needs `POST /repository/commits`.
   replay after GitLab already accepted the commit would land a second commit
   for one apply. A 5xx on the commit fails the apply; run `terraform plan`
   to see whether the commit landed.
+- **Gitaly failures on the Files API.** GitLab answers a Files API request
+  with 404 when Gitaly times out resolving the ref, exactly as for a file
+  that does not exist; releases up to at least 19.4 do the same when Gitaly
+  is unavailable. Before a 404 lets the provider drop a file from state or skip
+  a delete, it looks the branch up, which reports the same failure as an
+  error, and fails the refresh, apply or destroy if that lookup fails. That
+  narrows the window without closing it: a timeout that has cleared by the
+  time of the branch lookup still reads as a missing file, which a refresh
+  drops from state (the next apply adopts it again without a commit, with
+  `adopt_existing`, the default) and a destroy can leave in the repository.
 - **Timeouts.** Every request waits at most five minutes for GitLab's
   response headers once the request has been sent, so a wedged instance
   fails the apply instead of hanging it. Uploads are not bounded by that.

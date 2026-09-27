@@ -41,10 +41,18 @@ branch of one project. The provider:
   gone paths -> `delete` (emitted first), new paths -> `create`, or nothing
   when the path already exists with identical content, content changed ->
   `update`, exec bit flipped -> `chmod`. If nothing changed, no commit is
-  produced.
-- **Delete** - pushes one commit that removes every managed file. Files
-  already absent on the remote are skipped (idempotent against external
-  cleanup). Disable with `delete_on_destroy = false`.
+  produced. A delete or chmod that carries no lock token (for example with
+  `optimistic_lock = false`) is probed first: a delete of a path that no
+  longer holds a file is dropped, and a chmod of one fails.
+- **Delete** - pushes one commit that removes every managed file. With
+  `optimistic_lock` the commit goes out without probing: GitLab checks each
+  file's `last_commit_id` itself and rejects the commit when a file was
+  changed or removed out of band. Only then are the files probed, the ones
+  already gone dropped, and the commit retried once, so a destroy still lands
+  at most one commit. A file without a lock token is probed before the commit.
+  Files already absent are skipped (idempotent against external cleanup), and
+  a destroy that finds none left makes no commit and says so in a warning.
+  Disable with `delete_on_destroy = false`.
 
 The composite ID is `<project_id>::<branch>`. Import with that format; the
 files map starts empty and is reconciled on the next plan + apply.
@@ -250,7 +258,9 @@ converges without a commit.
   with a hint to run `terraform apply -refresh-only`. Set
   `optimistic_lock = false` per resource to opt out (e.g. when an external
   bot intentionally co-edits the same files); the trade-off is silent
-  last-write-wins.
+  last-write-wins. Without the token the provider probes each path before a
+  delete or chmod, because GitLab would apply the action to whatever sits at
+  the path, including a directory that replaced the file.
 - **`commit_message` is per-apply**, not per-file. The same message is used
   for create / update / destroy commits. This is by design - one resource,
   one logical change, one message.
@@ -271,6 +281,17 @@ converges without a commit.
   above 10 MB (5 per minute) are throttled separately; self-managed instances
   configure such limits independently. Those limits send no rate-limit
   headers, so a 429 without `Retry-After` can mean one of them.
+- **A Gitaly failure can look like a missing file.** GitLab answers a Files
+  API request with 404 when Gitaly times out resolving the ref, exactly as
+  for a file that does not exist; releases up to at least 19.4 do the same
+  when Gitaly is unavailable. Before a 404 lets the provider drop a file
+  from state or skip a delete, it looks the branch up, which reports the
+  same failure as an error, and fails the refresh, apply or destroy if that
+  lookup fails. That narrows the window without closing it: a timeout that
+  has cleared by the time of the branch lookup still reads as a missing
+  file, which a refresh drops from state (the next apply adopts it again
+  without a commit, with `adopt_existing`, the default) and a destroy can
+  leave in the repository.
 - **Timeouts and redirects.** Every request waits at most five minutes for
   GitLab's response headers once it has been sent, so a wedged instance or
   proxy fails the apply instead of hanging it (uploads are not bounded by

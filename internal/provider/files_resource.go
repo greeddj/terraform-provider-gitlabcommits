@@ -216,14 +216,17 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Description: "If true (default), Read fetches each managed file from GitLab and updates state " +
 					"when the remote blob differs, so terraform plan reflects the real repository state. " +
 					"With false, Read is a no-op: a file deleted out of band stays in state until detect_drift is " +
-					"re-enabled and a refresh runs, and until then an update that removes it fails with GitLab's 400.",
+					"re-enabled and a refresh runs. Until then an update that removes it fails with GitLab's 400 when " +
+					"optimistic_lock sends its last_commit_id; without the token the provider probes the path first and " +
+					"drops the delete.",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
 			},
 			"delete_on_destroy": schema.BoolAttribute{
 				Description: "If true (default), terraform destroy creates one commit that removes every managed file. " +
-					"Set to false to keep files in place when the resource is removed from state. " +
+					"Files already removed out of band are skipped; when none is left, destroy makes no commit and says " +
+					"so in a warning. Set to false to keep files in place when the resource is removed from state. " +
 					"Terraform does not evaluate configuration during destroy, so this value is read from the state " +
 					"written by the last apply: a change made in HCL must be applied before terraform destroy honours it.",
 				Optional: true,
@@ -260,6 +263,8 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					"GitLab rejects the action with HTTP 400 if the file has been modified by anyone else since " +
 					"this resource last touched it, preventing silent overwrites in concurrent pipelines. " +
 					"Set to false to opt out (useful when an external process intentionally co-edits the same files). " +
+					"Without the token the provider probes each path before a delete or chmod, because GitLab would " +
+					"otherwise apply the action to whatever sits at the path, a directory included. " +
 					"Like delete_on_destroy, the destroy commit uses the value recorded by the last apply.",
 				Optional: true,
 				Computed: true,
@@ -595,24 +600,33 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 		return
 	}
 
-	// Every managed file 404-ing at once usually means the container vanished
-	// (branch or project deleted out of band, or the token lost access -
-	// GitLab answers 404 for all three). Silently emptying the files map would
-	// strand the resource with state no apply can fix; drop it from state
-	// instead so the next apply recreates everything from scratch. With no
-	// files at all (right after import) the branch is the only thing to check.
-	if len(paths) == 0 || allDropped(results) {
-		_, _, err := r.client.Branches.GetBranch(project, branch, gitlab.WithContext(ctx))
+	// A file that answered 404 is dropped only once the branch lookup has
+	// answered too, since a Gitaly failure can reach the Files API as a 404
+	// (see absentPaths); dropping it on that alone would let a destroy that
+	// refreshed first leave the file in the repository. Every managed file
+	// 404-ing at once on a branch that is gone as well usually means the
+	// container vanished (branch or project deleted out of band, or the
+	// token lost access - GitLab answers 404 for all three). Silently
+	// emptying the files map would strand the resource with state no apply
+	// can fix; drop it from state instead so the next apply recreates
+	// everything from scratch. With no files at all (right after import) the
+	// branch is the only thing to check.
+	if len(paths) == 0 || slices.ContainsFunc(results, func(res fileRefreshResult) bool { return res.drop }) {
+		found, err := r.branchExists(ctx, project, branch)
 		if err != nil {
-			if errors.Is(err, gitlab.ErrNotFound) {
-				resp.Diagnostics.AddWarning("Branch no longer exists",
-					fmt.Sprintf("branch %q in project %q is gone (deleted out of band, project removed, or the token lost access); "+
-						"removing the resource from state so the next apply can recreate it", branch, project))
-				resp.State.RemoveResource(ctx)
+			if len(paths) == 0 {
+				resp.Diagnostics.AddError(apiErrorDiag("checking the branch", project, branch, err))
 				return
 			}
-			summary, detail := apiErrorDiag("checking branch after all managed files vanished", project, branch, err)
-			resp.Diagnostics.AddError(summary, detail)
+			summary, detail := apiErrorDiag("checking the branch after a managed file answered 404", project, branch, err)
+			resp.Diagnostics.AddError(summary, detail+gitaly404Note+" State was left unchanged.")
+			return
+		}
+		if !found && (len(paths) == 0 || allDropped(results)) {
+			resp.Diagnostics.AddWarning("Branch no longer exists",
+				fmt.Sprintf("branch %q in project %q is gone (deleted out of band, project removed, or the token lost access); "+
+					"removing the resource from state so the next apply can recreate it", branch, project))
+			resp.State.RemoveResource(ctx)
 			return
 		}
 	}
@@ -729,6 +743,11 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 		resp.Diagnostics.AddError("Error building actions", err.Error())
 		return
 	}
+	actions, _, diags := r.probeUnguarded(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString(), actions, probes, "before the update commit")
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	if len(actions) == 0 {
 		// Nothing to commit: keep computed fields from state, or from the
@@ -746,21 +765,9 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 		"actions":    len(actions),
 	})
 
-	release, err := r.locks.acquire(ctx, plan.ProjectID.ValueString(), plan.Branch.ValueString())
+	commit, err := r.commitLocked(ctx, plan, actions)
 	if err != nil {
-		resp.Diagnostics.AddError("Cancelled while waiting for the branch lock", err.Error())
-		return
-	}
-	defer release()
-	commit, _, err := r.client.Commits.CreateCommit(
-		plan.ProjectID.ValueString(),
-		commitOptions(plan, actions),
-		r.commitRequestOptions(ctx)...,
-	)
-	release()
-	if err != nil {
-		summary, detail := apiErrorDiag("pushing update commit", plan.ProjectID.ValueString(), plan.Branch.ValueString(), err)
-		resp.Diagnostics.AddError(summary, detail)
+		resp.Diagnostics.AddError(commitErrorDiag("pushing update commit", plan.ProjectID.ValueString(), plan.Branch.ValueString(), err))
 		return
 	}
 	// See Create: a JSON-null body decodes to a nil *Commit with no error.
@@ -789,9 +796,16 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
-// Delete pushes one commit that removes every managed file. Files already
-// missing on the remote are silently skipped so destroy is idempotent against
-// out-of-band cleanup. Disabled by setting delete_on_destroy = false.
+// Delete pushes one commit that removes every managed file; files already
+// gone are skipped, so destroy is idempotent against out-of-band cleanup.
+// A delete that carries a last_commit_id goes out without a probe: GitLab
+// checks that token itself and rejects the whole commit when the file was
+// changed, removed or replaced out of band, and a rejected commit lands
+// nothing. Only a rejection (HTTP 400, or 404 when the project itself is
+// gone) makes Delete probe the paths and retry once without the ones
+// already gone, so at most one commit lands. A delete without a token is
+// probed up front (see probeUnguarded). Disabled by setting
+// delete_on_destroy = false.
 func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state filesResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -799,7 +813,7 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 		return
 	}
 
-	if !state.deleteOnDestroy() {
+	if !state.deleteOnDestroy() || len(state.Files) == 0 {
 		return
 	}
 
@@ -807,27 +821,8 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 	branch := state.Branch.ValueString()
 	useLock := state.optimisticLock()
 
-	paths := sortedKeys(state.Files)
-	probes := r.probeRemote(ctx, project, branch, paths, false)
-
-	// A failed probe must fail the destroy: treating it as "absent" would skip
-	// the delete action and let the framework drop the resource from state
-	// while the file may still exist in the repository, silently orphaned.
-	for _, p := range paths {
-		if err := probes[p].err; err != nil {
-			summary, detail := apiErrorDiag(fmt.Sprintf("probing file %q before destroy", p), project, branch, err)
-			resp.Diagnostics.AddError(summary, detail)
-		}
-	}
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
 	actions := make([]*gitlab.CommitActionOptions, 0, len(state.Files))
-	for _, p := range paths {
-		if !probes[p].exists {
-			continue
-		}
+	for _, p := range sortedKeys(state.Files) {
 		a := &gitlab.CommitActionOptions{
 			Action:   new(gitlab.FileDelete),
 			FilePath: new(p),
@@ -840,22 +835,65 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 		actions = append(actions, a)
 	}
 
+	actions, branchFound, diags := r.probeUnguarded(ctx, project, branch, actions, nil, "before destroy")
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	if len(actions) == 0 {
+		resp.Diagnostics.AddWarning(nothingDeleted(project, branch, branchFound))
 		return
 	}
 
-	release, err := r.locks.acquire(ctx, project, branch)
-	if err != nil {
-		resp.Diagnostics.AddError("Cancelled while waiting for the branch lock", err.Error())
+	_, err := r.commitLocked(ctx, state, actions)
+	if err == nil {
 		return
 	}
-	defer release()
-	_, _, err = r.client.Commits.CreateCommit(project, commitOptions(state, actions), r.commitRequestOptions(ctx)...)
-	release()
-	if err != nil {
-		summary, detail := apiErrorDiag("pushing destroy commit", project, branch, err)
-		resp.Diagnostics.AddError(summary, detail)
+	// GitLab answers a 400 (a file changed, removed or replaced out of band,
+	// or the branch gone) and a 404 (the project gone, or invisible to the
+	// token) before it writes anything, so only those are worth a probe; a
+	// 5xx may have landed, and a 403 or a cancelled lock wait will not
+	// change on a retry.
+	if !hasStatus(err, http.StatusBadRequest) && !errors.Is(err, gitlab.ErrNotFound) {
+		resp.Diagnostics.AddError(commitErrorDiag("pushing destroy commit", project, branch, err))
+		return
 	}
+
+	paths := make([]string, 0, len(actions))
+	for _, a := range actions {
+		paths = append(paths, *a.FilePath)
+	}
+	absent, branchFound, diags := r.absentPaths(ctx, project, branch, paths, "after GitLab rejected the destroy commit")
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if len(absent) == 0 {
+		// Every file is still there, so the rejection was about something
+		// else (a concurrent edit, a push rule, another writer on the branch).
+		resp.Diagnostics.AddError(apiErrorDiag("pushing destroy commit", project, branch, err))
+		return
+	}
+	actions = withoutPaths(actions, absent)
+	if len(actions) == 0 {
+		resp.Diagnostics.AddWarning(nothingDeleted(project, branch, branchFound))
+		return
+	}
+	if _, err = r.commitLocked(ctx, state, actions); err != nil {
+		resp.Diagnostics.AddError(commitErrorDiag("pushing destroy commit without the files already gone", project, branch, err))
+	}
+}
+
+// nothingDeleted is the warning for a destroy that found every managed file
+// already gone and so made no commit.
+func nothingDeleted(project, branch string, branchFound bool) (string, string) {
+	if branchFound {
+		return "Nothing left to delete", fmt.Sprintf("none of the managed files exists on branch %q in project %q any more "+
+			"(removed out of band), so destroy made no commit", branch, project)
+	}
+	return "Nothing left to delete", fmt.Sprintf("no managed file is visible on branch %q in project %q, and neither is the branch "+
+		"(deleted out of band, project removed, or the token lost access; GitLab answers 404 for all three), so destroy made "+
+		"no commit. If the token lost access, the files may still exist in the repository.", branch, project)
 }
 
 // ImportState supports importing by "<project_id>::<branch>". After import the
@@ -1051,8 +1089,9 @@ func stringOrNull(s string) types.String {
 // state for the file. err is set for any failure other than a genuine 404 so
 // callers can tell "absent" from "unknown": the adopt paths deliberately fall
 // back to a plain update on it (a spurious create fails loudly at
-// CreateCommit anyway), but Delete must not - skipping a file because a probe
-// errored would let destroy report success while the file still exists.
+// CreateCommit anyway), but absentPaths must not - skipping a delete because
+// a probe errored would let destroy report success while the file still
+// exists.
 type remoteProbe struct {
 	err             error
 	lastCommitID    string
@@ -1160,8 +1199,8 @@ func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) (
 // probeRemote fans probeFile out across paths at refreshParallelism. The
 // goroutines always return nil so Wait never fails; each path's outcome -
 // including non-404 probe errors - travels in its remoteProbe's err field
-// for the caller to interpret (Delete aborts on it, the adopt paths fall
-// back to an update on purpose).
+// for the caller to interpret (absentPaths fails on it, the adopt paths
+// fall back to an update on purpose).
 func (r *filesResource) probeRemote(ctx context.Context, project, ref string, paths []string, withContent bool) map[string]remoteProbe {
 	out := make(map[string]remoteProbe, len(paths))
 	if len(paths) == 0 {
@@ -1181,6 +1220,131 @@ func (r *filesResource) probeRemote(ctx context.Context, project, ref string, pa
 		out[p] = probes[i]
 	}
 	return out
+}
+
+// probeUnguarded probes the delete and chmod actions that go out without a
+// last_commit_id (optimistic_lock off, or no token in state), leaving out
+// the paths fresh already resolved to a file. Without the token GitLab has
+// no guard of its own: it applies the action to whatever tree entry sits at
+// the path, so a delete removes a directory that replaced the file and a
+// chmod gives a directory a file mode. A delete whose path no longer holds a
+// file is dropped; a chmod on one fails. With the lock on and every token
+// present nothing is probed. branchFound is as absentPaths reports it.
+func (r *filesResource) probeUnguarded(
+	ctx context.Context,
+	project, branch string,
+	actions []*gitlab.CommitActionOptions,
+	fresh map[string]remoteProbe,
+	stage string,
+) ([]*gitlab.CommitActionOptions, bool, diag.Diagnostics) {
+	var paths []string
+	for _, a := range actions {
+		if a.LastCommitID != nil || fresh[*a.FilePath].exists {
+			continue
+		}
+		if *a.Action == gitlab.FileDelete || *a.Action == gitlab.FileChmod {
+			paths = append(paths, *a.FilePath)
+		}
+	}
+	if len(paths) == 0 {
+		return actions, true, nil
+	}
+	absent, branchFound, diags := r.absentPaths(ctx, project, branch, paths, stage)
+	if diags.HasError() {
+		return nil, branchFound, diags
+	}
+	for _, a := range actions {
+		if absent[*a.FilePath] && *a.Action == gitlab.FileChmod {
+			diags.AddAttributeError(path.Root("files").AtMapKey(*a.FilePath), "File no longer exists",
+				fmt.Sprintf("cannot change execute_filemode of %q: the path no longer holds a file on branch %q "+
+					"(deleted, or replaced by a directory, out of band). Refresh the state with detect_drift enabled "+
+					"and review the plan.", *a.FilePath, branch))
+		}
+	}
+	if diags.HasError() {
+		return nil, branchFound, diags
+	}
+	return withoutPaths(actions, absent), branchFound, diags
+}
+
+// gitaly404Note explains a failed branch lookup after a Files API 404.
+const gitaly404Note = " GitLab answers the Files API with 404 when Gitaly times out resolving the ref " +
+	"(and, up to at least 19.4, when Gitaly is unavailable), exactly as for a missing file, " +
+	"so a 404 is trusted only once the branch lookup succeeds."
+
+// absentPaths probes paths at branch and returns the ones that are gone.
+// A 404 is trusted only once a branch lookup has answered too: GitLab
+// answers the Files API with 404 when Gitaly fails to resolve the ref (a
+// timeout in every release, an outage too up to at least 19.4), while the
+// branches API reports the same failure as an error. Any other probe
+// failure is an error as well, since skipping a path whose state is unknown
+// would orphan the file. branchFound is false only when a path was gone and
+// the branch was not found either.
+func (r *filesResource) absentPaths(ctx context.Context, project, branch string, paths []string, stage string) (map[string]bool, bool, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	probes := r.probeRemote(ctx, project, branch, paths, false)
+	absent := map[string]bool{}
+	for _, p := range paths {
+		switch probe := probes[p]; {
+		case probe.err != nil:
+			summary, detail := apiErrorDiag(fmt.Sprintf("probing file %q %s", p, stage), project, branch, probe.err)
+			diags.AddError(summary, detail)
+		case !probe.exists:
+			absent[p] = true
+		}
+	}
+	if diags.HasError() || len(absent) == 0 {
+		return nil, true, diags
+	}
+	found, err := r.branchExists(ctx, project, branch)
+	if err != nil {
+		summary, detail := apiErrorDiag("checking the branch after a managed file answered 404", project, branch, err)
+		diags.AddError(summary, detail+gitaly404Note+" Nothing was committed.")
+		return nil, false, diags
+	}
+	return absent, found, diags
+}
+
+// withoutPaths returns the actions whose path is not in drop.
+func withoutPaths(actions []*gitlab.CommitActionOptions, drop map[string]bool) []*gitlab.CommitActionOptions {
+	kept := make([]*gitlab.CommitActionOptions, 0, len(actions))
+	for _, a := range actions {
+		if !drop[*a.FilePath] {
+			kept = append(kept, a)
+		}
+	}
+	return kept
+}
+
+// errLockWait marks a commit that was never sent: ctx ended while it waited
+// for the branch lock.
+var errLockWait = errors.New("cancelled while waiting for the branch lock")
+
+// commitLocked lands actions as one commit while holding the branch lock, so
+// resource instances sharing a branch never race on its tip, and releases
+// the lock before it returns: whatever follows only reads.
+func (r *filesResource) commitLocked(ctx context.Context, m filesResourceModel, actions []*gitlab.CommitActionOptions) (*gitlab.Commit, error) {
+	release, err := r.locks.acquire(ctx, m.ProjectID.ValueString(), m.Branch.ValueString())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errLockWait, err)
+	}
+	defer release()
+	commit, _, err := r.client.Commits.CreateCommit(m.ProjectID.ValueString(), commitOptions(m, actions), r.commitRequestOptions(ctx)...)
+	return commit, err
+}
+
+// commitErrorDiag is apiErrorDiag for an error from commitLocked.
+func commitErrorDiag(action, project, branch string, err error) (string, string) {
+	if errors.Is(err, errLockWait) {
+		return "Cancelled while waiting for the branch lock", err.Error()
+	}
+	return apiErrorDiag(action, project, branch, err)
+}
+
+// hasStatus reports whether err is a GitLab answer with the given HTTP status.
+func hasStatus(err error, status int) bool {
+	resp, ok := errors.AsType[*gitlab.ErrorResponse](err)
+	return ok && resp.Response != nil && resp.Response.StatusCode == status
 }
 
 // branchExists reports whether branch is present, distinguishing a genuine

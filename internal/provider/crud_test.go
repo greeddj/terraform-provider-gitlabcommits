@@ -6,6 +6,7 @@ package provider
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,6 +56,15 @@ func runDelete(t *testing.T, client *gitlab.Client, state filesResourceModel) *r
 
 func runDeleteOn(t *testing.T, res *filesResource, state filesResourceModel) *resource.DeleteResponse {
 	t.Helper()
+	req, resp := deleteRequest(t, res, state)
+	res.Delete(t.Context(), req, resp)
+	return resp
+}
+
+// deleteRequest is the Delete counterpart of updateRequest: the response
+// starts as the prior state, as fwserver hands it to Delete.
+func deleteRequest(t *testing.T, res *filesResource, state filesResourceModel) (resource.DeleteRequest, *resource.DeleteResponse) {
+	t.Helper()
 	ctx := t.Context()
 
 	sresp := &resource.SchemaResponse{}
@@ -64,10 +75,174 @@ func runDeleteOn(t *testing.T, res *filesResource, state filesResourceModel) *re
 	if d := st.Set(ctx, &state); d.HasError() {
 		t.Fatalf("state.Set: %v", d)
 	}
-	resp := &resource.DeleteResponse{State: st}
-	res.Delete(ctx, resource.DeleteRequest{State: st}, resp)
-	return resp
+	return resource.DeleteRequest{State: st}, &resource.DeleteResponse{State: tfsdk.State{Schema: sch, Raw: st.Raw.Copy()}}
 }
+
+// repoFake is a small stateful GitLab: files maps every path on the branch
+// to its last commit id. Like GitLab it answers a metadata probe from that
+// map and rejects with HTTP 400, landing nothing, a commit that creates an
+// existing path, or updates, deletes or chmods a missing one or with a stale
+// last_commit_id; an accepted commit is applied to the map. branchStatus,
+// commitStatus and probeStatus (per path) override the answers for GET
+// /branches/, a commit and a probe. Every file holds the content "x", which
+// a content fetch returns. Commits and probes (metadata requests) are
+// recorded, accepted or not.
+type repoFake struct {
+	files        map[string]string
+	probeStatus  map[string]int
+	commits      [][]string
+	probes       []string
+	mu           sync.Mutex
+	branchStatus int
+	commitStatus int
+}
+
+func (f *repoFake) client(t *testing.T) *gitlab.Client {
+	t.Helper()
+	return newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		switch {
+		case r.Method == http.MethodHead:
+			p := strings.TrimPrefix(r.URL.Path, "/api/v4/projects/proj/repository/files/")
+			f.probes = append(f.probes, p+"@"+r.URL.Query().Get("ref"))
+			if status := f.probeStatus[p]; status != 0 {
+				http.Error(w, "probe", status)
+				return
+			}
+			lcid, ok := f.files[p]
+			if !ok {
+				http.Error(w, "404 File Not Found", http.StatusNotFound)
+				return
+			}
+			metaHeaders(w, "blob-"+lcid, lcid, false)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
+			p := strings.TrimPrefix(r.URL.Path, "/api/v4/projects/proj/repository/files/")
+			lcid, ok := f.files[p]
+			if !ok {
+				http.Error(w, "404 File Not Found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(fileJSON(p, "blob-"+lcid, lcid, []byte("x")))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			if f.branchStatus != 0 {
+				http.Error(w, "branch lookup", f.branchStatus)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"head"}}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/commits"):
+			var opts gitlab.CreateCommitOptions
+			if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
+				t.Errorf("decoding the commit body: %v", err)
+				http.Error(w, "bad body", http.StatusInternalServerError)
+				return
+			}
+			f.commits = append(f.commits, describeActions(opts.Actions))
+			if f.commitStatus != 0 {
+				http.Error(w, "commit", f.commitStatus)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if msg := f.rejection(opts.Actions); msg != "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"message": msg})
+				return
+			}
+			sha := fmt.Sprintf("sha%d", len(f.commits))
+			for _, a := range opts.Actions {
+				if *a.Action == gitlab.FileDelete {
+					delete(f.files, *a.FilePath)
+				} else {
+					f.files[*a.FilePath] = sha
+				}
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = fmt.Fprintf(w, `{"id":%q}`, sha)
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	})
+}
+
+// rejection is GitLab's message for a commit it refuses, or "".
+func (f *repoFake) rejection(actions []*gitlab.CommitActionOptions) string {
+	if f.branchStatus == http.StatusNotFound {
+		return "You can only create or edit files when you are on a branch"
+	}
+	for _, a := range actions {
+		lcid, ok := f.files[*a.FilePath]
+		switch {
+		case *a.Action == gitlab.FileCreate:
+			if ok {
+				return "A file with this name already exists"
+			}
+		case a.LastCommitID != nil && (!ok || *a.LastCommitID != lcid):
+			return "The file has changed since you started editing it: " + *a.FilePath
+		case !ok:
+			return "A file with this name doesn't exist"
+		}
+	}
+	return ""
+}
+
+// recorded returns the commits and the probes (sorted, since they fan out)
+// sent so far, and the files left on the branch.
+func (f *repoFake) recorded() (commits [][]string, probes []string, files map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	probes = slices.Clone(f.probes)
+	slices.Sort(probes)
+	return slices.Clone(f.commits), probes, maps.Clone(f.files)
+}
+
+// describeActions renders actions as "<action>:<path>", plus "@<token>" when
+// a last_commit_id was sent, so a test can pin a commit body exactly.
+func describeActions(actions []*gitlab.CommitActionOptions) []string {
+	out := make([]string, 0, len(actions))
+	for _, a := range actions {
+		s := fmt.Sprintf("%s:%s", *a.Action, *a.FilePath)
+		if a.LastCommitID != nil {
+			s += "@" + *a.LastCommitID
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// managedFiles returns a state managing paths, each with the stored
+// last_commit_id given ("" stores none) and optimistic_lock set to lock.
+func managedFiles(lock bool, tokens map[string]string) filesResourceModel {
+	s := readState("blob")
+	s.OptimisticLock = types.BoolValue(lock)
+	s.Files = make(map[string]fileModel, len(tokens))
+	for p, lcid := range tokens {
+		s.Files[p] = fileModel{
+			Content: types.StringValue("x"), ContentBase64: types.StringNull(),
+			BlobID: types.StringValue("blob"), LastCommitID: stringOrNull(lcid), ExecuteFilemode: types.BoolValue(false),
+		}
+	}
+	return s
+}
+
+// inFlight records how many requests overlap at most.
+type inFlight struct {
+	cur, peak atomic.Int32
+}
+
+func (f *inFlight) enter() {
+	n := f.cur.Add(1)
+	for {
+		m := f.peak.Load()
+		if n <= m || f.peak.CompareAndSwap(m, n) {
+			return
+		}
+	}
+}
+
+func (f *inFlight) leave() { f.cur.Add(-1) }
 
 func runUpdate(t *testing.T, client *gitlab.Client, plan, state filesResourceModel) *resource.UpdateResponse {
 	t.Helper()
@@ -327,58 +502,409 @@ func TestDelete_DeleteOnDestroyFalseSkipsAPI(t *testing.T) {
 	}
 }
 
-// TestDelete_SkipsAbsentFiles: a file already gone at the remote is skipped, so
-// no commit is produced (destroy is idempotent against out-of-band cleanup).
-func TestDelete_SkipsAbsentFiles(t *testing.T) {
-	postCalled := false
-	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			postCalled = true
-		}
-		if r.Method == http.MethodHead {
-			http.Error(w, "gone", http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	})
-
-	resp := runDelete(t, client, readState("blob"))
-	if resp.Diagnostics.HasError() {
-		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+// TestDelete_Outcomes pins how destroy reaches its one commit. A delete that
+// carries a last_commit_id goes out unprobed, since GitLab checks the token
+// itself; only a rejection (a 400, or the 404 of a project that is gone)
+// makes Delete probe and retry once without the files already gone, and any
+// other failure is reported as it is. A delete without a token is probed
+// first, because GitLab would remove whatever sits at the path. A 404 counts
+// only once the branch lookup succeeds, and a destroy that finds nothing to
+// delete warns.
+func TestDelete_Outcomes(t *testing.T) {
+	cases := []struct {
+		repo         map[string]string // path -> last commit id on the branch
+		tokens       map[string]string // managed path -> stored last_commit_id
+		probeStatus  map[string]int
+		wantRepo     map[string]string
+		name         string
+		wantError    string
+		wantWarning  string
+		wantCommits  [][]string
+		wantProbes   []string
+		branchStatus int
+		commitStatus int
+		lock         bool
+	}{
+		{
+			name: "nothing managed makes no request",
+			lock: true,
+		},
+		{
+			name:        "locked deletes commit without probing",
+			lock:        true,
+			repo:        map[string]string{"a.txt": "la", "b.txt": "lb"},
+			tokens:      map[string]string{"a.txt": "la", "b.txt": "lb"},
+			wantCommits: [][]string{{"delete:a.txt@la", "delete:b.txt@lb"}},
+		},
+		{
+			name:        "rejected commit is retried without the file already gone",
+			lock:        true,
+			repo:        map[string]string{"keep.txt": "lk"},
+			tokens:      map[string]string{"gone.txt": "lg", "keep.txt": "lk"},
+			wantCommits: [][]string{{"delete:gone.txt@lg", "delete:keep.txt@lk"}, {"delete:keep.txt@lk"}},
+			wantProbes:  []string{"gone.txt@main", "keep.txt@main"},
+		},
+		{
+			name:        "rejection with every file present is reported as it is",
+			lock:        true,
+			repo:        map[string]string{"keep.txt": "external"},
+			tokens:      map[string]string{"keep.txt": "lk"},
+			wantCommits: [][]string{{"delete:keep.txt@lk"}},
+			wantProbes:  []string{"keep.txt@main"},
+			wantError:   "Concurrent modification detected",
+			wantRepo:    map[string]string{"keep.txt": "external"},
+		},
+		{
+			name:        "second rejection fails with its own diagnostic",
+			lock:        true,
+			repo:        map[string]string{"keep.txt": "external"},
+			tokens:      map[string]string{"gone.txt": "lg", "keep.txt": "lk"},
+			wantCommits: [][]string{{"delete:gone.txt@lg", "delete:keep.txt@lk"}, {"delete:keep.txt@lk"}},
+			wantProbes:  []string{"gone.txt@main", "keep.txt@main"},
+			wantError:   "editing it: keep.txt",
+			wantRepo:    map[string]string{"keep.txt": "external"},
+		},
+		{
+			name:        "everything already gone warns without a second commit",
+			lock:        true,
+			tokens:      map[string]string{"a.txt": "la", "b.txt": "lb"},
+			wantCommits: [][]string{{"delete:a.txt@la", "delete:b.txt@lb"}},
+			wantProbes:  []string{"a.txt@main", "b.txt@main"},
+			wantWarning: "removed out of band",
+		},
+		{
+			name:         "a vanished branch warns that the files may remain",
+			lock:         true,
+			tokens:       map[string]string{"a.txt": "la"},
+			branchStatus: http.StatusNotFound,
+			wantCommits:  [][]string{{"delete:a.txt@la"}},
+			wantProbes:   []string{"a.txt@main"},
+			wantWarning:  "may still exist",
+		},
+		{
+			name:         "a 404 is not trusted when the branch lookup fails",
+			lock:         true,
+			repo:         map[string]string{"keep.txt": "lk"},
+			tokens:       map[string]string{"gone.txt": "lg", "keep.txt": "lk"},
+			branchStatus: http.StatusInternalServerError,
+			wantCommits:  [][]string{{"delete:gone.txt@lg", "delete:keep.txt@lk"}},
+			wantProbes:   []string{"gone.txt@main", "keep.txt@main"},
+			wantError:    "Gitaly times out",
+			wantRepo:     map[string]string{"keep.txt": "lk"},
+		},
+		{
+			name:        "a failing probe after a rejection fails the destroy",
+			lock:        true,
+			repo:        map[string]string{"keep.txt": "lk"},
+			tokens:      map[string]string{"gone.txt": "lg", "keep.txt": "lk"},
+			probeStatus: map[string]int{"keep.txt": http.StatusForbidden},
+			wantCommits: [][]string{{"delete:gone.txt@lg", "delete:keep.txt@lk"}},
+			wantProbes:  []string{"gone.txt@main", "keep.txt@main"},
+			wantError:   "HTTP 403",
+			wantRepo:    map[string]string{"keep.txt": "lk"},
+		},
+		{
+			name:         "a refused commit is reported without probing",
+			lock:         true,
+			repo:         map[string]string{"a.txt": "la"},
+			tokens:       map[string]string{"a.txt": "la"},
+			commitStatus: http.StatusForbidden,
+			wantCommits:  [][]string{{"delete:a.txt@la"}},
+			wantError:    "HTTP 403",
+			wantRepo:     map[string]string{"a.txt": "la"},
+		},
+		{
+			name:         "a project that is gone warns that the files may remain",
+			lock:         true,
+			tokens:       map[string]string{"a.txt": "la"},
+			branchStatus: http.StatusNotFound,
+			commitStatus: http.StatusNotFound,
+			wantCommits:  [][]string{{"delete:a.txt@la"}},
+			wantProbes:   []string{"a.txt@main"},
+			wantWarning:  "may still exist",
+		},
+		{
+			name:         "a 404 with every file present is reported as it is",
+			lock:         true,
+			repo:         map[string]string{"a.txt": "la"},
+			tokens:       map[string]string{"a.txt": "la"},
+			commitStatus: http.StatusNotFound,
+			wantCommits:  [][]string{{"delete:a.txt@la"}},
+			wantProbes:   []string{"a.txt@main"},
+			wantError:    "HTTP 404",
+			wantRepo:     map[string]string{"a.txt": "la"},
+		},
+		{
+			name:        "without the lock every path is probed and no token is sent",
+			repo:        map[string]string{"keep.txt": "lk"},
+			tokens:      map[string]string{"gone.txt": "lg", "keep.txt": "lk"},
+			wantCommits: [][]string{{"delete:keep.txt"}},
+			wantProbes:  []string{"gone.txt@main", "keep.txt@main"},
+		},
+		{
+			name:        "a path with no stored token is probed under the lock",
+			lock:        true,
+			repo:        map[string]string{"bare.txt": "lb", "keep.txt": "lk"},
+			tokens:      map[string]string{"bare.txt": "", "gone.txt": "", "keep.txt": "lk"},
+			wantCommits: [][]string{{"delete:bare.txt", "delete:keep.txt@lk"}},
+			wantProbes:  []string{"bare.txt@main", "gone.txt@main"},
+		},
+		{
+			name:        "without the lock nothing present warns and commits nothing",
+			tokens:      map[string]string{"a.txt": "la"},
+			wantProbes:  []string{"a.txt@main"},
+			wantWarning: "removed out of band",
+		},
+		{
+			name:         "without the lock a hidden branch warns that the files may remain",
+			tokens:       map[string]string{"a.txt": "la"},
+			branchStatus: http.StatusNotFound,
+			wantProbes:   []string{"a.txt@main"},
+			wantWarning:  "may still exist",
+		},
+		{
+			name:         "without the lock a 404 is not trusted when the branch lookup fails",
+			repo:         map[string]string{"keep.txt": "lk"},
+			tokens:       map[string]string{"gone.txt": "lg", "keep.txt": "lk"},
+			branchStatus: http.StatusInternalServerError,
+			wantProbes:   []string{"gone.txt@main", "keep.txt@main"},
+			wantError:    "Gitaly times out",
+			wantRepo:     map[string]string{"keep.txt": "lk"},
+		},
+		{
+			name:        "without the lock a failing probe fails the destroy",
+			repo:        map[string]string{"keep.txt": "lk"},
+			tokens:      map[string]string{"gone.txt": "lg", "keep.txt": "lk"},
+			probeStatus: map[string]int{"keep.txt": http.StatusForbidden},
+			wantProbes:  []string{"gone.txt@main", "keep.txt@main"},
+			wantError:   "HTTP 403",
+			wantRepo:    map[string]string{"keep.txt": "lk"},
+		},
 	}
-	if postCalled {
-		t.Error("expected no commit when every managed file is already absent")
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &repoFake{files: maps.Clone(c.repo), probeStatus: c.probeStatus, branchStatus: c.branchStatus, commitStatus: c.commitStatus}
+			if fake.files == nil {
+				fake.files = map[string]string{}
+			}
+			resp := runDelete(t, fake.client(t), managedFiles(c.lock, c.tokens))
+
+			commits, probes, repo := fake.recorded()
+			if !slices.EqualFunc(commits, c.wantCommits, slices.Equal[[]string]) {
+				t.Errorf("commits = %q, want %q", commits, c.wantCommits)
+			}
+			if !slices.Equal(probes, c.wantProbes) {
+				t.Errorf("probes = %q, want %q", probes, c.wantProbes)
+			}
+			if !maps.Equal(repo, c.wantRepo) {
+				t.Errorf("files left on the branch = %v, want %v", repo, c.wantRepo)
+			}
+			wantDiag(t, "error", resp.Diagnostics.Errors(), c.wantError)
+			wantDiag(t, "warning", resp.Diagnostics.Warnings(), c.wantWarning)
+		})
 	}
 }
 
-// TestDelete_CommitsWhenPresent: present files produce exactly one delete commit.
-func TestDelete_CommitsWhenPresent(t *testing.T) {
-	postCalled := false
-	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodHead:
-			w.Header().Set("X-Gitlab-Blob-Id", "blob")
-			w.Header().Set("X-Gitlab-File-Path", "f.txt")
-			w.Header().Set("X-Gitlab-Ref", "main")
-			w.Header().Set("X-Gitlab-Size", "3")
-			w.WriteHeader(http.StatusOK)
-		case http.MethodPost:
-			postCalled = true
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusCreated)
-			_, _ = w.Write([]byte(`{"id":"delsha"}`))
-		default:
-			w.WriteHeader(http.StatusOK)
-		}
-	})
+// wantDiag asserts diags holds exactly one entry mentioning want in its
+// summary or detail, or none at all when want is empty.
+func wantDiag(t *testing.T, kind string, diags diag.Diagnostics, want string) {
+	t.Helper()
+	switch {
+	case want == "" && len(diags) > 0:
+		t.Errorf("unexpected %s: %v", kind, diags)
+	case want != "" && (len(diags) != 1 || !strings.Contains(diags[0].Summary()+" "+diags[0].Detail(), want)):
+		t.Errorf("%s diagnostics = %v, want exactly one mentioning %q", kind, diags, want)
+	}
+}
 
-	resp := runDelete(t, client, readState("blob"))
-	if resp.Diagnostics.HasError() {
-		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+// TestDelete_ConcurrentSameBranchCommitsAreSerialised: destroying a for_each
+// set that shares one branch runs every Delete at once, and their commits
+// must never be in flight together.
+func TestDelete_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
+	var posts atomic.Int32
+	var overlap inFlight
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected call %s %s: a locked delete needs no probe", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+			return
+		}
+		posts.Add(1)
+		overlap.enter()
+		// Long enough that unserialised goroutines provably overlap.
+		time.Sleep(20 * time.Millisecond)
+		overlap.leave()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"delsha"}`))
+	})
+	locks := newBranchLocks()
+
+	var wg sync.WaitGroup
+	for range 4 {
+		res := &filesResource{client: client, locks: locks}
+		req, resp := deleteRequest(t, res, readState("blob"))
+		wg.Go(func() {
+			res.Delete(t.Context(), req, resp)
+			if resp.Diagnostics.HasError() {
+				t.Errorf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+		})
 	}
-	if !postCalled {
-		t.Error("expected a delete commit when files are present")
+	wg.Wait()
+	if got := overlap.peak.Load(); got != 1 {
+		t.Fatalf("destroy commits to one branch overlapped: max in flight = %d, want 1", got)
 	}
+	if got := posts.Load(); got != 4 {
+		t.Errorf("commits = %d, want one per instance", got)
+	}
+}
+
+// TestUpdate_UnguardedDeleteAndChmodAreProbed: a delete or chmod without a
+// last_commit_id has no guard at GitLab, so its path is probed first; a
+// delete of a path that no longer holds a file is dropped and a chmod of one
+// fails. With the lock on and every token present nothing is probed before
+// the commit, and a path the adopt probe has just found is not probed again.
+// Every plan drops rm.txt and sets run.sh's exec bit to chmod; adopt adds
+// new.sh, executable, with the content the branch already holds.
+func TestUpdate_UnguardedDeleteAndChmodAreProbed(t *testing.T) {
+	cases := []struct {
+		repo               map[string]string
+		tokens             map[string]string
+		name               string
+		wantError          string
+		wantCommits        [][]string
+		wantProbes         []string
+		branchStatus       int
+		lock, chmod, adopt bool
+	}{
+		{
+			name:        "locked actions are not probed",
+			lock:        true,
+			chmod:       true,
+			repo:        map[string]string{"rm.txt": "lr", "run.sh": "ls"},
+			wantCommits: [][]string{{"delete:rm.txt@lr", "chmod:run.sh@ls"}},
+			wantProbes:  []string{"run.sh@sha1"},
+		},
+		{
+			name:        "without the lock both paths are probed first",
+			chmod:       true,
+			repo:        map[string]string{"rm.txt": "lr", "run.sh": "ls"},
+			wantCommits: [][]string{{"delete:rm.txt", "chmod:run.sh"}},
+			wantProbes:  []string{"rm.txt@main", "run.sh@main", "run.sh@sha1"},
+		},
+		{
+			name:        "a delete of a path already gone is dropped",
+			chmod:       true,
+			repo:        map[string]string{"run.sh": "ls"},
+			wantCommits: [][]string{{"chmod:run.sh"}},
+			wantProbes:  []string{"rm.txt@main", "run.sh@main", "run.sh@sha1"},
+		},
+		{
+			name:       "dropping the only action makes no commit",
+			repo:       map[string]string{"run.sh": "ls"},
+			wantProbes: []string{"rm.txt@main"},
+		},
+		{
+			name:       "a chmod of a path that no longer holds a file fails",
+			chmod:      true,
+			repo:       map[string]string{"rm.txt": "lr"},
+			wantProbes: []string{"rm.txt@main", "run.sh@main"},
+			wantError:  `"run.sh"`,
+		},
+		{
+			name:        "a missing token is probed under the lock",
+			lock:        true,
+			chmod:       true,
+			repo:        map[string]string{"run.sh": "ls"},
+			tokens:      map[string]string{"rm.txt": "", "run.sh": "ls"},
+			wantCommits: [][]string{{"chmod:run.sh@ls"}},
+			wantProbes:  []string{"rm.txt@main", "run.sh@sha1"},
+		},
+		{
+			name:         "a 404 is not trusted when the branch lookup fails",
+			chmod:        true,
+			repo:         map[string]string{"run.sh": "ls"},
+			branchStatus: http.StatusInternalServerError,
+			wantProbes:   []string{"rm.txt@main", "run.sh@main"},
+			wantError:    "Gitaly times out",
+		},
+		{
+			name:        "an adopted chmod is not probed again",
+			adopt:       true,
+			repo:        map[string]string{"new.sh": "ln", "rm.txt": "lr", "run.sh": "ls"},
+			wantCommits: [][]string{{"delete:rm.txt", "chmod:new.sh"}},
+			wantProbes:  []string{"new.sh@main", "new.sh@sha1", "rm.txt@main"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &repoFake{files: maps.Clone(c.repo), branchStatus: c.branchStatus}
+			tokens := c.tokens
+			if tokens == nil {
+				tokens = map[string]string{"rm.txt": "lr", "run.sh": "ls"}
+			}
+			state := managedFiles(c.lock, tokens)
+			plan := managedFiles(c.lock, tokens)
+			delete(plan.Files, "rm.txt")
+			run := plan.Files["run.sh"]
+			run.ExecuteFilemode = types.BoolValue(c.chmod)
+			plan.Files["run.sh"] = run
+			if c.adopt {
+				run.ExecuteFilemode = types.BoolValue(true)
+				plan.Files["new.sh"] = run
+			}
+
+			resp := runUpdate(t, fake.client(t), plan, state)
+
+			commits, probes, _ := fake.recorded()
+			if !slices.EqualFunc(commits, c.wantCommits, slices.Equal[[]string]) {
+				t.Errorf("commits = %q, want %q", commits, c.wantCommits)
+			}
+			if !slices.Equal(probes, c.wantProbes) {
+				t.Errorf("probes = %q, want %q", probes, c.wantProbes)
+			}
+			wantDiag(t, "error", resp.Diagnostics.Errors(), c.wantError)
+			if c.wantError != "" || len(c.wantCommits) > 0 {
+				return
+			}
+			var out filesResourceModel
+			if d := resp.State.Get(t.Context(), &out); d.HasError() {
+				t.Fatalf("state.Get: %v", d)
+			}
+			if _, kept := out.Files["rm.txt"]; kept || out.CommitSHA.ValueString() != "sha" {
+				t.Errorf("a dropped delete must leave rm.txt out of state and commit_sha as it was, got files=%v sha=%q",
+					slices.Sorted(maps.Keys(out.Files)), out.CommitSHA.ValueString())
+			}
+		})
+	}
+}
+
+// TestCommitLocked_CancelledWaitSendsNothing: a commit still waiting for the
+// branch lock when ctx ends is never sent, and says so.
+func TestCommitLocked_CancelledWaitSendsNothing(t *testing.T) {
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected call %s %s while the branch lock is held", r.Method, r.URL.Path)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	})
+	res := newTestResource(client)
+	release, err := res.locks.acquire(t.Context(), "proj", "main")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer release()
+
+	plan, state := changedPlan()
+	req, resp := updateRequest(t, res, plan, state)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	res.Update(ctx, req, resp)
+	if !resp.Diagnostics.HasError() || resp.Diagnostics.Errors()[0].Summary() != "Cancelled while waiting for the branch lock" {
+		t.Fatalf("expected the lock-wait diagnostic, got %v", resp.Diagnostics)
+	}
+	checkUpdateResult(t, req, resp)
 }
 
 // TestUpdate_NoOpProducesNoCommit: when plan equals state, Update must make no
@@ -397,70 +923,6 @@ func TestUpdate_NoOpProducesNoCommit(t *testing.T) {
 	}
 	if called {
 		t.Error("expected no API calls for a no-op update")
-	}
-}
-
-// TestDelete_ProbeErrorFailsLoudly: a non-404 probe failure (revoked token,
-// 5xx, timeout) must fail the destroy instead of skipping the file - an
-// error-free Delete makes the framework drop the resource from state while
-// the files may still exist in the repository.
-func TestDelete_ProbeErrorFailsLoudly(t *testing.T) {
-	postCalled := false
-	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			postCalled = true
-		}
-		if r.Method == http.MethodHead {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	})
-
-	resp := runDelete(t, client, readState("blob"))
-	if !resp.Diagnostics.HasError() {
-		t.Fatal("expected destroy to fail when the existence probe errors")
-	}
-	if postCalled {
-		t.Error("expected no commit attempt after a failed probe")
-	}
-}
-
-// TestDelete_PartialProbeErrorFailsLoudly: one 404 (legitimately absent) plus
-// one failing probe must still abort the destroy - a partial failure would
-// otherwise silently omit the failing path from the destroy commit.
-func TestDelete_PartialProbeErrorFailsLoudly(t *testing.T) {
-	postCalled := false
-	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			postCalled = true
-		}
-		if r.Method == http.MethodHead {
-			if strings.Contains(r.URL.Path, "gone.txt") {
-				http.Error(w, "absent", http.StatusNotFound)
-			} else {
-				http.Error(w, "forbidden", http.StatusForbidden)
-			}
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	})
-
-	state := readState("blob")
-	state.Files["gone.txt"] = fileModel{
-		Content:         types.StringValue("x"),
-		ContentBase64:   types.StringNull(),
-		BlobID:          types.StringValue("blob2"),
-		LastCommitID:    types.StringValue("lcid2"),
-		ExecuteFilemode: types.BoolValue(false),
-	}
-
-	resp := runDelete(t, client, state)
-	if !resp.Diagnostics.HasError() {
-		t.Fatal("expected destroy to fail when any existence probe errors")
-	}
-	if postCalled {
-		t.Error("expected no commit attempt after a failed probe")
 	}
 }
 
@@ -1069,20 +1531,14 @@ func TestBranchLocks_SerialisesPerBranch(t *testing.T) {
 // never have two commit POSTs in flight at once - that is the ref race GitLab
 // rejects with HTTP 400 "reference does not point to expected object".
 func TestUpdate_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
-	var inFlight, maxInFlight atomic.Int32
+	var overlap inFlight
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
-			n := inFlight.Add(1)
-			for {
-				m := maxInFlight.Load()
-				if n <= m || maxInFlight.CompareAndSwap(m, n) {
-					break
-				}
-			}
+			overlap.enter()
 			// Long enough that unserialised goroutines provably overlap.
 			time.Sleep(20 * time.Millisecond)
-			inFlight.Add(-1)
+			overlap.leave()
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"id":"sha"}`))
@@ -1110,7 +1566,7 @@ func TestUpdate_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if got := maxInFlight.Load(); got != 1 {
+	if got := overlap.peak.Load(); got != 1 {
 		t.Fatalf("commits to one branch overlapped: max in flight = %d, want 1", got)
 	}
 }
@@ -1180,6 +1636,114 @@ func TestCreate_ConcurrentBranchMaterialisationIsSerialised(t *testing.T) {
 	}
 	if got := commits.Load(); got != 4 {
 		t.Errorf("commits = %d, want one per instance", got)
+	}
+}
+
+// TestCreate_ConcurrentOnExistingBranchCommitsAreSerialised: the first apply
+// of a for_each set onto an existing branch runs every Create at once, and
+// their commits must never be in flight together.
+func TestCreate_ConcurrentOnExistingBranchCommitsAreSerialised(t *testing.T) {
+	var posts atomic.Int32
+	var overlap inFlight
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "sha":
+			stampHeaders(w, "sha")
+		case r.Method == http.MethodHead:
+			http.Error(w, "absent", http.StatusNotFound)
+		case r.Method == http.MethodPost:
+			posts.Add(1)
+			overlap.enter()
+			time.Sleep(20 * time.Millisecond)
+			overlap.leave()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"sha"}`))
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	})
+	locks := newBranchLocks()
+
+	var wg sync.WaitGroup
+	for range 4 {
+		res := &filesResource{client: client, locks: locks}
+		req, resp := createRequest(t, res, readState("ignored"))
+		wg.Go(func() {
+			res.Create(t.Context(), req, resp)
+			if resp.Diagnostics.HasError() {
+				t.Errorf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+			checkCreateResult(t, resp)
+		})
+	}
+	wg.Wait()
+	if got := overlap.peak.Load(); got != 1 {
+		t.Fatalf("commits to one branch overlapped: max in flight = %d, want 1", got)
+	}
+	if got := posts.Load(); got != 4 {
+		t.Errorf("commits = %d, want one per instance", got)
+	}
+}
+
+// TestCreate_ErrorInsideLockReleasesIt: Create returns from inside its
+// critical section when the branch re-check or the bare branch creation
+// fails, and the lock must be free afterwards, or every sibling on that
+// branch would wait until the apply is cancelled.
+func TestCreate_ErrorInsideLockReleasesIt(t *testing.T) {
+	for _, identical := range []bool{false, true} {
+		name := "branch re-check fails"
+		if identical {
+			// Adoption leaves nothing to commit, so the branch is created bare.
+			name = "bare branch creation fails"
+		}
+		t.Run(name, func(t *testing.T) {
+			var branchGets atomic.Int32
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+					if branchGets.Add(1) > 1 && !identical {
+						http.Error(w, "unavailable", http.StatusInternalServerError)
+						return
+					}
+					http.Error(w, "no branch yet", http.StatusNotFound)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"id":1,"empty_repo":false}`))
+				case r.Method == http.MethodHead && identical:
+					metaHeaders(w, "remoteblob", "remote-lcid", false)
+				case r.Method == http.MethodHead:
+					http.Error(w, "absent", http.StatusNotFound)
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repository/files/"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write(fileJSON("f.txt", "remoteblob", "remote-lcid", []byte("old")))
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/branches"):
+					http.Error(w, "push rule", http.StatusForbidden)
+				default:
+					t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+					http.Error(w, "unexpected", http.StatusInternalServerError)
+				}
+			})
+			res := newTestResource(client)
+			plan := readState("ignored")
+			plan.Branch = types.StringValue("feature")
+			plan.CreateBranchFrom = types.StringValue("main")
+
+			if resp := runCreateOn(t, res, plan); !resp.Diagnostics.HasError() {
+				t.Fatal("expected Create to fail")
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+			defer cancel()
+			release, err := res.locks.acquire(ctx, "proj", "feature")
+			if err != nil {
+				t.Fatalf("the branch lock is still held after the failed Create: %v", err)
+			}
+			release()
+		})
 	}
 }
 
@@ -1633,10 +2197,11 @@ func TestUpdate_StampsOnlyTouchedPaths(t *testing.T) {
 }
 
 // TestUpdate_MixedActionsProduceExactlyOneCommit counts the commit POSTs for
-// a plan that deletes, creates, updates and chmods at once.
+// a plan that deletes, creates, updates and chmods at once, and pins the
+// actions that one commit carries.
 func TestUpdate_MixedActionsProduceExactlyOneCommit(t *testing.T) {
 	var posts atomic.Int32
-	var body string
+	var sent []string
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -1647,8 +2212,11 @@ func TestUpdate_MixedActionsProduceExactlyOneCommit(t *testing.T) {
 			stampHeaders(w, "mixsha")
 		case http.MethodPost:
 			posts.Add(1)
-			b, _ := io.ReadAll(r.Body)
-			body = string(b)
+			var opts gitlab.CreateCommitOptions
+			if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
+				t.Errorf("decoding the commit body: %v", err)
+			}
+			sent = describeActions(opts.Actions)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"id":"mixsha"}`))
@@ -1675,13 +2243,11 @@ func TestUpdate_MixedActionsProduceExactlyOneCommit(t *testing.T) {
 	if got := posts.Load(); got != 1 {
 		t.Fatalf("commit POSTs = %d, want exactly 1", got)
 	}
-	for _, want := range []string{`"action":"delete"`, `"action":"create"`, `"action":"update"`, `"action":"chmod"`} {
-		if !strings.Contains(body, want) {
-			t.Errorf("commit body missing %s: %s", want, body)
-		}
-	}
-	if strings.Index(body, `"action":"delete"`) > strings.Index(body, `"action":"create"`) {
-		t.Errorf("delete actions must precede creates, body: %s", body)
+	// Deletes come first, then the plan's paths in order, each with the
+	// lock token state holds for it.
+	want := []string{"delete:remove.txt@l-r", "create:add.txt", "update:change.txt@l-old", "chmod:keep.sh@l-k"}
+	if !slices.Equal(sent, want) {
+		t.Errorf("commit actions = %q, want %q", sent, want)
 	}
 }
 
@@ -1876,11 +2442,15 @@ func TestTruncateForDiag_RuneBoundary(t *testing.T) {
 	}
 }
 
+// TestDelete_CommitIsNotRetriedOn5xx: a 5xx on the destroy commit may have
+// landed, so it is neither replayed nor taken for a rejection: no probe and
+// no second commit follow.
 func TestDelete_CommitIsNotRetriedOn5xx(t *testing.T) {
-	var posts atomic.Int32
+	var posts, heads atomic.Int32
 	res := newRetryingResource(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
+			heads.Add(1)
 			stampHeaders(w, "sha")
 		case http.MethodPost:
 			posts.Add(1)
@@ -1896,5 +2466,8 @@ func TestDelete_CommitIsNotRetriedOn5xx(t *testing.T) {
 	}
 	if got := posts.Load(); got != 1 {
 		t.Errorf("commit POST attempts = %d, want exactly 1", got)
+	}
+	if got := heads.Load(); got != 0 {
+		t.Errorf("probes = %d, want none after a 5xx", got)
 	}
 }

@@ -388,6 +388,56 @@ func TestAccFiles_optimisticLockConflict(t *testing.T) {
 	})
 }
 
+// TestAccFiles_destroyAfterOutOfBandDelete: with detect_drift=false state
+// still lists a file someone deleted by hand, so the destroy commit names it
+// with its last_commit_id and GitLab rejects that commit. Destroy must then
+// retry once without the missing file and remove the rest.
+func TestAccFiles_destroyAfterOutOfBandDelete(t *testing.T) {
+	testAccPreCheck(t)
+
+	project := os.Getenv("GITLAB_TEST_PROJECT_ID")
+	branch := accBranch(t)
+	keep := accTestPathPrefix + "oob/keep.txt"
+	gone := accTestPathPrefix + "oob/gone.txt"
+
+	var b strings.Builder
+	b.WriteString(accResourceHeader(project, branch))
+	b.WriteString("  detect_drift = false\n  files = {\n")
+	fmt.Fprintf(&b, "    %q = { content = %q }\n", keep, "keep\n")
+	fmt.Fprintf(&b, "    %q = { content = %q }\n", gone, "gone\n")
+	b.WriteString("  }\n}\n")
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
+			accCheckFileGone(project, branch, keep),
+			accCheckFileGone(project, branch, gone),
+		),
+		Steps: []resource.TestStep{
+			{Config: b.String()},
+			{
+				PreConfig: func() {
+					c, err := accClient()
+					if err != nil {
+						t.Fatalf("accClient: %v", err)
+					}
+					_, err = c.RepositoryFiles.DeleteFile(project, gone, &gitlab.DeleteFileOptions{
+						Branch:        new(branch),
+						CommitMessage: new("tf-acc-test out-of-band delete"),
+					}, gitlab.WithContext(context.Background()))
+					if err != nil {
+						t.Fatalf("out-of-band delete: %v", err)
+					}
+				},
+				// Read is a no-op with detect_drift=false, so the plan stays
+				// empty and state keeps the deleted file for the destroy.
+				Config: b.String(),
+				Check:  accCheckFileGone(project, branch, gone),
+			},
+		},
+	})
+}
+
 // TestAccFiles_chmodCycle flips the executable bit both ways without touching
 // content and asserts the bit actually lands in the repository each time.
 func TestAccFiles_chmodCycle(t *testing.T) {
