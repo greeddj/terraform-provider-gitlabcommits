@@ -765,7 +765,7 @@ func TestApiErrorDiag(t *testing.T) {
 		{
 			name: "302-redirect-refused", err: mkErr(302, "", http.Header{"Location": []string{"https://evil.example.net/api/v4/x"}}),
 			wantSummary: "Refused to follow a GitLab redirect (HTTP 302)",
-			contains:    []string{"evil.example.net", "base_url"},
+			contains:    []string{"evil.example.net", "base_url", "write request into a GET", "tenth in a row"},
 		},
 		{
 			name: "413-too-large",

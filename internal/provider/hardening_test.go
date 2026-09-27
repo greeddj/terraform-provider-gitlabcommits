@@ -4,6 +4,7 @@
 package provider
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -32,18 +33,21 @@ func TestDecodeRemoteContent_NilFile(t *testing.T) {
 }
 
 // TestCrossHostRedirectGuard verifies the token-exfiltration guard: same-host
-// redirects (any scheme) pass, off-host redirects and https->http downgrades
-// are refused by handing back the 3xx (ErrUseLastResponse, so the client
-// neither follows nor retries), and the chain is capped at 10.
+// redirects (any scheme) pass, off-host redirects, https->http downgrades
+// and hops on which net/http turned a POST into a GET are refused by handing
+// back the 3xx (ErrUseLastResponse, so the client neither follows nor
+// retries), and the chain is capped at 10.
 func TestCrossHostRedirectGuard(t *testing.T) {
-	mk := func(raw string) *http.Request {
+	mkMethod := func(method, raw string) *http.Request {
 		u, err := url.Parse(raw)
 		if err != nil {
 			t.Fatalf("parse %q: %v", raw, err)
 		}
-		return &http.Request{URL: u}
+		return &http.Request{Method: method, URL: u}
 	}
+	mk := func(raw string) *http.Request { return mkMethod(http.MethodGet, raw) }
 	orig := mk("https://gitlab.example.com/api/v4/x")
+	post := mkMethod(http.MethodPost, "https://gitlab.example.com/api/v4/projects/p/repository/commits")
 
 	cases := []struct {
 		name        string
@@ -57,6 +61,11 @@ func TestCrossHostRedirectGuard(t *testing.T) {
 		{"cross host refused", mk("https://evil.example.net/steal"), []*http.Request{orig}, true},
 		{"https to http downgrade refused", mk("http://gitlab.example.com/down"), []*http.Request{orig}, true},
 		{"http stays http allowed", mk("http://gitlab.example.com/next"), []*http.Request{mk("http://gitlab.example.com/x")}, false},
+		// 301/302/303: net/http re-sends the POST as a body-less GET.
+		{"post rewritten to get refused", mk("https://gitlab.example.com/moved/commits"), []*http.Request{post}, true},
+		// 307/308: the method and the body are kept.
+		{"post kept as post allowed", mkMethod(http.MethodPost, "https://gitlab.example.com/moved/commits"), []*http.Request{post}, false},
+		{"head kept as head allowed", mkMethod(http.MethodHead, "https://gitlab.example.com/moved/f"), []*http.Request{mkMethod(http.MethodHead, "https://gitlab.example.com/f")}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -120,6 +129,89 @@ func TestCrossHostRedirect_EndToEnd(t *testing.T) {
 	}
 	if got := hits.Load(); got != 1 {
 		t.Errorf("requests to GitLab = %d, want 1 (a refused redirect must not be retried)", got)
+	}
+}
+
+// TestSameHostRedirectOnCommit drives a Create through the configured client
+// while GitLab redirects the commit POST to another path on the same host.
+// net/http re-sends a POST as a GET on 301, 302 and 303, which would read
+// the commit list and fail as a JSON decode error; that hop is refused and
+// reported as a redirect, once. A 307 or 308 keeps the method and the body
+// and is followed: the commit lands once, at the new address.
+func TestSameHostRedirectOnCommit(t *testing.T) {
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			var posts, moved, listReads atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				isCommits := strings.HasSuffix(r.URL.Path, "/repository/commits")
+				switch {
+				case isCommits && r.Method == http.MethodPost && r.URL.Query().Get("moved") == "":
+					posts.Add(1)
+					http.Redirect(w, r, r.URL.Path+"?moved=1", status)
+				case isCommits && r.Method == http.MethodPost:
+					moved.Add(1)
+					var opts gitlab.CreateCommitOptions
+					if err := json.NewDecoder(r.Body).Decode(&opts); err != nil || len(opts.Actions) != 1 {
+						t.Errorf("the followed POST must carry the commit body, got %v (%v)", opts.Actions, err)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(`{"id":"newsha"}`))
+				case isCommits:
+					listReads.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`[]`))
+				case r.Method == http.MethodHead && r.URL.Query().Get("ref") == "newsha":
+					stampHeaders(w, "newsha")
+				case r.Method == http.MethodHead:
+					http.Error(w, "404 File Not Found", http.StatusNotFound)
+				case isTreeRequest(r):
+					noDirectory(w)
+				case strings.Contains(r.URL.Path, "/repository/branches/"):
+					branchJSON(w, "main", "head")
+				default:
+					t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+					http.Error(w, "unexpected", http.StatusInternalServerError)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			t.Setenv("GITLAB_TOKEN", "")
+			cfg := runConfigure(t, map[string]tftypes.Value{
+				"token":    tftypes.NewValue(tftypes.String, "tok"),
+				"base_url": tftypes.NewValue(tftypes.String, srv.URL),
+			})
+			if cfg.Diagnostics.HasError() {
+				t.Fatalf("configure: %v", cfg.Diagnostics.Errors())
+			}
+			deps := cfg.ResourceData.(*resourceDeps)
+			res := &filesResource{client: deps.client, locks: deps.locks, retryCommits: deps.retryCommits}
+
+			plan := readState("")
+			plan.Files["f.txt"] = fileModel{Content: types.StringValue("new"), ContentBase64: types.StringNull(),
+				ExecuteFilemode: types.BoolValue(false)}
+			resp := runCreateOn(t, res, plan)
+
+			if posts.Load() != 1 || listReads.Load() != 0 {
+				t.Errorf("commit POSTs = %d, commit list reads = %d, want 1 and 0", posts.Load(), listReads.Load())
+			}
+			if status == http.StatusTemporaryRedirect || status == http.StatusPermanentRedirect {
+				if resp.Diagnostics.HasError() || moved.Load() != 1 {
+					t.Fatalf("a %d keeps the POST: want one commit at the new address, got %d and %v", status, moved.Load(), resp.Diagnostics)
+				}
+				return
+			}
+			errs := resp.Diagnostics.Errors()
+			if len(errs) != 1 || errs[0].Summary() != fmt.Sprintf("Refused to follow a GitLab redirect (HTTP %d)", status) {
+				t.Fatalf("want the refused-redirect error, got %v", resp.Diagnostics)
+			}
+			if d := errs[0].Detail(); !strings.Contains(d, "?moved=1") || !strings.Contains(d, "write request into a GET") {
+				t.Errorf("detail must name the target and the reason, got: %s", d)
+			}
+			if moved.Load() != 0 {
+				t.Errorf("the redirect target must not receive the commit, got %d", moved.Load())
+			}
+		})
 	}
 }
 

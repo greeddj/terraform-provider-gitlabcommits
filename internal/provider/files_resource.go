@@ -2659,12 +2659,13 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 				"`gitlabcommits_files` resources (for example with for_each), or on self-managed GitLab raise the "+
 				"GITLAB_COMMITS_MAX_REQUEST_SIZE_BYTES limit. Body: %s", prefix, body)
 		case 301, 302, 303, 307, 308:
-			// crossHostRedirectGuard stops the client from following an
-			// off-host or https->http redirect; the 3xx then lands here.
+			// crossHostRedirectGuard stops the client from following a
+			// redirect it refuses; the 3xx then lands here.
 			summary = fmt.Sprintf("Refused to follow a GitLab redirect (HTTP %d)", status)
-			return summary, fmt.Sprintf("%s: GitLab answered with a redirect to %q. Redirects to another host or from https "+
-				"to http are not followed because the request carries the API token; point base_url at the final GitLab "+
-				"address. Body: %s", prefix, resp.Response.Header.Get("Location"), body)
+			return summary, fmt.Sprintf("%s: GitLab answered with a redirect to %q. The provider does not follow three kinds "+
+				"of redirect: one to another host or from https to http, since the request carries the API token; one that "+
+				"would turn a write request into a GET (net/http re-sends a POST as a GET on 301, 302 and 303); and the tenth "+
+				"in a row. Point base_url at the final GitLab address. Body: %s", prefix, resp.Response.Header.Get("Location"), body)
 		case 429:
 			summary = "GitLab rate limit exceeded (HTTP 429)"
 			h := resp.Response.Header

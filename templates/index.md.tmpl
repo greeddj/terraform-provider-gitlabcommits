@@ -81,8 +81,10 @@ provider needs `POST /repository/commits`.
   response headers once the request has been sent, so a wedged instance
   fails the apply instead of hanging it. Uploads are not bounded by that.
 - **Redirects.** A redirect to another host, or from https to http, is never
-  followed because the request carries the token; it is reported with the
-  target so you can point `base_url` at the final address.
+  followed because the request carries the token, and neither is a 301, 302
+  or 303 on a commit or a branch creation, which net/http would re-send as a
+  GET; the redirect is reported with the target so you can point `base_url`
+  at the final address.
 - **A branch that shares its name with a tag is not supported.** GitLab
   resolves the bare name to the tag first, and the provider, like GitLab's
   commits API, names the branch that way. File reads (refreshes, adoption,

@@ -434,8 +434,10 @@ converges without a commit.
   GitLab's response headers once it has been sent, so a wedged instance or
   proxy fails the apply instead of hanging it (uploads are not bounded by
   that). A redirect to another host or from https to http is never followed,
-  because the request carries the token; it is reported with the target so
-  you can point `base_url` at the final address.
+  because the request carries the token, and neither is a 301, 302 or 303
+  on a commit or a branch creation, which net/http would re-send as a GET;
+  the redirect is reported with the target so you can point `base_url` at
+  the final address.
 - **Commits are not idempotent, so the commit request is never replayed on
   5xx.** `POST /repository/commits` has no request deduplication: if a proxy
   answered 502/504 after GitLab had already accepted the commit, a retry

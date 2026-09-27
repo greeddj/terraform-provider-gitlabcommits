@@ -283,13 +283,16 @@ func (p *gitlabCommitsProvider) Resources(_ context.Context) []func() resource.R
 // leaves custom headers like Private-Token intact, so a 3xx pointing off-host
 // would otherwise forward the API token to an attacker-controlled host. Same-host
 // redirects (including http->https upgrades) are allowed, but an https->http
-// downgrade is refused - it would resend the token in cleartext. A refusal
-// returns http.ErrUseLastResponse rather than an error: the 3xx then reaches
-// client-go as a plain non-2xx response, which it does not retry (an error
-// from CheckRedirect would be replayed max_retries times as a transport
-// failure), and apiErrorDiag explains it with the Location header. The chain
-// is capped at 10 to match net/http's default behaviour, which a non-nil
-// CheckRedirect drops, and the cap is reported the same way.
+// downgrade is refused - it would resend the token in cleartext. So is a hop
+// on which net/http changed the method: on 301/302/303 it turns a POST into
+// a body-less GET, which would read the list at the commit or branch URL and
+// fail as a JSON decode error; a 307/308 keeps the method and the body and is
+// followed. A refusal returns http.ErrUseLastResponse rather than an error:
+// the 3xx then reaches client-go as a plain non-2xx response, which it does
+// not retry (an error from CheckRedirect would be replayed max_retries times
+// as a transport failure), and apiErrorDiag explains it with the Location
+// header. The chain is capped at 10 to match net/http's default behaviour,
+// which a non-nil CheckRedirect drops, and the cap is reported the same way.
 func crossHostRedirectGuard(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
@@ -303,6 +306,9 @@ func crossHostRedirectGuard(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 	if req.URL.Scheme == "http" && via[len(via)-1].URL.Scheme == "https" {
+		return http.ErrUseLastResponse
+	}
+	if req.Method != via[len(via)-1].Method {
 		return http.ErrUseLastResponse
 	}
 	return nil
