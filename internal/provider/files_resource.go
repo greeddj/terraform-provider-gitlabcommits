@@ -83,7 +83,7 @@ type resourceDeps struct {
 // racing on the same branch tip make GitLab reject the loser with "reference
 // update: reference does not point to expected object"; holding the branch
 // lock around the commit removes that race without merging or splitting
-// commits, so every resource still lands exactly one. Writers outside this
+// commits, so every resource still lands at most one. Writers outside this
 // process are not covered and surface through apiErrorDiag.
 //
 // A claim is a path a resource creates or adopts: Create claims every path
@@ -267,15 +267,15 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 		Description: "Manages a set of files in a single GitLab repository on a single branch. " +
 			"Every change (create / update / delete / chmod) is batched into ONE commit per terraform apply, " +
 			"which means one CI pipeline run per resource. Use one resource per logical bundle " +
-			"(typically per service) so each apply produces exactly one commit per service. " +
+			"(typically per service) so each apply produces at most one commit per service. " +
 			"Commits are serialised per branch within one provider configuration, so for_each resources sharing one " +
-			"branch never race on its tip, and the commit request is retried only on HTTP 429, never on 5xx, " +
-			"so one apply can never land two commits. Within one run of one provider configuration, no resource " +
-			"deletes a file on its branch after another resource created or adopted it there: that delete is dropped " +
-			"with a warning, so a file can move from one resource to another in one apply, and a replacement under " +
-			"create_before_destroy keeps the files the new object took over. A delete commit already in flight is " +
-			"waited for only when both resources spell project_id the same way. Later runs are not covered, a re-run " +
-			"of a failed apply included. " +
+			"branch never race on its tip, and the commit request is retried only on HTTP 429 and on connection " +
+			"failures before it is sent, never on 5xx, so one apply can never land two commits. Within one run of " +
+			"one provider configuration, no resource deletes a file on its branch after another resource created or " +
+			"adopted it there: that delete is dropped with a warning, so a file can move from one resource to another " +
+			"in one apply, and a replacement under create_before_destroy keeps the files the new object took over. A " +
+			"delete commit already in flight is waited for only when both resources spell project_id the same way. " +
+			"Later runs are not covered, a re-run of a failed apply included. " +
 			"Git LFS: GitLab's commits API turns only a created file into an LFS object and commits an update as a " +
 			"regular blob, so an LFS-tracked file this resource updates leaves LFS. Where the provider reads a file's " +
 			"LFS pointer it compares the object the pointer names with the configured bytes when adopting a path and " +

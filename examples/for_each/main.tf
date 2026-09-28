@@ -1,7 +1,7 @@
 # ============================================================================
 # Real-world layout: 20 services x 30 environments
 #   - one terraform resource per service
-#   - one commit per service per apply
+#   - at most one commit per service per apply (none when nothing changed)
 #   - all per-env helm values and ArgoCD application manifests in that commit
 # ============================================================================
 
@@ -57,8 +57,8 @@ variable "services" {
 
 # ----------------------------------------------------------------------
 # One resource per service. Inside each resource we generate every file
-# for every environment, so each terraform apply creates exactly one
-# commit per service (and one CI pipeline run per service).
+# for every environment, so each terraform apply creates at most one
+# commit per service (and one CI pipeline run per service it changed).
 # ----------------------------------------------------------------------
 resource "gitlabcommits_files" "service" {
   for_each = var.services
@@ -143,7 +143,7 @@ resource "gitlabcommits_files" "service" {
 # Outputs: per-service commit SHAs (handy for downstream pipelines).
 # ----------------------------------------------------------------------
 output "service_commits" {
-  description = "Map service_name -> commit SHA produced by this apply."
+  description = "Map service_name -> SHA of the last commit each resource produced (unchanged when this apply made no commit for it, null if it never committed)."
   value       = { for k, r in gitlabcommits_files.service : k => r.commit_sha }
 }
 

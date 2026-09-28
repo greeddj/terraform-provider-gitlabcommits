@@ -1,5 +1,10 @@
 # Migration guide
 
+The resources this guide replaces, `gitlabcommits_commit` and the
+`gitlabcommits_file` resource, existed only in pre-release source builds.
+Every tagged release, v0.1.0 onward, ships `gitlabcommits_files` as its only
+resource, and `gitlabcommits_file` there is a read-only data source.
+
 ## From `gitlabcommits_commit` to `gitlabcommits_files`
 
 The old `gitlabcommits_commit` modelled a commit as a Terraform resource. That
@@ -25,21 +30,34 @@ as the unit of state - which is what users actually want to manage.
    release that ships `gitlabcommits_files`).
 2. **Re-write each `gitlabcommits_commit` resource** to `gitlabcommits_files`:
    - Convert the `files` list to a map keyed by `file_path`.
-   - Drop the `action` attribute - the provider computes it from the diff.
-   - Optional fields (`previous_path`, `encoding`) that were used for `move`
-     and explicit base64 are no longer needed; use `content_base64` for
-     binaries and let the diff handle moves as create/delete pairs.
+   - Drop the `action` attribute - the provider computes it from the diff. A
+     `move` becomes the old path removed from the map and the new path
+     added: a delete and a create in one commit.
+   - Drop the `encoding` attribute: `content` holds text, and setting
+     `content_base64` instead is what marks base64 content (use it for
+     binaries).
+   - `project_id` takes a numeric ID or the plain project path
+     (`group/subgroup/project`); a URL-encoded path fails validation.
 3. **Remove old state**: `terraform state rm <addr>` for every
    `gitlabcommits_commit.*` resource.
 4. **Apply with `adopt_existing = true`** (the default). For each new
-   `gitlabcommits_files` resource the provider does a preflight
-   `GetFileMetaData` per path and rewrites `create` to `update` for
-   already-existing paths, so the apply converges without "file already
-   exists" errors. A path whose content and mode already match the rendered
-   configuration needs no action at all, so a resource whose files all match
-   the repository makes no commit; one with differing files pushes one
-   adoption commit carrying only those. A path that cannot be read stops
-   the apply before anything is committed, so re-running it is safe.
+   `gitlabcommits_files` resource the provider probes every path
+   (`GetFileMetaData`, plus one `GetFile` for each path that already exists)
+   and rewrites `create` to `update` for already-existing paths, so the apply
+   converges without "file already exists" errors. A path whose content and
+   mode already match the rendered configuration needs no action at all (for
+   a Git LFS-tracked file, a pointer that names the rendered bytes counts as
+   a match), and one that differs only in its exec bit needs only a `chmod`.
+   So a resource whose files all match the repository makes no commit and
+   leaves `commit_sha` null, and anything wired to `commit_sha` sees null
+   until the resource commits a real change; a resource with differing files
+   pushes one adoption commit carrying only those. A path that cannot be read
+   stops the apply before anything is committed, so re-running it is safe.
+   So does a Git LFS-tracked file whose pointer names other content than the
+   rendered bytes, because the commits API would store the update as a
+   regular blob outside LFS: change that file with git and Git LFS first, or
+   render the content its pointer names (see Limits in the provider
+   documentation).
 5. **Inspect once** - run `terraform plan` again; it should report no
    changes.
 
@@ -92,6 +110,33 @@ resource "gitlabcommits_files" "frontend" {
 The first apply after the migration produces at most one adoption commit per
 resource, none for a resource whose files already match the repository;
 every later apply with no changes produces zero commits.
+
+## From the `gitlabcommits_file` resource to `gitlabcommits_files`
+
+The pre-release `gitlabcommits_file` resource managed one file per resource.
+With `batch_mode` (the default) it gathered the files created on the same
+project and branch within five seconds of the first into one commit, under
+that first file's `commit_message`; every update was a commit of its own.
+Its destroy only dropped state. The name
+now belongs to a read-only data source, so `data "gitlabcommits_file"` is not
+a replacement.
+
+1. **Fold the resources into bundles**: one `gitlabcommits_files` resource
+   per project and branch, whose `files` map is keyed by each old resource's
+   `file_path` and holds its `content` or `content_base64`. Move
+   `commit_message`, `author_name` and `author_email` to the new resource and
+   drop `action`, `encoding` and `batch_mode`: a resource makes at most one
+   commit per apply without them. `project_id` takes a numeric ID or the
+   plain project path (`group/subgroup/project`); a URL-encoded path fails
+   validation.
+2. **Remove old state**: `terraform state rm <addr>` for every
+   `gitlabcommits_file.*` resource.
+3. **Apply and inspect** as in steps 4 and 5 above: existing files are
+   adopted, without a commit where they already match.
+
+Unlike the old resource, destroying a `gitlabcommits_files` resource deletes
+its files in one commit; set `delete_on_destroy = false` and apply to keep
+them.
 
 ## `blob_id` is now opaque
 

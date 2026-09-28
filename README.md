@@ -13,8 +13,8 @@ It exists to solve a very specific operational problem: a GitOps repository
 holding huge fan-outs of nearly-identical YAML (helm values, ArgoCD
 applications) for *N services x M environments*. With `gitlab_repository_file`
 each file becomes its own commit, which is a non-starter at any reasonable scale.
-This provider lets you express the bundle as Terraform and emit exactly one
-commit per service.
+This provider lets you express the bundle as Terraform and emit at most one
+commit per service per apply.
 
 > **Note:** This project was created in collaboration with Claude Code.
 
@@ -81,8 +81,8 @@ files map starts empty and is reconciled on the next plan + apply.
 ## Requirements
 
 - Terraform >= 1.5
-- GitLab 19.x (what CI tests against); 18.x works, older versions may work
-  for basic operations but are not supported
+- Tested against GitLab 19.x; older versions may work for basic operations
+  but are not supported
 - A token that can call the GitLab REST API on the target project (see Authentication below)
 - On macOS and Windows, `SSL_CERT_FILE` / `SSL_CERT_DIR`, when set, replace the
   system certificate store for the provider's TLS connections (Go 1.27 default);
@@ -97,7 +97,7 @@ terraform {
     gitlabcommits = {
       source = "greeddj/gitlabcommits"
       # Pin a version once you depend on released behaviour, e.g.:
-      # version = "~> 0.1.0"
+      # version = "~> 0.2.0"
     }
   }
 }
@@ -244,7 +244,9 @@ resource "gitlabcommits_files" "service" {
 }
 ```
 
-20 resources -> 20 commits per apply -> 20 pipeline runs. Not 600.
+20 resources -> at most 20 commits per apply -> at most 20 pipeline runs.
+With one commit per file, the first apply would make 1,200 commits (two files
+per service and environment), and bumping every service's image tag 600.
 
 A complete example lives in [`examples/for_each/main.tf`](examples/for_each/main.tf).
 
@@ -271,7 +273,7 @@ names the configured bytes (see Limits).
   on its tip (GitLab rejects the loser with HTTP 400 "reference does not point
   to expected object"). The provider serialises its commits per branch within
   one provider configuration, so the `for_each` layout above never hits that;
-  each resource still lands exactly one commit. Two things stay outside that
+  each resource still lands at most one commit. Two things stay outside that
   guarantee: resources sharing a branch must spell `project_id` the same way
   (a numeric ID and a path are different lock keys; changing the spelling of
   an existing resource is a replacement, see below), and a second provider
@@ -544,7 +546,7 @@ development loop.
 ## More
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) - development loop, acceptance tests, PR conventions.
-- [MIGRATION.md](MIGRATION.md) - upgrading from the earlier `gitlabcommits_commit` resource.
+- [MIGRATION.md](MIGRATION.md) - upgrading from the pre-release `gitlabcommits_commit` and `gitlabcommits_file` resources.
 - [SECURITY.md](SECURITY.md) - threat model and how to report a vulnerability.
 
 ## License

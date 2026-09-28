@@ -26,7 +26,9 @@ a one-liner you can run manually - see the `Justfile`.
    rehearses the release with `goreleaser release --snapshot`):
    - `just check` (`go vet`, `staticcheck`, `govulncheck`, `fieldalignment`)
    - `just lint` (`golangci-lint`, including the `gofmt` formatter)
-   - `just test` (`go test -race ./...`)
+   - `just test` (`go test -race ./...`; the tests that run Terraform itself
+     against a fake GitLab skip without a `terraform` CLI on `PATH` or
+     `TF_ACC_TERRAFORM_PATH`)
    - `terraform fmt -check` and `terraform validate` over `examples/`,
      including the resource and data-source doc snippets
    - generated-docs and copywrite-header sync checks
@@ -57,9 +59,9 @@ the same environment replays the cached result without sending a request.
 block) and skips on older versions.
 
 In CI they run via `.github/workflows/acceptance.yml` (manual trigger,
-nightly cron, and pushes to `main` that touch `internal/**`) on a branch
-named after the run, which a final always-run step deletes even when the job
-times out or is cancelled.
+nightly cron, and pushes to `main` that touch `internal/**`, `go.mod`,
+`go.sum` or the workflow file itself) on a branch named after the run, which
+a final always-run step deletes even when the job times out or is cancelled.
 
 ## Pull requests
 

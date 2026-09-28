@@ -50,5 +50,5 @@ resource "gitlabcommits_files" "frontend" {
 
 output "frontend_commit" {
   value       = gitlabcommits_files.frontend.commit_sha
-  description = "SHA of the commit produced by the frontend bundle."
+  description = "SHA of the last commit the frontend bundle produced (null if it never committed)."
 }
