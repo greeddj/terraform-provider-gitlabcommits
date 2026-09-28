@@ -21,3 +21,23 @@ for dir in examples/complete examples/for_each examples/provider; do
   echo "validating $dir"
   (cd "$dir" && TF_CLI_CONFIG_FILE="$tmp/dev.tfrc" terraform validate)
 done
+# The resource and data-source snippets are rendered into the Registry docs
+# but are not modules; each is validated in a copy with the provider source
+# added.
+for dir in examples/resources/*/ examples/data-sources/*/; do
+  name="$(basename "$dir")"
+  mod="$tmp/snippets/$name"
+  mkdir -p "$mod"
+  cp "$dir"*.tf "$mod/"
+  cat > "$mod/zz_required_providers.tf" <<EOF
+terraform {
+  required_providers {
+    gitlabcommits = {
+      source = "greeddj/gitlabcommits"
+    }
+  }
+}
+EOF
+  echo "validating $dir"
+  (cd "$mod" && TF_CLI_CONFIG_FILE="$tmp/dev.tfrc" terraform validate)
+done

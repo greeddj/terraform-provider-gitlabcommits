@@ -36,10 +36,6 @@ linters:
     revive:
       rules:
         - name: var-naming
-        - name: package-comments
-          disabled: true
-        - name: exported
-          disabled: true
   exclusions:
     generated: lax
     presets:

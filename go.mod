@@ -136,9 +136,10 @@ require (
 )
 
 // v1.84.0 already carries the fix for GO-2026-6443, but the advisory's third
-// range tracks grpc's master branch and semver puts the released tag inside it,
-// so govulncheck fails on it. Excluded rather than pinned in require, because
-// `go get -u ./...` silently raises a require pin and honours an exclude. It
-// names one version, so `go get -u ./...` moves past it once grpc ships v1.85.0;
-// delete this then. See CLAUDE.md for the full reasoning.
+// range tracks grpc's master branch and semver puts every v1.84.x release
+// inside it, so govulncheck fails on them. Excluded rather than pinned in
+// require, because `go get -u` silently raises a require pin and honours an
+// exclude. Each v1.84.x patch grpc publishes needs its own exclude line; delete
+// the block once grpc resolves to v1.85.0 or later. See CLAUDE.md for the full
+// reasoning.
 exclude google.golang.org/grpc v1.84.0

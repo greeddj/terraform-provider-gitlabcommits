@@ -1,5 +1,9 @@
 version: 2
 updates:
+  # Version updates cover only the direct requirements in go.mod. The tool
+  # block and every indirect module (x/net, x/crypto, grpc and protobuf in the
+  # shipped binary among them) are marked indirect, which dependabot skips, so
+  # they move only through the manual refresh described in CLAUDE.md.
   - package-ecosystem: gomod
     directory: "/"
     schedule:
@@ -27,5 +31,6 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 3
+    # fix(ci) titles land in the changelog's CI group, not under Bug Fixes.
     commit-message:
       prefix: "fix(ci)"

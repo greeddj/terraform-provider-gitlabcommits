@@ -22,11 +22,13 @@ a one-liner you can run manually - see the `Justfile`.
 1. **Edit code** under `internal/provider/`. New code paths need unit tests in
    the same package - see `*_test.go` for examples (table-driven where it
    helps).
-2. **Run `just ci`** before pushing - it is the exact gate CI runs:
+2. **Run `just ci`** before pushing - it is the gate CI runs (CI also
+   rehearses the release with `goreleaser release --snapshot`):
    - `just check` (`go vet`, `staticcheck`, `govulncheck`, `fieldalignment`)
    - `just lint` (`golangci-lint`, including the `gofmt` formatter)
    - `just test` (`go test -race ./...`)
-   - `terraform fmt -check` and `terraform validate` over `examples/`
+   - `terraform fmt -check` and `terraform validate` over `examples/`,
+     including the resource and data-source doc snippets
    - generated-docs and copywrite-header sync checks
    - `go mod tidy -diff`
 3. **Regenerate docs** if you changed any schema:

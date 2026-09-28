@@ -6,9 +6,9 @@
 
 <!-- Concrete commands you ran. Include "added unit tests for X". -->
 
-- [ ] `just check`
+- [ ] `just ci`
 - [ ] `just docs` (if schema changed)
-- [ ] CHANGELOG.md updated under `## [Unreleased]` (if user-visible)
+- [ ] Conventional commit / PR title (`feat:`, `fix:`, `docs:`) for user-visible changes; the release notes are built from commit titles
 
 ## Breaking change?
 
