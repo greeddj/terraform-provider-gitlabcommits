@@ -1416,6 +1416,48 @@ func TestCommitLocked_CancelledWaitSendsNothing(t *testing.T) {
 	checkUpdateResult(t, req, resp)
 }
 
+// TestCreate_CancelledLockWaitBeforeCommitSendsNothing: Create takes the
+// branch lock a second time, after its probes, for the branch re-check and
+// the commit. Another commit takes the lock while a probe is in flight, so
+// that second wait is the one ctx ends; nothing is committed and no state is
+// returned.
+func TestCreate_CancelledLockWaitBeforeCommitSendsNothing(t *testing.T) {
+	var res *filesResource
+	var held sync.Once
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"main","commit":{"id":"base"}}`))
+		case r.Method == http.MethodHead:
+			held.Do(func() {
+				release, err := res.locks.acquire(context.Background(), "proj", "main")
+				if err != nil {
+					t.Errorf("acquire: %v", err)
+					return
+				}
+				t.Cleanup(release)
+			})
+			http.Error(w, "not found", http.StatusNotFound)
+		case isTreeRequest(r):
+			noDirectory(w)
+		default:
+			t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	})
+	res = newTestResource(client)
+
+	req, resp := createRequest(t, res, readState("ignored"))
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	res.Create(ctx, req, resp)
+	if !resp.Diagnostics.HasError() || resp.Diagnostics.Errors()[0].Summary() != "Cancelled while waiting for the branch lock" {
+		t.Fatalf("expected the lock-wait diagnostic, got %v", resp.Diagnostics)
+	}
+	checkCreateResult(t, resp)
+}
+
 // TestUpdate_NoOpProducesNoCommit: when plan equals state, Update must make no
 // API call (the one-commit-per-apply invariant produces zero commits here).
 func TestUpdate_NoOpProducesNoCommit(t *testing.T) {
