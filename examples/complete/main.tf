@@ -18,7 +18,8 @@ variable "gitlab_token" {
 }
 
 # ----------------------------------------------------------------------
-# Minimal example: one resource = one service = one commit per apply
+# Minimal example: one resource = one service = at most one commit per apply
+# (none when nothing changed)
 # ----------------------------------------------------------------------
 resource "gitlabcommits_files" "frontend" {
   project_id     = "platform/gitops"

@@ -85,7 +85,8 @@ func (p *gitlabCommitsProvider) Metadata(_ context.Context, _ provider.MetadataR
 func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Description: "Terraform provider for managing repository files in GitLab via the Commits API. " +
-			"Each managed resource produces one commit per terraform apply containing all of its file changes. " +
+			"Each managed resource produces at most one commit per terraform apply, containing all of its file changes, " +
+			"and none when nothing changed. " +
 			"Tested against GitLab 19.x; older versions may work for basic operations but are not supported.",
 		Attributes: map[string]schema.Attribute{
 			"token": schema.StringAttribute{
