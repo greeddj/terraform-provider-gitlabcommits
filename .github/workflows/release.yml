@@ -7,7 +7,8 @@ on:
 
 # The write scope is confined to the release job: the gate reused from ci.yml
 # runs third-party tool binaries (golangci-lint, terraform) and must not hold a
-# token that can push commits, tags, or release assets.
+# token that can push commits, tags, or release assets. The Go cache is the
+# same boundary, so the release job never restores one (see its setup-go).
 permissions:
   contents: read
 
@@ -50,6 +51,11 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: 'go.mod'
+          # A restored cache was saved by jobs that run third-party binaries,
+          # and go trusts an extracted module tree and cached build outputs
+          # without re-hashing them. The signed build starts from a clean
+          # download, which go checks against go.sum.
+          cache: false
 
       - name: Import GPG key
         uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
@@ -66,7 +72,8 @@ jobs:
           # time: two tags cut a week apart would otherwise be built by two
           # different goreleasers with no commit recording the change.
           # Dependabot moves the action SHA above but never a `with:` input,
-          # so this line is bumped by hand.
+          # so this line is bumped by hand. ci.yml rehearses the release with
+          # the same action SHA and version; the two must move together.
           version: 'v2.18.2'
           args: release --clean
         env:
