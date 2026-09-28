@@ -43,9 +43,10 @@ import (
 // operation (a Read, an adopt probe, a stampBlobs pass). It is a per-operation
 // bound: with terraform's -parallelism (default 10) the process-wide
 // concurrency is up to 10x this. 16 gives a 16x speedup on the documented
-// fan-out use case (hundreds of files per resource) while client-go's
-// RateLimit-Limit-derived limiter keeps the aggregate under GitLab's budget,
-// and the retry layer handles 429s if a cap is hit anyway.
+// fan-out use case (hundreds of files per resource) while the provider's
+// RateLimit-Limit-derived limiter (headerRateLimiter, installed by Configure
+// in place of client-go's) keeps the aggregate under GitLab's budget, and the
+// retry layer handles 429s if a cap is hit anyway.
 const refreshParallelism = 16
 
 var (

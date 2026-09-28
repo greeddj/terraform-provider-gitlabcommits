@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -644,6 +645,116 @@ func TestConfigure_RateLimitHeaderIsRaceFree(t *testing.T) {
 	}
 	if got := observer.limiter.current.Load().Limit(); got != rate.Limit(600000.0/60*0.66) {
 		t.Errorf("limit = %v, want two thirds of the header's per-second rate", got)
+	}
+}
+
+// TestConfigure_RateLimitHeaderAfterAHop: client-go takes RateLimit-Limit
+// from the answer a request finally gets, so a first request that reaches it
+// through a followed same-host redirect, or through a retry after a 502,
+// still configures the limiter from the header that answer carries.
+func TestConfigure_RateLimitHeaderAfterAHop(t *testing.T) {
+	hops := map[string]func(w http.ResponseWriter, r *http.Request){
+		"followed redirect": func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, r.URL.Path+"?moved=1", http.StatusPermanentRedirect)
+		},
+		"retried 502": func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		},
+	}
+	for name, hop := range hops {
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					hop(w, r)
+					return
+				}
+				w.Header().Set("RateLimit-Limit", "600000")
+				branchJSON(w, "main", "head")
+			}))
+			t.Cleanup(srv.Close)
+			t.Setenv("GITLAB_TOKEN", "")
+			client := configuredClient(t, map[string]tftypes.Value{
+				"token":    tftypes.NewValue(tftypes.String, "tok"),
+				"base_url": tftypes.NewValue(tftypes.String, srv.URL),
+			})
+
+			if _, _, err := client.Branches.GetBranch("proj", "main", gitlab.WithContext(t.Context())); err != nil {
+				t.Fatalf("request: %v", err)
+			}
+
+			if got := calls.Load(); got != 2 {
+				t.Fatalf("requests = %d, want the hop and the answer", got)
+			}
+			observer, ok := client.HTTPClient().Transport.(*rateLimitObserver)
+			if !ok {
+				t.Fatalf("transport is %T, want *rateLimitObserver", client.HTTPClient().Transport)
+			}
+			if got := observer.limiter.current.Load().Limit(); got != rate.Limit(600000.0/60*0.66) {
+				t.Errorf("limit = %v, want the rate of the answer's header", got)
+			}
+		})
+	}
+}
+
+// replayTransport answers each round trip with the next of its responses.
+type replayTransport struct {
+	responses []*http.Response
+}
+
+func (r *replayTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	resp := r.responses[0]
+	r.responses = r.responses[1:]
+	return resp, nil
+}
+
+// TestRateLimitObserver_WhichResponsesSettle: a redirect, a 5xx or a 429
+// without RateLimit-Limit leaves the limiter to a later response; any
+// response with the header, and a 2xx or another 4xx without it, settles it
+// for good, the way the answer client-go reads it from does.
+func TestRateLimitObserver_WhichResponsesSettle(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+		first  int
+		// perMinute is the RateLimit-Limit the limiter must end up with, or 0
+		// for a limiter left off.
+		perMinute float64
+	}{
+		{name: "redirect", first: http.StatusPermanentRedirect, perMinute: 600},
+		{name: "found", first: http.StatusFound, perMinute: 600},
+		{name: "502", first: http.StatusBadGateway, perMinute: 600},
+		{name: "503", first: http.StatusServiceUnavailable, perMinute: 600},
+		{name: "429 without the header", first: http.StatusTooManyRequests, perMinute: 600},
+		{name: "429 with the header", first: http.StatusTooManyRequests, header: "60", perMinute: 60},
+		{name: "502 with the header", first: http.StatusBadGateway, header: "60", perMinute: 60},
+		{name: "200 without the header", first: http.StatusOK},
+		{name: "404 without the header", first: http.StatusNotFound},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			first := &http.Response{StatusCode: c.first, Header: http.Header{}, Body: http.NoBody}
+			if c.header != "" {
+				first.Header.Set("RateLimit-Limit", c.header)
+			}
+			answer := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Ratelimit-Limit": []string{"600"}}, Body: http.NoBody}
+			observer := &rateLimitObserver{
+				next:    &replayTransport{responses: []*http.Response{first, answer}},
+				limiter: newHeaderRateLimiter(),
+			}
+			for range 2 {
+				resp, err := observer.RoundTrip(httptest.NewRequest(http.MethodGet, "https://gitlab.example.com/", nil))
+				if err != nil {
+					t.Fatalf("round trip: %v", err)
+				}
+				_ = resp.Body.Close()
+			}
+			got := observer.limiter.current.Load().Limit()
+			if want := rate.Limit(c.perMinute / 60 * 0.66); c.perMinute == 0 && got != rate.Inf ||
+				c.perMinute != 0 && math.Abs(float64(got-want)) > 1e-9*float64(want) {
+				t.Errorf("limit = %v, want the rate of %v requests per minute (0: off)", got, c.perMinute)
+			}
+		})
 	}
 }
 

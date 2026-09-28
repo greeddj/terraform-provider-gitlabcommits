@@ -425,10 +425,11 @@ func (l *headerRateLimiter) Wait(ctx context.Context) error {
 	return l.current.Load().Wait(ctx)
 }
 
-// observe configures the limiter from the first response, as client-go
-// does: two thirds of GitLab's per-minute limit as the steady rate and a
-// third as the burst, with the request that brought the header counted. A
-// first response without a usable header leaves the limiter off for good.
+// observe configures the limiter from the first response it is handed, as
+// client-go does: two thirds of GitLab's per-minute limit as the steady rate
+// and a third as the burst, with the request that brought the header
+// counted. A first response without a usable header leaves the limiter off
+// for good.
 func (l *headerRateLimiter) observe(h http.Header) {
 	l.once.Do(func() {
 		perMinute, _ := strconv.ParseFloat(h.Get("RateLimit-Limit"), 64)
@@ -443,8 +444,8 @@ func (l *headerRateLimiter) observe(h http.Header) {
 	})
 }
 
-// rateLimitObserver is the transport under the GitLab client: it hands each
-// response's headers to the rate limiter.
+// rateLimitObserver is the transport under the GitLab client: it hands the
+// headers of each response that may settle the limiter to it.
 type rateLimitObserver struct {
 	next    http.RoundTripper
 	limiter *headerRateLimiter
@@ -452,10 +453,25 @@ type rateLimitObserver struct {
 
 func (t *rateLimitObserver) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.next.RoundTrip(req)
-	if err == nil {
+	if err == nil && settlesLimiter(resp) {
 		t.limiter.observe(resp.Header)
 	}
 	return resp, err
+}
+
+// settlesLimiter reports whether resp may configure the rate limiter.
+// client-go reads the header from the answer a request finally gets, after
+// redirects were followed and retries were made, while a transport sees every
+// hop. A redirect, a 5xx or a 429 is often only a hop before that answer, so
+// one without RateLimit-Limit leaves the choice to a later response instead
+// of turning the limiter off for the whole run; a response that carries the
+// header always settles it.
+func settlesLimiter(resp *http.Response) bool {
+	if resp.Header.Get("RateLimit-Limit") != "" {
+		return true
+	}
+	code := resp.StatusCode
+	return code < 300 || (code >= 400 && code < 500 && code != http.StatusTooManyRequests)
 }
 
 // CloseIdleConnections forwards to the pooled transport. http.Client reaches
