@@ -416,39 +416,54 @@ func TestRead_OversizedBlobIDIgnored(t *testing.T) {
 	}
 }
 
-// utf16Drift is "a" in UTF-16LE with its byte order mark, as PowerShell 5
-// writes it: bytes that are not valid UTF-8.
-var utf16Drift = []byte{0xff, 0xfe, 0x61, 0x00}
+// textMisfits are drifted bytes the text content attribute cannot hold,
+// with what the warning says about each: "a" in UTF-16LE with its byte order
+// mark, as PowerShell 5 writes it, which is not valid UTF-8, and "café" with
+// a combining accent, as macOS tools may write it, which Terraform would
+// turn into its NFC form on the way into state.
+var textMisfits = []struct {
+	name, misfit string
+	drift        []byte
+}{
+	{name: "invalid UTF-8", misfit: "is not valid UTF-8", drift: []byte{0xff, 0xfe, 0x61, 0x00}},
+	{name: "not NFC", misfit: "a Unicode form other than NFC", drift: []byte("cafe\u0301\n")},
+}
 
-// utf16DriftFake holds f.txt drifted to utf16Drift in commit newlcid.
-func utf16DriftFake() *repoFake {
-	return &repoFake{files: map[string]string{"f.txt": "newlcid"}, content: map[string][]byte{"f.txt": utf16Drift}}
+// misfitDriftFake holds f.txt drifted to drift in commit newlcid.
+func misfitDriftFake(drift []byte) *repoFake {
+	return &repoFake{files: map[string]string{"f.txt": "newlcid"}, content: map[string][]byte{"f.txt": drift}}
 }
 
 // TestRead_TextMisfitDriftRecordedAsBase64: a file managed through the text
-// content attribute that drifts to invalid UTF-8 cannot be held there (cty
-// would silently turn the bytes into U+FFFD), and Read cannot see whether
-// the configuration has switched to content_base64. So the bytes land in
-// content_base64 with content null and a warning, and the refresh succeeds
-// with the new ids.
+// content attribute that drifts to bytes it cannot hold (cty would turn
+// invalid UTF-8 into U+FFFD, and text in another Unicode form into the NFC
+// form the configuration already has, hiding the drift for good), and Read
+// cannot see whether the configuration has switched to content_base64. So
+// the bytes land in content_base64 with content null and a warning, and the
+// refresh succeeds with the new ids.
 func TestRead_TextMisfitDriftRecordedAsBase64(t *testing.T) {
-	resp, out := runRead(t, utf16DriftFake().client(t), readState("oldblob"))
-	if resp.Diagnostics.HasError() {
-		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
-	}
-	wantDiag(t, "warning", resp.Diagnostics.Warnings(), `file "f.txt" is managed through `+"`content`")
-	if w := resp.Diagnostics.Warnings(); len(w) == 1 && !strings.Contains(w[0].Detail(), "manage the file through `content_base64`") {
-		t.Errorf("the warning must say how to keep the new bytes, got: %s", w[0].Detail())
-	}
-	f := out.Files["f.txt"]
-	if !f.Content.IsNull() {
-		t.Errorf("content = %q, want null", f.Content.ValueString())
-	}
-	if want := base64.StdEncoding.EncodeToString(utf16Drift); f.ContentBase64.ValueString() != want {
-		t.Errorf("content_base64 = %q, want the remote bytes %q", f.ContentBase64.ValueString(), want)
-	}
-	if f.BlobID.ValueString() != "blob-newlcid" || f.LastCommitID.ValueString() != "newlcid" {
-		t.Errorf("blob_id/last_commit_id = %q/%q, want blob-newlcid/newlcid", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+	for _, m := range textMisfits {
+		t.Run(m.name, func(t *testing.T) {
+			resp, out := runRead(t, misfitDriftFake(m.drift).client(t), readState("oldblob"))
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+			wantDiag(t, "warning", resp.Diagnostics.Warnings(), `file "f.txt" is managed through `+"`content`")
+			if w := resp.Diagnostics.Warnings(); len(w) == 1 && (!strings.Contains(w[0].Detail(), m.misfit) ||
+				!strings.Contains(w[0].Detail(), "manage the file through `content_base64`")) {
+				t.Errorf("the warning must say why (%q) and how to keep the new bytes, got: %s", m.misfit, w[0].Detail())
+			}
+			f := out.Files["f.txt"]
+			if !f.Content.IsNull() {
+				t.Errorf("content = %q, want null", f.Content.ValueString())
+			}
+			if want := base64.StdEncoding.EncodeToString(m.drift); f.ContentBase64.ValueString() != want {
+				t.Errorf("content_base64 = %q, want the remote bytes %q", f.ContentBase64.ValueString(), want)
+			}
+			if f.BlobID.ValueString() != "blob-newlcid" || f.LastCommitID.ValueString() != "newlcid" {
+				t.Errorf("blob_id/last_commit_id = %q/%q, want blob-newlcid/newlcid", f.BlobID.ValueString(), f.LastCommitID.ValueString())
+			}
+		})
 	}
 }
 
@@ -467,46 +482,48 @@ func TestTextMisfitDrift_Converges(t *testing.T) {
 		return refreshed
 	}
 
-	t.Run("restore the configured text", func(t *testing.T) {
-		fake := utf16DriftFake()
-		client := fake.client(t)
-		refreshed := refresh(t, client)
+	for _, m := range textMisfits {
+		t.Run(m.name+", restore the configured text", func(t *testing.T) {
+			fake := misfitDriftFake(m.drift)
+			client := fake.client(t)
+			refreshed := refresh(t, client)
 
-		resp := runUpdate(t, client, readState("oldblob"), refreshed)
-		if resp.Diagnostics.HasError() {
-			t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
-		}
-		commits, _, _ := fake.recorded()
-		if want := [][]string{{"update:f.txt@newlcid"}}; !slices.EqualFunc(commits, want, slices.Equal[[]string]) {
-			t.Errorf("commits = %q, want %q", commits, want)
-		}
-		var out filesResourceModel
-		if d := resp.State.Get(t.Context(), &out); d.HasError() {
-			t.Fatalf("state.Get: %v", d)
-		}
-		if f := out.Files["f.txt"]; f.Content.ValueString() != "old" || !f.ContentBase64.IsNull() {
-			t.Errorf("state content/content_base64 = %s/%s, want \"old\"/null", f.Content, f.ContentBase64)
-		}
-	})
+			resp := runUpdate(t, client, readState("oldblob"), refreshed)
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+			commits, _, _ := fake.recorded()
+			if want := [][]string{{"update:f.txt@newlcid"}}; !slices.EqualFunc(commits, want, slices.Equal[[]string]) {
+				t.Errorf("commits = %q, want %q", commits, want)
+			}
+			var out filesResourceModel
+			if d := resp.State.Get(t.Context(), &out); d.HasError() {
+				t.Fatalf("state.Get: %v", d)
+			}
+			if f := out.Files["f.txt"]; f.Content.ValueString() != "old" || !f.ContentBase64.IsNull() {
+				t.Errorf("state content/content_base64 = %s/%s, want \"old\"/null", f.Content, f.ContentBase64)
+			}
+		})
 
-	t.Run("keep the new bytes", func(t *testing.T) {
-		fake := utf16DriftFake()
-		client := fake.client(t)
-		refreshed := refresh(t, client)
+		t.Run(m.name+", keep the new bytes", func(t *testing.T) {
+			fake := misfitDriftFake(m.drift)
+			client := fake.client(t)
+			refreshed := refresh(t, client)
 
-		plan := readState("oldblob")
-		f := plan.Files["f.txt"]
-		f.Content = types.StringNull()
-		f.ContentBase64 = types.StringValue(base64.StdEncoding.EncodeToString(utf16Drift))
-		plan.Files["f.txt"] = f
-		resp := runUpdate(t, client, plan, refreshed)
-		if resp.Diagnostics.HasError() {
-			t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
-		}
-		if commits, _, _ := fake.recorded(); len(commits) != 0 {
-			t.Errorf("commits = %q, want none", commits)
-		}
-	})
+			plan := readState("oldblob")
+			f := plan.Files["f.txt"]
+			f.Content = types.StringNull()
+			f.ContentBase64 = types.StringValue(base64.StdEncoding.EncodeToString(m.drift))
+			plan.Files["f.txt"] = f
+			resp := runUpdate(t, client, plan, refreshed)
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+			}
+			if commits, _, _ := fake.recorded(); len(commits) != 0 {
+				t.Errorf("commits = %q, want none", commits)
+			}
+		})
+	}
 }
 
 // TestRead_UnchangedBlobSkipsGetFile pins the core drift-detection invariant:

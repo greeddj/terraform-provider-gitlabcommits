@@ -2475,6 +2475,37 @@ func TestCreate_AdoptDifferentContentUpdates(t *testing.T) {
 	}
 }
 
+// TestCreate_AdoptNonNFCRemoteUpdates: Terraform hands the provider every
+// string in Unicode NFC, so a remote file holding the same text in another
+// form (a combining accent, as macOS tools may write it) differs bytewise
+// from the plan. Adoption compares bytes, so it commits the configured NFC
+// text instead of taking the file for identical.
+func TestCreate_AdoptNonNFCRemoteUpdates(t *testing.T) {
+	var posts atomic.Int32
+	var body string
+	client := adoptServer(t, "cafe\u0301", &posts, &body)
+
+	plan := readState("ignored")
+	f := plan.Files["f.txt"]
+	f.Content = types.StringValue("caf\u00e9")
+	plan.Files["f.txt"] = f
+	resp := runCreate(t, client, plan)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("commit POSTs = %d, want 1", got)
+	}
+	var opts gitlab.CreateCommitOptions
+	if err := json.Unmarshal([]byte(body), &opts); err != nil {
+		t.Fatalf("decoding the commit body: %v", err)
+	}
+	if len(opts.Actions) != 1 || *opts.Actions[0].Action != gitlab.FileUpdate || opts.Actions[0].Content == nil ||
+		*opts.Actions[0].Content != "caf\u00e9" {
+		t.Errorf("want one update committing the NFC text, body: %s", body)
+	}
+}
+
 // TestCreate_AdoptIdenticalBesideNewPathCommitsOnlyTheNewPath: one path that
 // already matches the plan and one that does not exist yet make a single
 // commit carrying only the create. The adopted path is never probed at the

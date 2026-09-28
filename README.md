@@ -42,9 +42,10 @@ branch of one project. The provider:
   bit with state. Only when the blob has actually drifted does it pull the
   full content. Any drift updates state, so the next plan shows real
   differences against the repo. A file managed through `content` that
-  drifts to bytes that are not valid UTF-8 is recorded in `content_base64`
-  instead, with a warning: the next apply restores the configured text, and
-  switching the file to `content_base64` keeps the new bytes.
+  drifts to bytes that are not valid UTF-8, or to text in a Unicode form
+  other than NFC (see Limits), is recorded in `content_base64` instead, with
+  a warning: the next apply restores the configured text, and switching the
+  file to `content_base64` keeps the new bytes.
 - **Update** - diffs plan vs state and emits the **minimum** set of actions:
   gone paths -> `delete` (emitted first), new paths -> `create`, or nothing
   when the path already exists with identical content, content changed ->
@@ -162,7 +163,7 @@ to `https://gitlab.com` when that is empty or unset too.
 | `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. Read from the state of the last apply; see Caveats. |
 | `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist, or to no action when their content already matches (needed for clean import). A path that cannot be read fails the apply without a commit. |
 | `optimistic_lock` | bool | no | Default `true`. Send each managed file's `last_commit_id`, as the last refresh or apply recorded it (for a file the apply adopts, as its probe during the apply reads it), so GitLab rejects the commit with HTTP 400 and the apply fails when the file changed after that point; with `detect_drift = true` a change made before the plan's refresh shows up in the plan and is overwritten by applying it (see Caveats). Set to `false` to opt out. Not sent on the first commit of a branch created from `create_branch_from`. For the destroy commit, read from the state of the last apply. |
-| `files` | map of object | yes | See below. Must not be empty: `files = {}` would mean "delete everything", which is what `terraform destroy` is for. An entry must not be null; omit its key to leave a file out. |
+| `files` | map of object | yes | See below. Must not be empty: `files = {}` would mean "delete everything", which is what `terraform destroy` is for. An entry must not be null; omit its key to leave a file out. Keys are normalised to Unicode NFC, so a path stored in another form cannot be addressed (see Limits). |
 | `id` | string | computed | Composite identifier `<project_id>::<branch>`. |
 | `commit_sha` | string | computed | SHA of the most recent commit produced by this resource. A plan that adds and removes no file and leaves every file's `content`, `content_base64` and `execute_filemode` as they are (all known at plan time) keeps it known. |
 
@@ -170,7 +171,7 @@ to `https://gitlab.com` when that is empty or unset too.
 
 | Field | Type | Computed | Notes |
 | --- | --- | --- | --- |
-| `content` | string | no | text content; mutually exclusive with `content_base64`; drift to bytes that are not valid UTF-8 is recorded in `content_base64` (see Read above) |
+| `content` | string | no | text content; mutually exclusive with `content_base64`; normalised to Unicode NFC by Terraform, so text that must keep another form needs `content_base64`; drift to bytes that are not valid UTF-8 or text that is not NFC is recorded in `content_base64` (see Read above) |
 | `content_base64` | string | no | base64-encoded content (use for binaries); mutually exclusive with `content` |
 | `execute_filemode` | bool | no | default `false`; toggling triggers a `chmod` action |
 | `blob_id` | string | yes | opaque blob identifier returned by GitLab; used for drift detection (git SHA-1 today, possibly SHA-256 on SHA-256 repos) |
@@ -182,9 +183,13 @@ to `https://gitlab.com` when that is empty or unset too.
   `project_id`, `branch`, `file_path`. Outputs: `content` (null when the file
   is not valid UTF-8), `content_base64` (always set), `blob_id`,
   `last_commit_id`, `execute_filemode`, `size`. Useful for comparing rendered
-  HCL with what is committed. The content and size are those of the git blob
-  stored at the path: for a Git LFS-tracked file the LFS pointer, not the
-  object, and for a symlink the link target.
+  HCL with what is committed. Terraform normalises strings to Unicode NFC,
+  so for text in another form `content` differs bytewise from the file;
+  `content_base64` is the byte-exact form, the one to hand to a
+  `gitlabcommits_files` resource that should reproduce the file exactly.
+  The content and size are those of the git blob stored at the path: for a
+  Git LFS-tracked file the LFS pointer, not the object, and for a symlink
+  the link target.
 - `gitlabcommits_branch_head` returns `commit_sha` and `protected` for a
   branch, e.g. to wire downstream pipelines to the exact SHA terraform saw.
 
@@ -474,6 +479,15 @@ converges without a commit.
   changed while the commit was being created" or "Concurrent modification
   detected", and both diagnostics say how to check for the tag
   (`git ls-remote <remote> refs/tags/<branch>`). Rename or delete the tag.
+- **Unicode normalisation.** Terraform normalises every string, map keys
+  included, to Unicode NFC. A repository path stored in another form (for
+  example NFD, as some macOS tools write names) cannot be addressed: a
+  `files` key naming it refers to the NFC spelling, which git treats as a
+  different path, so the apply creates a second file that looks the same and
+  leaves the original unmanaged. File content in another form needs
+  `content_base64`; a file managed through `content` that drifts to such text
+  is recorded in `content_base64` with a warning, and the next apply writes
+  the configured text back.
 
 ## Development
 

@@ -70,7 +70,11 @@ func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, r
 			"content": schema.StringAttribute{
 				Description: "Decoded text of the git blob stored at the path: for a Git LFS-tracked file the LFS pointer, " +
 					"not the object; for a symlink the link target. Null when the blob is not valid UTF-8 " +
-					"(Terraform strings cannot hold arbitrary bytes without corruption); use content_base64 for binaries.",
+					"(Terraform strings cannot hold arbitrary bytes without corruption); use content_base64 for binaries. " +
+					"Terraform normalises every string to Unicode NFC, so for text in another form (for example a combining " +
+					"accent, as macOS tools may write it) this value differs bytewise from the file. content_base64 is " +
+					"the byte-exact form: pass content_base64 = data.gitlabcommits_file.<name>.content_base64 to a " +
+					"gitlabcommits_files resource that should reproduce the file exactly.",
 				Computed: true,
 			},
 			"content_base64": schema.StringAttribute{
@@ -145,6 +149,9 @@ func (d *fileDataSource) Read(ctx context.Context, req datasource.ReadRequest, r
 
 	// cty silently mangles invalid UTF-8 (bytes become U+FFFD), so a binary
 	// file must surface as a null content, not corrupted-but-plausible text.
+	// Valid text is kept even where cty normalises it to NFC: canonically
+	// equivalent text still serves jsondecode and the like, and
+	// content_base64 carries the exact bytes.
 	if utf8.Valid(raw) {
 		data.Content = types.StringValue(string(raw))
 	} else {

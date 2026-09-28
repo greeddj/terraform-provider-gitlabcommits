@@ -138,6 +138,31 @@ func TestFileDataSource_BinaryContentNull(t *testing.T) {
 	}
 }
 
+// TestFileDataSource_NonNFCTextKeepsContent: valid text in a Unicode form
+// other than NFC still sets content, which serves jsondecode and the like
+// once Terraform has normalised it to NFC, while content_base64 keeps the
+// file's exact bytes.
+func TestFileDataSource_NonNFCTextKeepsContent(t *testing.T) {
+	nfd := []byte("cafe\u0301\n")
+	encoded := base64.StdEncoding.EncodeToString(nfd)
+	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"file_path":"f.bin","size":7,"encoding":"base64","content":"` +
+			encoded + `","blob_id":"blob123","last_commit_id":"lcid123"}`))
+	})
+
+	resp, out := runFileDataSourceRead(t, client)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
+	}
+	if out.Content.ValueString() != string(nfd) {
+		t.Errorf("content = %q, want the text %q", out.Content.ValueString(), nfd)
+	}
+	if out.ContentBase64.ValueString() != encoded {
+		t.Errorf("content_base64 = %q, want the exact bytes %q", out.ContentBase64.ValueString(), encoded)
+	}
+}
+
 // TestFileDataSource_DecodeErrorSurfaces: an unknown encoding fails loudly
 // instead of passing the wire string through.
 func TestFileDataSource_DecodeErrorSurfaces(t *testing.T) {

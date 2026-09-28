@@ -26,7 +26,8 @@ output "renovate_blob_id" {
 }
 
 output "renovate_content" {
-  # Null for binary (non-UTF-8) files; content_base64 is always set.
+  # Null for binary (non-UTF-8) files. Terraform normalises text to Unicode
+  # NFC; content_base64 is always set and keeps the file's exact bytes.
   value = data.gitlabcommits_file.renovate_config.content
 }
 ```
@@ -43,7 +44,7 @@ output "renovate_content" {
 ### Read-Only
 
 - `blob_id` (String) Opaque blob identifier returned by GitLab (git SHA-1 today, possibly SHA-256 on SHA-256 repositories).
-- `content` (String) Decoded text of the git blob stored at the path: for a Git LFS-tracked file the LFS pointer, not the object; for a symlink the link target. Null when the blob is not valid UTF-8 (Terraform strings cannot hold arbitrary bytes without corruption); use content_base64 for binaries.
+- `content` (String) Decoded text of the git blob stored at the path: for a Git LFS-tracked file the LFS pointer, not the object; for a symlink the link target. Null when the blob is not valid UTF-8 (Terraform strings cannot hold arbitrary bytes without corruption); use content_base64 for binaries. Terraform normalises every string to Unicode NFC, so for text in another form (for example a combining accent, as macOS tools may write it) this value differs bytewise from the file. content_base64 is the byte-exact form: pass content_base64 = data.gitlabcommits_file.<name>.content_base64 to a gitlabcommits_files resource that should reproduce the file exactly.
 - `content_base64` (String) Base64-encoded bytes of the git blob stored at the path. Always set. For a Git LFS-tracked file this is the LFS pointer, not the object; for a symlink it is the link target.
 - `execute_filemode` (Boolean) Whether the file has the executable bit set in the repo.
 - `last_commit_id` (String) SHA of the most recent commit that touched this file.

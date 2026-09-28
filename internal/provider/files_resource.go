@@ -33,6 +33,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/text/unicode/norm"
 )
 
 // refreshParallelism caps concurrent GitLab API calls within one resource
@@ -435,7 +436,10 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					"key to leave a file out. A plan shows blob_id and last_commit_id as known after apply only for a file it " +
 					"adds, a file whose content, content_base64 or execute_filemode it changes (a switch between content and " +
 					"content_base64 of the same bytes included, though that commits nothing), and a file whose values are " +
-					"not known until apply.",
+					"not known until apply. Terraform normalises map keys, like every string, to Unicode NFC, so a path the " +
+					"repository stores in another form (for example NFD, as macOS tools may write names) cannot be " +
+					"addressed: a key naming it refers to the NFC spelling, which git treats as another path, and the " +
+					"apply creates a second file under that spelling.",
 				Required: true,
 				Validators: []validator.Map{
 					mapNonEmpty(),
@@ -453,9 +457,11 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 							Description: "Text content. Mutually exclusive with content_base64. Not intended for secret " +
 								"values: it is stored in plaintext in state and printed in plan / apply output (and thus CI logs). " +
 								"Deliver secrets via SealedSecrets / ExternalSecrets / Vault and reference them from the managed file. " +
-								"When the file drifts to bytes that are not valid UTF-8, which content cannot hold, a refresh " +
-								"records them in content_base64 instead, with a warning: the next apply restores this content, " +
-								"and switching the file to content_base64 keeps the new bytes.",
+								"Terraform normalises every string to Unicode NFC, so text that must keep another form byte for " +
+								"byte (for example a combining accent) needs content_base64. " +
+								"When the file drifts to bytes content cannot hold (not valid UTF-8, or text in a form other than " +
+								"NFC), a refresh records them in content_base64 instead, with a warning: the next apply restores " +
+								"this content, and switching the file to content_base64 keeps the new bytes.",
 							Optional: true,
 							Validators: []validator.String{
 								stringConflictsWithSibling("content_base64"),
@@ -987,12 +993,18 @@ func setRemoteContent(f *fileModel, raw []byte) (misfit string) {
 }
 
 // textContentMisfit says why raw cannot be held in the text `content`
-// attribute, or returns "" when it can. cty replaces invalid UTF-8 with
-// U+FFFD, so such bytes stored as text would be corrupted in state and the
-// diff could never converge.
+// attribute, or returns "" when it can. Terraform core builds every string
+// through cty, which replaces invalid UTF-8 with U+FFFD and normalises valid
+// text to Unicode NFC. Invalid bytes stored as text would be corrupted in
+// state and the diff could never converge; text in another form would reach
+// state as the configured NFC text next to the blob_id of the bytes GitLab
+// holds, so the drift would vanish and never be refreshed again.
 func textContentMisfit(raw []byte) string {
-	if !utf8.Valid(raw) {
+	switch {
+	case !utf8.Valid(raw):
 		return "is not valid UTF-8"
+	case !norm.NFC.IsNormal(raw):
+		return "is text in a Unicode form other than NFC (Terraform normalises every string to NFC)"
 	}
 	return ""
 }
