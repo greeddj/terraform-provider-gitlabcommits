@@ -45,7 +45,8 @@ branch of one project. The provider:
   drifts to bytes that are not valid UTF-8, or to text in a Unicode form
   other than NFC (see Limits), is recorded in `content_base64` instead, with
   a warning: the next apply restores the configured text, and switching the
-  file to `content_base64` keeps the new bytes.
+  file to `content_base64` keeps the new bytes. A Git LFS pointer that names
+  the content in state is no drift (see Limits).
 - **Update** - diffs plan vs state and emits the **minimum** set of actions:
   gone paths -> `delete` (emitted first), new paths -> `create`, or nothing
   when the path already exists with identical content, content changed ->
@@ -252,7 +253,8 @@ state. The next plan will produce `create` actions for every file; with
 `adopt_existing = true` (default) those that already exist in the repo are
 compared with the plan: identical content needs no action, differing content
 becomes an `update`. A configuration that matches the repository therefore
-converges without a commit.
+converges without a commit; a Git LFS-tracked file matches when its pointer
+names the configured bytes (see Limits).
 
 ## Caveats worth knowing
 
@@ -479,6 +481,21 @@ converges without a commit.
   changed while the commit was being created" or "Concurrent modification
   detected", and both diagnostics say how to check for the tag
   (`git ls-remote <remote> refs/tags/<branch>`). Rename or delete the tag.
+- **Git LFS.** GitLab's commits API turns only a created file into an LFS
+  object and commits an update as a regular blob, so a Git LFS-tracked file
+  that a resource updates leaves LFS. The Files API returns an LFS-tracked
+  file's pointer rather than its content, and the provider sees that pointer
+  only where it reads content anyway (adopting a path, and a refresh of a
+  file that changed), so the default path makes no extra request. A pointer
+  that names exactly the configured bytes (SHA-256 and size) counts as the
+  same file on adoption, which then makes no commit, and one that names the
+  bytes in state is no drift on a refresh. A pointer to other content fails
+  the adoption with nothing committed; a refresh records the pointer text
+  in state with a warning, and an apply then refuses to change the file's
+  content or `execute_filemode` while state holds the pointer. Configuring
+  the content the pointer names, with `execute_filemode` as the branch has
+  it, records it without a commit. Change LFS-tracked files with git and
+  Git LFS.
 - **Unicode normalisation.** Terraform normalises every string, map keys
   included, to Unicode NFC. A repository path stored in another form (for
   example NFD, as some macOS tools write names) cannot be addressed: a

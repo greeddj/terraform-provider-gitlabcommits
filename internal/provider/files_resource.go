@@ -6,12 +6,15 @@ package provider
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
 	"net"
 	"net/http"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -272,7 +275,12 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"with a warning, so a file can move from one resource to another in one apply, and a replacement under " +
 			"create_before_destroy keeps the files the new object took over. A delete commit already in flight is " +
 			"waited for only when both resources spell project_id the same way. Later runs are not covered, a re-run " +
-			"of a failed apply included.",
+			"of a failed apply included. " +
+			"Git LFS: GitLab's commits API turns only a created file into an LFS object and commits an update as a " +
+			"regular blob, so an LFS-tracked file this resource updates leaves LFS. Where the provider reads a file's " +
+			"LFS pointer it compares the object the pointer names with the configured bytes when adopting a path and " +
+			"with the bytes in state when refreshing a changed file, and it refuses to change a file whose pointer " +
+			"names other content; see the provider documentation's Limits section.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Description: "Composite identifier: \"<project_id>::<branch>\".",
@@ -962,6 +970,25 @@ func (r *filesResource) Read(ctx context.Context, req resource.ReadRequest, resp
 			f.LastCommitID = types.StringValue(res.file.LastCommitID)
 		}
 		f.ExecuteFilemode = types.BoolValue(res.file.ExecuteFilemode)
+		// The Files API returns a Git LFS-tracked file's pointer, not the
+		// file: a pointer to the content state holds is no drift, and one to
+		// other content is recorded as it is, since the object is never
+		// read, and Update then refuses to write over it (see diffActions).
+		if ptr, ok := parseLFSPointer(raw); ok {
+			held, err := f.rawBytes()
+			if err == nil && ptr.names(held) {
+				state.Files[p] = f
+				continue
+			}
+			if err != nil || !bytes.Equal(held, raw) {
+				resp.Diagnostics.AddWarning("Remote file is a Git LFS pointer",
+					fmt.Sprintf("file %q on branch %q holds a Git LFS pointer to other content than state records (%s), "+
+						"so state records the pointer text. %san apply refuses to change the file while state holds its "+
+						"pointer. Change the file with git and Git LFS, or configure the content the pointer names and "+
+						"execute_filemode as the branch has it, which the next apply records without a commit.",
+						p, branch, ptr, lfsUpdateNote))
+			}
+		}
 		if misfit := setRemoteContent(&f, raw); misfit != "" {
 			resp.Diagnostics.AddWarning("Remote file recorded as content_base64",
 				fmt.Sprintf("file %q is managed through `content`, but its content on branch %q %s, which `content` cannot "+
@@ -1324,8 +1351,10 @@ func parseImportID(s string) (project, branch string, err error) {
 // is created must not have a directory in its place (see probeAdded). When
 // optimistic_lock is enabled, update / delete / chmod actions carry the
 // file's previously-known last_commit_id so GitLab rejects the action if the
-// file was concurrently modified. Every failure is an error on the file it
-// concerns, and nothing is committed.
+// file was concurrently modified. A file whose state holds a Git LFS pointer
+// (see Read) is compared by the object the pointer names and is neither
+// updated nor chmodded (see errLFSPointer). Every failure is an error on the
+// file it concerns, and nothing is committed.
 func (r *filesResource) diffActions(ctx context.Context, plan, state filesResourceModel) ([]*gitlab.CommitActionOptions, map[string]remoteProbe, diag.Diagnostics) {
 	actions := make([]*gitlab.CommitActionOptions, 0)
 	useLock := plan.optimisticLock()
@@ -1385,6 +1414,30 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 		if err != nil {
 			return nil, nil, fileActionDiags(p, err)
 		}
+		planExec := pf.ExecuteFilemode.ValueBool()
+		stateExec := sf.ExecuteFilemode.ValueBool()
+		if changed || planExec != stateExec {
+			if ptr, ok := statePointer(sf); ok {
+				// State holds the pointer a refresh read in place of the
+				// file, so the pointer is what the branch holds: a plan of
+				// the object it names changes no content, as for adoption.
+				// Nothing else is written, a chmod included, since state
+				// knows no content of the file until the configuration
+				// names the object and an apply records it.
+				raw, err := pf.rawBytes()
+				if err != nil {
+					return nil, nil, fileActionDiags(p, err)
+				}
+				changed = changed && !ptr.names(raw)
+				if changed || planExec != stateExec {
+					return nil, nil, fileActionDiags(p, fmt.Errorf("%w (%s), which a refresh recorded in state in place "+
+						"of the file's content. %sthe provider changes no file while state holds its pointer: updating it "+
+						"would move it out of Git LFS. Change the file with git and Git LFS, or configure the content the "+
+						"pointer names and execute_filemode as the branch has it, which the next apply records without a "+
+						"commit", errLFSPointer, ptr, lfsUpdateNote))
+				}
+			}
+		}
 		if changed {
 			a, err := buildAction(p, pf, gitlab.FileUpdate, lastCommitID)
 			if err != nil {
@@ -1393,8 +1446,6 @@ func (r *filesResource) diffActions(ctx context.Context, plan, state filesResour
 			actions = append(actions, a)
 		}
 
-		planExec := pf.ExecuteFilemode.ValueBool()
-		stateExec := sf.ExecuteFilemode.ValueBool()
 		if planExec != stateExec {
 			chmod := &gitlab.CommitActionOptions{
 				Action:          new(gitlab.FileChmod),
@@ -1438,8 +1489,12 @@ func (r *filesResource) createActions(ctx context.Context, plan filesResourceMod
 // fileActionDiags reports a file that cannot be turned into a commit action;
 // Create and Update share it so one cause reads the same in both.
 func fileActionDiags(p string, err error) diag.Diagnostics {
+	summary := "Cannot build the commit action for a file"
+	if errors.Is(err, errLFSPointer) {
+		summary = "File is stored in Git LFS"
+	}
 	return diag.Diagnostics{diag.NewAttributeErrorDiagnostic(path.Root("files").AtMapKey(p),
-		"Cannot build the commit action for a file", fmt.Sprintf("file %q: %s. Nothing was committed.", p, err))}
+		summary, fmt.Sprintf("file %q: %s. Nothing was committed.", p, err))}
 }
 
 // addedPaths lists, sorted, the paths the plan manages and state does not:
@@ -1580,7 +1635,10 @@ func checkFileIDs(f *gitlab.File) error {
 // The commits API honors execute_filemode only on create and chmod actions,
 // so an adopt-update cannot set the exec bit itself; when the remote bit
 // differs from the plan a companion chmod is emitted into the same commit,
-// keeping one-commit-per-apply intact.
+// keeping one-commit-per-apply intact. A remote Git LFS pointer is compared
+// by the object it names: the Files API returns the pointer, not the file,
+// so a pointer to the planned bytes matches, and a pointer to other content
+// is refused (see errLFSPointer).
 func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) ([]*gitlab.CommitActionOptions, error) {
 	op := gitlab.FileCreate
 	lastCommitID := ""
@@ -1613,7 +1671,16 @@ func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) (
 		if err != nil {
 			return nil, err
 		}
-		if bytes.Equal(raw, probe.content) {
+		identical := bytes.Equal(raw, probe.content)
+		if ptr, ok := parseLFSPointer(probe.content); ok && !identical {
+			if !ptr.names(raw) {
+				return nil, fmt.Errorf("%w to other content than configured (%s). %sadopting the file would move it out "+
+					"of Git LFS. Change the file with git and Git LFS, or configure the content the pointer names, which "+
+					"is adopted without a commit", errLFSPointer, ptr, lfsUpdateNote)
+			}
+			identical = true
+		}
+		if identical {
 			if chmod != nil {
 				return []*gitlab.CommitActionOptions{chmod}, nil
 			}
@@ -1629,6 +1696,89 @@ func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) (
 		actions = append(actions, chmod)
 	}
 	return actions, nil
+}
+
+// lfsPointerVersion is the first line of every Git LFS pointer file.
+const lfsPointerVersion = "version https://git-lfs.github.com/spec/v1"
+
+// maxLFSPointerSize bounds the blobs parseLFSPointer considers; git-lfs
+// itself never takes a larger blob for a pointer.
+const maxLFSPointerSize = 1024
+
+// errLFSPointer marks a change the provider refuses because the path holds
+// a Git LFS pointer (see lfsUpdateNote).
+var errLFSPointer = errors.New("the path holds a Git LFS pointer")
+
+// lfsUpdateNote says why a file stored as a Git LFS pointer is not updated:
+// GitLab runs its LFS conversion only for create actions
+// (Files::MultiService), so an update commits the configured bytes as a
+// regular blob in place of the pointer, and the file leaves LFS.
+const lfsUpdateNote = "GitLab's commits API turns only a created file into an LFS object and commits an update as a " +
+	"regular blob, so "
+
+// lfsPointer is the object a Git LFS pointer file names.
+type lfsPointer struct {
+	size int64
+	oid  [sha256.Size]byte
+}
+
+func (p lfsPointer) String() string {
+	return fmt.Sprintf("object sha256:%x, %d bytes", p.oid, p.size)
+}
+
+// names reports whether raw is the object p names.
+func (p lfsPointer) names(raw []byte) bool {
+	return int64(len(raw)) == p.size && sha256.Sum256(raw) == p.oid
+}
+
+// The lines of a Git LFS pointer after the version: any extension lines,
+// then the oid and the size, exactly as git-lfs writes and reads them.
+var (
+	lfsExtensionLine = regexp.MustCompile(`^ext-[0-9]+-\w+ sha256:[0-9a-f]{64}$`)
+	lfsOIDLine       = regexp.MustCompile(`^oid sha256:([0-9a-f]{64})$`)
+	lfsSizeLine      = regexp.MustCompile(`^size (0|[1-9][0-9]*)$`)
+)
+
+// parseLFSPointer reports whether raw is a Git LFS pointer file and returns
+// the object it names. The parse is as strict as git-lfs's own, so ordinary
+// content is never taken for a pointer: at most maxLFSPointerSize bytes of
+// lines that each end in a newline, lfsPointerVersion first, then any
+// extension lines, then the oid line and the size line, and nothing else.
+func parseLFSPointer(raw []byte) (lfsPointer, bool) {
+	var ptr lfsPointer
+	body, ok := bytes.CutSuffix(raw, []byte("\n"))
+	if !ok || len(raw) > maxLFSPointerSize {
+		return ptr, false
+	}
+	lines := strings.Split(string(body), "\n")
+	n := len(lines)
+	if n < 3 || lines[0] != lfsPointerVersion ||
+		slices.ContainsFunc(lines[1:n-2], func(l string) bool { return !lfsExtensionLine.MatchString(l) }) {
+		return ptr, false
+	}
+	oid, size := lfsOIDLine.FindStringSubmatch(lines[n-2]), lfsSizeLine.FindStringSubmatch(lines[n-1])
+	if oid == nil || size == nil {
+		return ptr, false
+	}
+	if _, err := hex.Decode(ptr.oid[:], []byte(oid[1])); err != nil {
+		return ptr, false
+	}
+	var err error
+	if ptr.size, err = strconv.ParseInt(size[1], 10, 64); err != nil {
+		return ptr, false
+	}
+	return ptr, true
+}
+
+// statePointer reports whether the content state holds for f is a Git LFS
+// pointer, as a refresh records it when the file changed in LFS out of band,
+// and returns the object it names.
+func statePointer(f fileModel) (lfsPointer, bool) {
+	held, err := f.rawBytes()
+	if err != nil {
+		return lfsPointer{}, false
+	}
+	return parseLFSPointer(held)
 }
 
 // probeEach runs probe for every path, fanned out at refreshParallelism.
