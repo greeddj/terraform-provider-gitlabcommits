@@ -94,13 +94,14 @@ func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaReque
 					"(plus Branch: Create when create_branch_from is used). A CI job token (CI_JOB_TOKEN) is rejected: the provider " +
 					"authenticates with the Private-Token header, which GitLab does not accept for a job token, and the job-token " +
 					"allowlist leaves out POST /repository/commits anyway. " +
-					"May also be provided via the GITLAB_TOKEN environment variable. See the provider documentation's Authentication section for details.",
+					"When unset or empty, the GITLAB_TOKEN environment variable is used. See the provider documentation's Authentication section for details.",
 				Optional:  true,
 				Sensitive: true,
 			},
 			"base_url": schema.StringAttribute{
-				Description: "GitLab base URL for self-hosted instances. Defaults to https://gitlab.com. May also be provided via GITLAB_BASE_URL environment variable.",
-				Optional:    true,
+				Description: "GitLab base URL for self-hosted instances. When unset or empty, the GITLAB_BASE_URL environment " +
+					"variable is used, and https://gitlab.com when that is unset or empty too.",
+				Optional: true,
 			},
 			"max_retries": schema.Int64Attribute{
 				Description: "Maximum number of retries on transient failures (5xx, 429) for read and probe requests. " +
@@ -172,13 +173,17 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 		return
 	}
 
+	// An empty string counts as unset, so a module variable defaulting to ""
+	// falls back to the environment instead of overriding it: an empty
+	// base_url would otherwise send a self-managed instance's token to
+	// gitlab.com, client-go's default.
 	token := os.Getenv("GITLAB_TOKEN")
-	if !config.Token.IsNull() {
-		token = config.Token.ValueString()
+	if v := config.Token.ValueString(); v != "" {
+		token = v
 	}
-	baseURL := os.Getenv("GITLAB_BASE_URL")
-	if !config.BaseURL.IsNull() {
-		baseURL = config.BaseURL.ValueString()
+	baseURL, baseURLSource := os.Getenv("GITLAB_BASE_URL"), "GITLAB_BASE_URL"
+	if v := config.BaseURL.ValueString(); v != "" {
+		baseURL, baseURLSource = v, "base_url"
 	}
 
 	if token == "" {
@@ -220,15 +225,11 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 		// The value is not echoed: it may carry a proxy's credentials.
 		u, err := url.Parse(baseURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			source := "base_url"
-			if config.BaseURL.IsNull() {
-				source = "GITLAB_BASE_URL"
-			}
 			resp.Diagnostics.AddAttributeError(
 				path.Root("base_url"),
 				"Invalid GitLab base URL",
 				fmt.Sprintf("The base URL from %s must be an absolute http:// or https:// URL with a host, for example "+
-					"https://gitlab.example.com", source),
+					"https://gitlab.example.com", baseURLSource),
 			)
 			return
 		}

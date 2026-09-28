@@ -56,7 +56,10 @@ The token's user (or the token itself, for Project/Group tokens) needs the
 
 Pass the token via the `GITLAB_TOKEN` environment variable or the `token`
 attribute on the provider block. In CI, prefer a CI variable such as
-`TF_VAR_gitlab_token` over committing the token.
+`TF_VAR_gitlab_token` over committing the token. An empty `token` counts as
+unset, so a module variable that defaults to `""` falls back to
+`GITLAB_TOKEN`. `base_url` falls back to `GITLAB_BASE_URL` the same way, and
+to `https://gitlab.com` when that is empty or unset too.
 
 The `write_repository` scope is for Git-over-HTTP (push/pull) and does
 **not** authenticate REST API calls; of the legacy scopes only `api` does.
@@ -122,8 +125,8 @@ leaves out `POST /repository/commits` anyway.
 
 ### Optional
 
-- `base_url` (String) GitLab base URL for self-hosted instances. Defaults to https://gitlab.com. May also be provided via GITLAB_BASE_URL environment variable.
+- `base_url` (String) GitLab base URL for self-hosted instances. When unset or empty, the GITLAB_BASE_URL environment variable is used, and https://gitlab.com when that is unset or empty too.
 - `max_retries` (Number) Maximum number of retries on transient failures (5xx, 429) for read and probe requests. The commit request (POST /repository/commits) is retried only on 429 and on connection failures that happen before the request is sent, never on 5xx, so one apply cannot land two commits. Default 5, at most 100. Set to 0 to disable retries entirely.
 - `retry_wait_max_ms` (Number) Sets the random jitter (ms) added to each rate-limited (429) retry wait, which is up to retry_wait_max_ms - retry_wait_min_ms; the total wait can exceed this value. Must not be below retry_wait_min_ms. Default 30000, at most 3600000 (one hour).
 - `retry_wait_min_ms` (Number) Base wait (ms) for rate-limited (429) retries. When GitLab sends a RateLimit-Reset header the wait lasts until the reset, or this value if that is longer; without the header it doubles with each attempt. 5xx and connection retries use client-go's linear schedule instead: 700-900 ms times the attempt number. Default 1000, at most 3600000 (one hour).
-- `token` (String, Sensitive) GitLab token used for REST API calls: a Personal, Project, or Group access token with the `api` scope, or a fine-grained personal access token (GitLab 19.2+) with Commit: Create, Repository: Read and Branch: Read (plus Branch: Create when create_branch_from is used). A CI job token (CI_JOB_TOKEN) is rejected: the provider authenticates with the Private-Token header, which GitLab does not accept for a job token, and the job-token allowlist leaves out POST /repository/commits anyway. May also be provided via the GITLAB_TOKEN environment variable. See the provider documentation's Authentication section for details.
+- `token` (String, Sensitive) GitLab token used for REST API calls: a Personal, Project, or Group access token with the `api` scope, or a fine-grained personal access token (GitLab 19.2+) with Commit: Create, Repository: Read and Branch: Read (plus Branch: Create when create_branch_from is used). A CI job token (CI_JOB_TOKEN) is rejected: the provider authenticates with the Private-Token header, which GitLab does not accept for a job token, and the job-token allowlist leaves out POST /repository/commits anyway. When unset or empty, the GITLAB_TOKEN environment variable is used. See the provider documentation's Authentication section for details.

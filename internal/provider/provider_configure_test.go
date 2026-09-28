@@ -264,6 +264,65 @@ func TestConfigure_TokenSourcing(t *testing.T) {
 	})
 }
 
+// TestConfigure_EmptySettingsCountAsUnset: a module passing a variable that
+// defaults to "" must not override the environment. An empty base_url that
+// won would point the client at gitlab.com, client-go's default, and send a
+// self-managed instance's token there; an empty token that won would fail
+// with advice to export the GITLAB_TOKEN already exported.
+func TestConfigure_EmptySettingsCountAsUnset(t *testing.T) {
+	empty := tftypes.NewValue(tftypes.String, "")
+	t.Run("empty token, GITLAB_TOKEN set", func(t *testing.T) {
+		srv, seen := tokenCapture(t)
+		t.Setenv("GITLAB_TOKEN", "envtok")
+		t.Setenv("GITLAB_BASE_URL", "")
+		client := configuredClient(t, map[string]tftypes.Value{
+			"token":    empty,
+			"base_url": tftypes.NewValue(tftypes.String, srv.URL),
+		})
+		if _, _, err := client.Branches.GetBranch("proj", "main", gitlab.WithContext(t.Context())); err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		if *seen != "envtok" {
+			t.Errorf("token sent = %q, want the environment token", *seen)
+		}
+	})
+	t.Run("empty token, GITLAB_TOKEN unset", func(t *testing.T) {
+		t.Setenv("GITLAB_TOKEN", "")
+		t.Setenv("GITLAB_BASE_URL", "")
+		resp := runConfigure(t, map[string]tftypes.Value{"token": empty})
+		wantDiag(t, "error", resp.Diagnostics.Errors(), "Missing GitLab API Token")
+	})
+	t.Run("empty base_url, GITLAB_BASE_URL set", func(t *testing.T) {
+		srv, seen := tokenCapture(t)
+		t.Setenv("GITLAB_TOKEN", "envtok")
+		t.Setenv("GITLAB_BASE_URL", srv.URL)
+		client := configuredClient(t, map[string]tftypes.Value{"base_url": empty})
+		if got := client.BaseURL().String(); !strings.HasPrefix(got, srv.URL) {
+			t.Fatalf("base URL = %q, want it under %q", got, srv.URL)
+		}
+		if _, _, err := client.Branches.GetBranch("proj", "main", gitlab.WithContext(t.Context())); err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		if *seen != "envtok" {
+			t.Errorf("token sent = %q, want the environment token", *seen)
+		}
+	})
+	t.Run("empty base_url, GITLAB_BASE_URL unset", func(t *testing.T) {
+		t.Setenv("GITLAB_TOKEN", "envtok")
+		t.Setenv("GITLAB_BASE_URL", "")
+		client := configuredClient(t, map[string]tftypes.Value{"base_url": empty})
+		if got := client.BaseURL().String(); got != "https://gitlab.com/api/v4/" {
+			t.Errorf("base URL = %q, want the gitlab.com default", got)
+		}
+	})
+	t.Run("invalid GITLAB_BASE_URL behind an empty base_url", func(t *testing.T) {
+		t.Setenv("GITLAB_TOKEN", "envtok")
+		t.Setenv("GITLAB_BASE_URL", "gitlab.example.com")
+		resp := runConfigure(t, map[string]tftypes.Value{"base_url": empty})
+		wantDiag(t, "error", resp.Diagnostics.Errors(), "from GITLAB_BASE_URL")
+	})
+}
+
 func TestConfigure_RejectsMalformedInputs(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
 	t.Setenv("GITLAB_BASE_URL", "")

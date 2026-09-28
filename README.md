@@ -108,8 +108,8 @@ provider "gitlabcommits" {
 
 | Argument | Default | Description |
 | --- | --- | --- |
-| `token` | `GITLAB_TOKEN` | Token for the REST API; see Authentication. |
-| `base_url` | `GITLAB_BASE_URL`, else `https://gitlab.com` | Base URL of a self-hosted instance. |
+| `token` | `GITLAB_TOKEN` | Token for the REST API; see Authentication. An empty string counts as unset. |
+| `base_url` | `GITLAB_BASE_URL`, else `https://gitlab.com` | Base URL of a self-hosted instance. An empty string counts as unset. |
 | `max_retries` | `5` | Retries on 429 and transient 5xx for read and probe requests. The commit request is retried only on 429 and on connection failures before it is sent (see Limits and retries). `0` disables retries; at most `100`. |
 | `retry_wait_min_ms` | `1000` | Base wait for 429 retries: until GitLab's `RateLimit-Reset` when it sends one (or this value, if longer), otherwise doubling per attempt. 5xx and connection retries wait 700-900 ms times the attempt number instead. At most `3600000` (one hour). |
 | `retry_wait_max_ms` | `30000` | Sets the random jitter added to each 429 wait, up to `retry_wait_max_ms - retry_wait_min_ms`; not a bound on the total wait. At most `3600000`. |
@@ -134,7 +134,10 @@ The token's user (or the token itself, for Project/Group tokens) needs the
 
 Pass the token via the `GITLAB_TOKEN` environment variable or the `token`
 attribute on the provider block. In CI, prefer a CI variable such as
-`TF_VAR_gitlab_token` over committing the token.
+`TF_VAR_gitlab_token` over committing the token. An empty `token` counts as
+unset, so a module variable that defaults to `""` falls back to
+`GITLAB_TOKEN`. `base_url` falls back to `GITLAB_BASE_URL` the same way, and
+to `https://gitlab.com` when that is empty or unset too.
 
 > The `write_repository` scope is for Git-over-HTTP (push/pull) and does
 > **not** authenticate REST API calls - of the legacy scopes only `api` does.

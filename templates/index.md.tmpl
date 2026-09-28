@@ -38,7 +38,10 @@ The token's user (or the token itself, for Project/Group tokens) needs the
 
 Pass the token via the `GITLAB_TOKEN` environment variable or the `token`
 attribute on the provider block. In CI, prefer a CI variable such as
-`TF_VAR_gitlab_token` over committing the token.
+`TF_VAR_gitlab_token` over committing the token. An empty `token` counts as
+unset, so a module variable that defaults to `""` falls back to
+`GITLAB_TOKEN`. `base_url` falls back to `GITLAB_BASE_URL` the same way, and
+to `https://gitlab.com` when that is empty or unset too.
 
 The `write_repository` scope is for Git-over-HTTP (push/pull) and does
 **not** authenticate REST API calls; of the legacy scopes only `api` does.
