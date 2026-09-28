@@ -1913,10 +1913,11 @@ func TestCommitOptions_AuthorPropagation(t *testing.T) {
 	}
 }
 
-// TestCreate_ExistingBranchSendsNoStartBranch: start_branch is only for
-// materialising a missing branch; on an existing branch GitLab would reject
-// it ("A branch called ... already exists").
-func TestCreate_ExistingBranchSendsNoStartBranch(t *testing.T) {
+// TestCreate_ExistingBranchSendsNoStartBranchOrSHA: a commit to an existing
+// branch carries neither start_branch nor start_sha, even with
+// create_branch_from set; the provider never sends start_branch, and
+// start_sha only creates a missing branch.
+func TestCreate_ExistingBranchSendsNoStartBranchOrSHA(t *testing.T) {
 	var commitBody string
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1946,8 +1947,13 @@ func TestCreate_ExistingBranchSendsNoStartBranch(t *testing.T) {
 	if resp := runCreate(t, client, plan); resp.Diagnostics.HasError() {
 		t.Fatalf("unexpected error: %v", resp.Diagnostics.Errors())
 	}
-	if strings.Contains(commitBody, "start_branch") {
-		t.Errorf("start_branch must not be sent when the branch exists, body: %s", commitBody)
+	if commitBody == "" {
+		t.Fatal("no commit was sent")
+	}
+	for _, field := range []string{"start_branch", "start_sha"} {
+		if strings.Contains(commitBody, field) {
+			t.Errorf("%s must not be sent when the branch exists, body: %s", field, commitBody)
+		}
 	}
 }
 
