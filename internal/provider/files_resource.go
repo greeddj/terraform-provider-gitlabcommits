@@ -1096,9 +1096,17 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	actions, _, diags = r.probeUnguarded(ctx, project, branch, actions, probes, !state.detectDrift(), "before the update commit")
+	var branchFound bool
+	actions, branchFound, diags = r.probeUnguarded(ctx, project, branch, actions, probes, !state.detectDrift(), "before the update commit")
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !branchFound {
+		// The probed paths went with the branch. Dropping their deletes
+		// would leave a zero-action apply that records every kept file on
+		// a branch that no longer exists.
+		resp.Diagnostics.AddError("Branch no longer exists", branchGoneDetail(state, project, branch, false))
 		return
 	}
 
@@ -1121,7 +1129,7 @@ func (r *filesResource) Update(ctx context.Context, req resource.UpdateRequest, 
 			// from the other rejections.
 			if hasStatus(err, http.StatusBadRequest) {
 				if found, checkErr := r.branchExists(ctx, project, branch); checkErr == nil && !found {
-					resp.Diagnostics.AddError("Branch no longer exists", branchGoneDetail(state, project, branch))
+					resp.Diagnostics.AddError("Branch no longer exists", branchGoneDetail(state, project, branch, true))
 					return
 				}
 			}
@@ -1262,14 +1270,19 @@ func (r *filesResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 	}
 }
 
-// branchGoneDetail explains an Update commit that GitLab refused because the
-// branch is gone, and how to recover: once a refresh has found the branch
-// gone it removes the resource from state, and the next apply creates it
-// again. A refresh while state records detect_drift = false leaves state as
-// it is, so the value has to be recorded first.
-func branchGoneDetail(state filesResourceModel, project, branch string) string {
+// branchGoneDetail explains an Update that found its branch gone, from
+// GitLab refusing the commit (refused) or from the probes before it, and how
+// to recover: once a refresh has found the branch gone it removes the
+// resource from state, and the next apply creates it again. A refresh while
+// state records detect_drift = false leaves state as it is, so the value has
+// to be recorded first.
+func branchGoneDetail(state filesResourceModel, project, branch string, refused bool) string {
+	outcome := "so nothing was committed"
+	if refused {
+		outcome = "so GitLab refused the commit and nothing was committed"
+	}
 	lead := fmt.Sprintf("branch %q no longer exists in project %q (deleted out of band, for example by merging a merge "+
-		"request that deletes its source branch), so GitLab refused the commit and nothing was committed. ", branch, project)
+		"request that deletes its source branch), %s. ", branch, project, outcome)
 	recreate := "the refresh finds the branch gone and removes the resource from state, and the apply then creates it " +
 		"again, materialising the branch from create_branch_from (set it if the resource has none)."
 	if state.detectDrift() {
@@ -1966,7 +1979,9 @@ func hasPathUnder(paths map[string]bool, dir string) bool {
 // token is kept, so a file changed out of band still fails the commit. A
 // delete whose path no longer holds a file is dropped; a chmod on one
 // fails. With the lock on, every token present and a refreshed state
-// nothing is probed. branchFound is as absentPaths reports it.
+// nothing is probed. branchFound is as absentPaths reports it; when it is
+// false the paths went with the branch, so no chmod is blamed on its file
+// and the caller reports the branch.
 func (r *filesResource) probeUnguarded(
 	ctx context.Context,
 	project, branch string,
@@ -1992,6 +2007,9 @@ func (r *filesResource) probeUnguarded(
 	absent, branchFound, diags := r.absentPaths(ctx, project, branch, paths, stage)
 	if diags.HasError() {
 		return nil, branchFound, diags
+	}
+	if !branchFound {
+		return withoutPaths(actions, absent), false, diags
 	}
 	next := "Refresh the state with detect_drift enabled and review the plan."
 	if unrefreshed {

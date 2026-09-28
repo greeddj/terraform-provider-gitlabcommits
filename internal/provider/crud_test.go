@@ -1153,6 +1153,11 @@ func TestDelete_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
 	}
 }
 
+// branchGoneUnsent is the lead of "Branch no longer exists" when the probes
+// before the commit found the branch gone, so no commit was sent.
+const branchGoneUnsent = `branch "main" no longer exists in project "proj" (deleted out of band, for example by ` +
+	`merging a merge request that deletes its source branch), so nothing was committed.`
+
 // TestUpdate_UnguardedDeleteAndChmodAreProbed: a delete or chmod without a
 // last_commit_id has no guard at GitLab, so its path is probed first; a
 // delete of a path that no longer holds a file is dropped and a chmod of one
@@ -1162,6 +1167,9 @@ func TestDelete_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
 // every delete is probed, a locked one included (GitLab would reject the
 // locked delete of a missing file on every apply), and once only, whether
 // the plan turns detect_drift back on (stale) or keeps it off (keepOff too).
+// A probed path gone together with its branch fails the update naming the
+// branch, rather than dropping the delete into an apply that commits
+// nothing and records the kept files on a branch that no longer exists.
 // Every plan drops rm.txt and sets run.sh's exec bit to chmod; adopt adds
 // new.sh, executable, with the content the branch already holds.
 func TestUpdate_UnguardedDeleteAndChmodAreProbed(t *testing.T) {
@@ -1309,6 +1317,30 @@ func TestUpdate_UnguardedDeleteAndChmodAreProbed(t *testing.T) {
 			branchStatus: http.StatusInternalServerError,
 			wantProbes:   []string{"rm.txt@main"},
 			wantError:    "Gitaly times out",
+		},
+		{
+			name:         "a token-less delete on a branch deleted since the plan reports the branch",
+			repo:         map[string]string{},
+			branchStatus: http.StatusNotFound,
+			wantProbes:   []string{"rm.txt@main"},
+			wantError:    branchGoneUnsent,
+		},
+		{
+			name:         "an unrefreshed locked delete on a branch deleted since the plan reports the branch",
+			lock:         true,
+			stale:        true,
+			repo:         map[string]string{},
+			branchStatus: http.StatusNotFound,
+			wantProbes:   []string{"rm.txt@main"},
+			wantError:    branchGoneUnsent,
+		},
+		{
+			name:         "a token-less chmod on a branch deleted since the plan reports the branch, not the file",
+			chmod:        true,
+			repo:         map[string]string{},
+			branchStatus: http.StatusNotFound,
+			wantProbes:   []string{"rm.txt@main", "run.sh@main"},
+			wantError:    branchGoneUnsent,
 		},
 	}
 
