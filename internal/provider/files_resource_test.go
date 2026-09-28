@@ -634,8 +634,13 @@ func TestApiErrorDiag(t *testing.T) {
 		{
 			name: "403", err: mkErr(403, "forbidden", nil),
 			wantSummary: "GitLab permission denied (HTTP 403)",
-			contains:    []string{"api", "Developer"},
-			absent:      []string{"CI_JOB_TOKEN"},
+			contains: []string{
+				"api", "Developer",
+				"Commit: Create, Repository: Read, Branch: Read and Project: Read, plus Branch: Create when create_branch_from is used",
+				"on GitLab.com, a top-level group that enforces",
+				"on GitLab Self-Managed, enforcement only stops legacy tokens from being created or rotated",
+			},
+			absent: []string{"CI_JOB_TOKEN", "group or instance"},
 		},
 		{
 			// CheckResponse answers every 404 with this one shared value, so it

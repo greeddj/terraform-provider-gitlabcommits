@@ -90,8 +90,8 @@ func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaReque
 		Attributes: map[string]schema.Attribute{
 			"token": schema.StringAttribute{
 				Description: "GitLab token used for REST API calls: a Personal, Project, or Group access token with the `api` scope, " +
-					"or a fine-grained personal access token (GitLab 19.2+) with Commit: Create, Repository: Read and Branch: Read " +
-					"(plus Branch: Create when create_branch_from is used). A CI job token (CI_JOB_TOKEN) is rejected: the provider " +
+					"or a fine-grained personal access token (GitLab 19.2+) with Commit: Create, Repository: Read, Branch: Read and " +
+					"Project: Read (plus Branch: Create when create_branch_from is used). A CI job token (CI_JOB_TOKEN) is rejected: the provider " +
 					"authenticates with the Private-Token header, which GitLab does not accept for a job token, and the job-token " +
 					"allowlist leaves out POST /repository/commits anyway. " +
 					"When unset or empty, the GITLAB_TOKEN environment variable is used. See the provider documentation's Authentication section for details.",

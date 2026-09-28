@@ -2773,9 +2773,13 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			summary = "GitLab permission denied (HTTP 403)"
 			return summary, fmt.Sprintf("%s: %s Body: %s", prefix,
 				"The token was rejected by GitLab. Verify that: "+
-					"(1) the token has the `api` scope, or the fine-grained permissions Commit: Create, Repository: Read and Branch: Read (write_repository alone does not authenticate REST API calls); "+
+					"(1) the token has the `api` scope (write_repository alone does not authenticate REST API calls), or the fine-grained permissions "+
+					"Commit: Create, Repository: Read, Branch: Read and Project: Read, plus Branch: Create when create_branch_from is used; "+
 					"(2) the token's user has the Developer role on the project, or Maintainer for a protected branch; "+
-					"(3) if your group or instance enforces fine-grained personal access tokens, a legacy `api` token is refused after the enforcement date and the body lists the permissions a fine-grained token needs.",
+					"(3) on GitLab.com, a top-level group that enforces fine-grained personal access tokens refuses a legacy personal access "+
+					"token after its enforcement date (on GitLab Self-Managed, enforcement only stops legacy tokens from being created or "+
+					"rotated). When a fine-grained permission is missing, or enforcement refused a legacy token, the body names the "+
+					"permissions the request needs.",
 				body)
 		case 400, 409:
 			if isLockConflict(err) {
