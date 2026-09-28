@@ -36,7 +36,10 @@ branch of one project. The provider:
   and the files are compared with that commit and the branch created from
   it, even if the source branch moves in the meantime. In a repository with
   no commits yet, leave `create_branch_from` unset: the first commit creates
-  the branch.
+  the branch. Another resource that starts its branch from that commit sets
+  `create_branch_from` to that branch and needs `depends_on` on the first
+  resource: nothing else orders the two, and GitLab refuses a first commit
+  once another one has landed.
 - **Read** - probes each managed file via a HEAD-style metadata call
   (`GetFileMetaData`) and compares the GitLab-returned `blob_id` and exec
   bit with state. Only when the blob has actually drifted does it pull the
@@ -165,7 +168,7 @@ to `https://gitlab.com` when that is empty or unset too.
 | `commit_message` | string | yes | Used for any commit produced (create / update / destroy). |
 | `author_name` | string | no | Override commit author name. |
 | `author_email` | string | no | Override commit author email. |
-| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit, or on its own when there is nothing to commit. A branch name is resolved to its head commit once, when the resource is created. Must be unset in a repository with no commits yet. The branch is not deleted on destroy. |
+| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit, or on its own when there is nothing to commit. A branch name is resolved to its head commit once, when the resource is created. In a repository with no commits yet, leave it unset on the resource that makes the first commit; another resource branching from that commit names that branch here and needs `depends_on` on that resource. The branch is not deleted on destroy. |
 | `detect_drift` | bool | no | Default `true`. If false, Read is a no-op. A refresh reads the value from state, so a new value affects refreshes only once an apply has recorded it; see Caveats. |
 | `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. Read from the state of the last apply; see Caveats. |
 | `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist, or to no action when their content already matches (needed for clean import). A path that cannot be read fails the apply without a commit. |

@@ -1439,8 +1439,9 @@ func TestUpdate_NoOpProducesNoCommit(t *testing.T) {
 // lookup 404s and no ref exists to branch from. Without create_branch_from,
 // Create sends one commit naming the branch alone, which GitLab makes the
 // root commit together with the branch; nothing can exist yet, so nothing is
-// probed before it. With create_branch_from set the ref cannot exist, and
-// Create says to remove it rather than ignoring it.
+// probed before it. With create_branch_from set the ref cannot exist yet,
+// and Create says to order this resource after the one that makes the first
+// commit, or to remove create_branch_from, rather than ignoring it.
 func TestCreate_EmptyRepository(t *testing.T) {
 	for _, withFrom := range []bool{false, true} {
 		t.Run(fmt.Sprintf("create_branch_from set %v", withFrom), func(t *testing.T) {
@@ -1471,8 +1472,13 @@ func TestCreate_EmptyRepository(t *testing.T) {
 			}
 			resp := runCreate(t, client, plan)
 			if withFrom {
-				if !resp.Diagnostics.HasError() || !strings.Contains(resp.Diagnostics.Errors()[0].Detail(), "remove create_branch_from") {
-					t.Fatalf("want the diagnostic to say to remove create_branch_from, got: %v", resp.Diagnostics)
+				if !resp.Diagnostics.HasError() {
+					t.Fatal("want an error for create_branch_from on an empty repository")
+				}
+				for _, want := range []string{"add depends_on on that resource", "remove create_branch_from"} {
+					if detail := resp.Diagnostics.Errors()[0].Detail(); !strings.Contains(detail, want) {
+						t.Errorf("detail must mention %q, got: %s", want, detail)
+					}
 				}
 				if len(bodies) != 0 {
 					t.Errorf("commits = %d, want none", len(bodies))
@@ -1694,18 +1700,6 @@ func TestBranchHelpers(t *testing.T) {
 		}
 	})
 
-	t.Run("preflight rejects empty repository", func(t *testing.T) {
-		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":1,"empty_repo":true}`))
-		})
-		r := newTestResource(client)
-		_, err := r.missingBranchPreflight(t.Context(), "proj", "feature", "main")
-		if err == nil || !strings.Contains(err.Error(), "no commits") {
-			t.Fatalf("want the empty-repository diagnostic, got: %v", err)
-		}
-	})
-
 	t.Run("preflight demands create_branch_from", func(t *testing.T) {
 		client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -1723,6 +1717,70 @@ func TestBranchHelpers(t *testing.T) {
 // sourceHead is the head commit of create_branch_from = "main" in the fakes
 // of a missing target branch.
 const sourceHead = "5eed00000000000000000000000000000000a1a1"
+
+// TestCreate_EmptyRepositoryFirstCommitTakenMeanwhile: two resources that
+// bootstrap different branches of one empty repository in one apply are not
+// ordered by the branch lock. When another writer makes the first commit
+// after the preflight, GitLab refuses this root commit with a 400 that names
+// no cause; a repository that holds commits by then is reported as such,
+// with the ways out. A 400 on a repository that is still empty is the
+// commit's own error.
+func TestCreate_EmptyRepositoryFirstCommitTakenMeanwhile(t *testing.T) {
+	for _, taken := range []bool{true, false} {
+		t.Run(fmt.Sprintf("taken=%v", taken), func(t *testing.T) {
+			var projectLookups, commits atomic.Int32
+			client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/branches/"):
+					http.Error(w, "no branch", http.StatusNotFound)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/projects/proj"):
+					projectJSON(w, projectLookups.Add(1) == 1 || !taken)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/repository/commits"):
+					commits.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"message":"You can only create or edit files when you are on a branch"}`))
+				default:
+					t.Errorf("unexpected call %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+					http.Error(w, "unexpected", http.StatusInternalServerError)
+				}
+			})
+			plan := readState("blob")
+			plan.Branch = types.StringValue("dev")
+
+			resp := runCreate(t, client, plan)
+
+			errs := resp.Diagnostics.Errors()
+			if len(errs) != 1 {
+				t.Fatalf("want one error, got %v", resp.Diagnostics)
+			}
+			if got := commits.Load(); got != 1 {
+				t.Errorf("commits sent = %d, want the one GitLab refused", got)
+			}
+			if got := projectLookups.Load(); got != 2 {
+				t.Errorf("project lookups = %d, want the preflight and the one after the refusal", got)
+			}
+			if !taken {
+				if want := `GitLab API error: creating branch "dev" with the first commit of the empty repository`; errs[0].Summary() != want {
+					t.Errorf("summary = %q, want the commit's own %q", errs[0].Summary(), want)
+				}
+				return
+			}
+			if errs[0].Summary() != "Repository received its first commit meanwhile" {
+				t.Errorf("summary = %q", errs[0].Summary())
+			}
+			for _, want := range []string{
+				`creating branch "dev" with the first commit of the empty repository (project="proj" branch="dev")`,
+				"when you are on a branch", "nothing was committed", `if that first commit created branch "dev"`,
+				"set create_branch_from", "add depends_on on that resource",
+			} {
+				if !strings.Contains(errs[0].Detail(), want) {
+					t.Errorf("detail must mention %q, got: %s", want, errs[0].Detail())
+				}
+			}
+		})
+	}
+}
 
 // branchJSON answers a branch lookup with the given head commit.
 func branchJSON(w http.ResponseWriter, name, head string) {

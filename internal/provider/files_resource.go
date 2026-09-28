@@ -316,7 +316,8 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			},
 			"branch": schema.StringAttribute{
 				Description: "Target branch. Must already exist, or set create_branch_from to materialise it; in a repository " +
-					"with no commits yet, leave create_branch_from unset and the first commit creates the branch. " +
+					"with no commits yet, leave create_branch_from unset and the first commit creates the branch (for more " +
+					"than one branch, see create_branch_from). " +
 					"Changing it forces replacement, and so does a value that is unknown at plan time, even one that turns " +
 					"out unchanged. Without create_before_destroy the old object is destroyed first: with the default " +
 					"delete_on_destroy = true that pushes a commit deleting every managed file from the old branch before " +
@@ -396,7 +397,9 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					"the first commit, as one push event (when adoption leaves nothing to commit, the branch is created on its own). " +
 					"A branch name is resolved to its head commit once, and both adoption and the new branch use that " +
 					"commit, so a commit pushed to the source branch in the meantime, by another resource in the same " +
-					"apply included, is not part of the new branch. Must be unset in a repository with no commits yet. " +
+					"apply included, is not part of the new branch. In a repository with no commits yet, leave it unset on " +
+					"the resource that makes the first commit; another resource that starts its branch from that commit " +
+					"names that branch here and needs depends_on on that resource, since nothing else orders the two. " +
 					"Only consulted by Create; once the branch exists, changing or removing this value is a " +
 					"state-only no-op (no destroy / recreate). A branch created this way is not deleted by " +
 					"terraform destroy; only the managed files are.",
@@ -780,6 +783,14 @@ func (r *filesResource) Create(ctx context.Context, req resource.CreateRequest, 
 	// lock; release here rather than at the deferred return.
 	release()
 	if err != nil {
+		// A root commit fails with a 400 once another writer has made the
+		// repository's first commit: GitLab then wants the missing branch to
+		// start from a ref. The branch lock cannot order two resources that
+		// bootstrap different branches, since their keys differ.
+		if !branchExists && base == "" && hasStatus(err, http.StatusBadRequest) && r.repositoryHasCommits(ctx, project) {
+			resp.Diagnostics.AddError("Repository received its first commit meanwhile", firstCommitTakenDetail(action, project, branch, err))
+			return
+		}
 		summary, detail := commitErrorDiag(action, project, branch, err)
 		resp.Diagnostics.AddError(summary, detail)
 		return
@@ -2464,7 +2475,10 @@ func (r *filesResource) branchExists(ctx context.Context, project, branch string
 // on the project means the project itself is the problem (missing, or
 // invisible to the token), not the branch. A repository with no commits has
 // no ref to start from: without create_branch_from the first commit becomes
-// its root commit and creates the branch, so the commit returned is "".
+// its root commit and creates the branch, so the commit returned is "". With
+// create_branch_from set the ref it names does not exist yet; the usual
+// cause is another resource that makes the first commit on it in the same
+// apply, which only depends_on orders before this one.
 func (r *filesResource) missingBranchPreflight(ctx context.Context, project, branch, createFrom string) (string, error) {
 	proj, _, err := r.client.Projects.GetProject(project, nil, gitlab.WithContext(ctx))
 	if err != nil {
@@ -2476,8 +2490,11 @@ func (r *filesResource) missingBranchPreflight(ctx context.Context, project, bra
 	}
 	if proj != nil && proj.EmptyRepo {
 		if createFrom != "" {
-			return "", fmt.Errorf("repository %q has no commits, so create_branch_from %q has nothing to start from; "+
-				"remove create_branch_from and the first commit creates branch %q in the empty repository", project, createFrom, branch)
+			return "", fmt.Errorf("repository %q has no commits yet, so create_branch_from %q names nothing to start "+
+				"from. If another resource in this configuration makes the repository's first commit on the branch it "+
+				"names, add depends_on on that resource so its commit lands first (or apply again once the branch "+
+				"exists); remove create_branch_from only if this resource itself should make the first commit, which "+
+				"then creates branch %q", project, createFrom, branch)
 		}
 		return "", nil
 	}
@@ -2499,6 +2516,30 @@ func (r *filesResource) missingBranchPreflight(ctx context.Context, project, bra
 		return "", fmt.Errorf("resolving create_branch_from branch %q: GitLab returned no head commit", createFrom)
 	}
 	return src.Commit.ID, nil
+}
+
+// repositoryHasCommits reports whether project is known to hold commits now.
+// A failed lookup answers false, so the caller reports its own error.
+func (r *filesResource) repositoryHasCommits(ctx context.Context, project string) bool {
+	proj, _, err := r.client.Projects.GetProject(project, nil, gitlab.WithContext(ctx))
+	return err == nil && proj != nil && !proj.EmptyRepo
+}
+
+// firstCommitTakenDetail explains a root commit GitLab refused because the
+// repository, empty when Create checked it, received its first commit from
+// another writer before this one landed, and how to recover.
+func firstCommitTakenDetail(action, project, branch string, err error) string {
+	var body string
+	if resp, ok := errors.AsType[*gitlab.ErrorResponse](err); ok {
+		body = truncateForDiag(resp.Message)
+	}
+	return fmt.Sprintf("%s (project=%q branch=%q): GitLab refused the commit with HTTP 400 (body: %s). The repository "+
+		"had no commits when this resource checked it and has received its first commit since, from another resource "+
+		"in this configuration or a writer outside it. Once a repository has commits, a commit that creates a branch "+
+		"needs a ref to start from, so nothing was committed. Apply again: if that first commit created branch %q, "+
+		"the apply adopts what the branch holds; otherwise set create_branch_from to the branch that received it and, "+
+		"when a resource in this configuration makes that commit, add depends_on on that resource so its commit "+
+		"lands first.", action, project, branch, body, branch)
 }
 
 // describeBase names the commit a missing branch is created from, as the

@@ -670,7 +670,9 @@ func TestMissingBranchPreflight_ResolvesBase(t *testing.T) {
 		{name: "branch without a head", from: "main", branchBody: `{"name":"main","commit":null}`, wantErr: "no head commit"},
 		{name: "branch head without an id", from: "main", branchBody: `{"name":"main","commit":{"id":""}}`, wantErr: "no head commit"},
 		{name: "empty repository", empty: true, want: ""},
-		{name: "empty repository with a source", from: "main", empty: true, wantErr: "remove create_branch_from"},
+		{name: "empty repository with a source", from: "main", empty: true, wantErr: "add depends_on on that resource so its " +
+			"commit lands first (or apply again once the branch exists); remove create_branch_from only if this resource " +
+			"itself should make the first commit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
