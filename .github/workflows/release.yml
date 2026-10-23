@@ -68,13 +68,10 @@ jobs:
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser
-          # An exact version rather than '~> v2', which resolves at release
-          # time: two tags cut a week apart would otherwise be built by two
-          # different goreleasers with no commit recording the change.
-          # Dependabot moves the action SHA above but never a `with:` input,
-          # so this line is bumped by hand. ci.yml rehearses the release with
-          # the same action SHA and version; the two must move together.
-          version: 'v2.19.0'
+          # Newest 2.x at release time, at least the version .goreleaser.yml
+          # was last checked against. ci.yml rehearses with the same range;
+          # the two must move together.
+          version: '^v2.19'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
