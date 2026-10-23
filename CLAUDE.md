@@ -8,7 +8,7 @@ A Terraform provider (`greeddj/gitlabcommits`) built on the **Terraform Plugin F
 
 ## Commands
 
-`just` is the entry point; every target is a thin wrapper over a Go/Terraform invocation (see `Justfile`). The analysis tools (`staticcheck`, `govulncheck`, `fieldalignment`, `tfplugindocs`, `copywrite`) are declared in the `tool` block of `go.mod` and run via `go tool ...`, so there is nothing to install. `golangci-lint` is the one external binary (CI pins v2.13.2; `.golangci.yml` enables an explicit linter list with `default: none`, so a new golangci-lint release cannot quietly add linters).
+`just` is the entry point; every target is a thin wrapper over a Go/Terraform invocation (see `Justfile`). The analysis tools (`staticcheck`, `govulncheck`, `fieldalignment`, `tfplugindocs`, `copywrite`) are declared in the `tool` block of `go.mod` and run via `go tool ...`, so there is nothing to install. `golangci-lint` is the one external binary (CI pins v2.15.0; `.golangci.yml` enables an explicit linter list with `default: none`, so a new golangci-lint release cannot quietly add linters).
 
 ```bash
 just ci              # the gate CI runs: check + lint + test + check-tf-fmt + check-examples + docs-check + headers-check + check-deps (CI also rehearses the release with goreleaser --snapshot)
