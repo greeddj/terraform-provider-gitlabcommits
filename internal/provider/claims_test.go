@@ -776,3 +776,97 @@ func TestClaims_CreateOverAClaimedDirectory(t *testing.T) {
 		})
 	}
 }
+
+// TestClaims_LookupWithoutAProjectID: a 2xx project lookup without a project
+// id (a null body, or id 0) fails the operation that needed it, commits
+// nothing and caches no ID.
+func TestClaims_LookupWithoutAProjectID(t *testing.T) {
+	bodies := []struct{ name, body string }{
+		{name: "null body", body: "null"},
+		{name: "id 0", body: `{"id":0}`},
+	}
+	// Each operation meets one of the two claims made under "123", which
+	// needs no lookup, so "proj" is the only spelling looked up.
+	ops := []struct {
+		op   func(t *testing.T, res *filesResource) operation
+		name string
+		want string
+	}{
+		{
+			name: "destroy",
+			op: func(t *testing.T, res *filesResource) operation {
+				return deleteOp(t, res, managedFiles(true, map[string]string{"f.txt": "l1"}))
+			},
+			want: `"f.txt" on branch "main" is to be deleted through project_id "proj"`,
+		},
+		{
+			name: "update dropping a path",
+			op: func(t *testing.T, res *filesResource) operation {
+				return updateOp(t, res, managedFiles(true, map[string]string{"a.txt": "l0"}),
+					managedFiles(true, map[string]string{"a.txt": "l0", "f.txt": "l1"}))
+			},
+			want: `"f.txt" on branch "main" is to be deleted through project_id "proj"`,
+		},
+		{
+			name: "create over a claimed directory",
+			op: func(t *testing.T, res *filesResource) operation {
+				return createOp(t, res, managedFiles(true, map[string]string{"conf": ""}))
+			},
+			want: `"conf" is to be created on branch "main" through project_id "proj"`,
+		},
+		{
+			name: "update adding a path over a claimed directory",
+			op: func(t *testing.T, res *filesResource) operation {
+				return updateOp(t, res, managedFiles(true, map[string]string{"a.txt": "l0", "conf": ""}),
+					managedFiles(true, map[string]string{"a.txt": "l0"}))
+			},
+			want: `"conf" is to be created on branch "main" through project_id "proj"`,
+		},
+	}
+	for _, b := range bodies {
+		for _, o := range ops {
+			t.Run(b.name+"/"+o.name, func(t *testing.T) {
+				initial := map[string]string{"a.txt": "l0", "f.txt": "l1"}
+				fake := &repoFake{files: maps.Clone(initial)}
+				var lookups atomic.Int32
+				h := fake.handler(t)
+				res := newTestResource(newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodGet && r.URL.Path == "/api/v4/projects/proj" {
+						lookups.Add(1)
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(b.body))
+						return
+					}
+					h(w, r)
+				}))
+				res.locks.claim("123", "main", []string{"f.txt", "conf/sub/x"})
+				op := o.op(t, res)
+
+				op.run(t.Context())
+
+				commits, _, repo := fake.recorded()
+				if len(commits) != 0 {
+					t.Errorf("commits = %q, want none", commits)
+				}
+				if !maps.Equal(repo, initial) {
+					t.Errorf("files on the branch = %q, want them unchanged: %q", repo, initial)
+				}
+				if got := lookups.Load(); got != 1 {
+					t.Errorf("project lookups = %d, want one, of \"proj\"", got)
+				}
+				if id, ok := res.locks.projectID("proj"); ok {
+					t.Errorf("an answer without a project id was cached as %d", id)
+				}
+				wantDiag(t, "error", op.diags().Errors(), `looking up project "proj": GitLab returned no project id`)
+				wantDiag(t, "warning", op.diags().Warnings(), "")
+				if errs := op.diags().Errors(); len(errs) == 1 {
+					for _, want := range []string{o.want, `project_id "123"`, "Whether the two name the same project is unknown"} {
+						if !strings.Contains(errs[0].Detail(), want) {
+							t.Errorf("error detail %q does not mention %q", errs[0].Detail(), want)
+						}
+					}
+				}
+			})
+		}
+	}
+}
