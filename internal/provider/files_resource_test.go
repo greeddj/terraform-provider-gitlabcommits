@@ -629,7 +629,8 @@ func TestApiErrorDiag(t *testing.T) {
 		{
 			name: "401", err: mkErr(401, "invalid token", nil),
 			wantSummary: "GitLab authentication failed (HTTP 401)",
-			contains:    []string{"token rejected", "invalid token", "CI_JOB_TOKEN", "Private-Token"},
+			contains:    []string{"token rejected", "not expired and not revoked", "invalid token", "CI_JOB_TOKEN", "Private-Token"},
+			absent:      []string{"Verify the token has the `api` scope"},
 		},
 		{
 			name: "403", err: mkErr(403, "forbidden", nil),
@@ -637,10 +638,12 @@ func TestApiErrorDiag(t *testing.T) {
 			contains: []string{
 				"api", "Developer",
 				"Commit: Create, Repository: Read, Branch: Read and Project: Read, plus Branch: Create when create_branch_from is used",
-				"on GitLab.com, a top-level group that enforces",
-				"on GitLab Self-Managed, enforcement only stops legacy tokens from being created or rotated",
+				`"Allowed to push and merge" setting allows (default: Maintainers)`,
+				"on GitLab.com, when the project's top-level group enforces fine-grained tokens",
+				"a personal access token must be fine-grained after the enforcement date",
+				"service account tokens are exempt",
 			},
-			absent: []string{"CI_JOB_TOKEN", "group or instance"},
+			absent: []string{"CI_JOB_TOKEN", "group or instance", "Self-Managed"},
 		},
 		{
 			// CheckResponse answers every 404 with this one shared value, so it
@@ -711,14 +714,15 @@ func TestApiErrorDiag(t *testing.T) {
 		},
 		{
 			// Verbatim Gitaly text when the branch tip moved under the commit
-			// (a writer outside this terraform run).
+			// (another process, or a resource spelling project_id differently).
 			name:        "400-ref-race",
 			err:         mkErr(400, "9:reference update: reference does not point to expected object.", nil),
 			wantSummary: "Branch changed while the commit was being created",
 			// GitLab takes the branch tip it expects from the bare name,
 			// which resolves to a tag of the same name first, so the
 			// rejection then repeats on every run.
-			contains: []string{"another writer", "re-run terraform apply", `tag named "main"`, "refs/tags/main", "every commit to the branch is refused"},
+			contains: []string{"another writer", "re-run terraform apply", `tag named "main"`, "refs/tags/main", "every commit to the branch is refused",
+				"spell project_id the same way", "spells project_id differently"},
 		},
 		{
 			// Gitaly's text when another writer held the ref lock past git's
@@ -745,7 +749,7 @@ func TestApiErrorDiag(t *testing.T) {
 		{
 			name: "429-with-retry-after", err: mkErr(429, "rate limited", http.Header{"Retry-After": []string{"60"}}),
 			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
-			contains:    []string{"retry after 60 seconds"},
+			contains:    []string{"retry after 60 seconds", "above 20 MB to 3 per 30 s per user", "above 10 MB to 5 per minute per project"},
 			absent:      []string{"did not wait"},
 		},
 		{
@@ -775,15 +779,16 @@ func TestApiErrorDiag(t *testing.T) {
 			contains:    []string{"unix time 1700000000"},
 		},
 		{
-			// Per-endpoint limits (18.7) send no rate-limit headers at all.
+			// GitLab's size limits send Retry-After, so they are not named here.
 			name: "429-without-headers", err: mkErr(429, "rate limited", nil),
 			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
-			contains:    []string{"no rate-limit headers", "20 MB", "split the bundle"},
+			contains:    []string{"no Retry-After or reset time", "max_retries"},
+			absent:      []string{"20 MB", "per-endpoint"},
 		},
 		{
 			name: "302-redirect-refused", err: mkErr(302, "", http.Header{"Location": []string{"https://evil.example.net/api/v4/x"}}),
 			wantSummary: "Refused to follow a GitLab redirect (HTTP 302)",
-			contains:    []string{"evil.example.net", "base_url", "write request into a GET", "tenth in a row"},
+			contains:    []string{"evil.example.net", "base_url", "write request into a GET", "tenth in a row", "not to the full redirect URL"},
 		},
 		{
 			name: "413-too-large",

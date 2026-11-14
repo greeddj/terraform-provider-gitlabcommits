@@ -36,11 +36,9 @@ var (
 	_ provider.Provider = &gitlabCommitsProvider{}
 )
 
-// responseHeaderTimeout bounds how long a request may wait for GitLab's
-// response headers once the request, body included, has been sent, so a
-// wedged instance or proxy fails the apply instead of hanging it forever.
-// Uploads are not bounded by it, which matters for large commits; it only
-// starts once GitLab has the whole request.
+// responseHeaderTimeout bounds only the wait for response headers after the
+// whole request is sent. An upload, and a body that stalls after its headers,
+// have no time limit.
 const responseHeaderTimeout = 5 * time.Minute
 
 // Upper bounds for the retry settings. A larger value is a typo rather than a
@@ -309,10 +307,11 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	))
 
 	// client-go's default is cleanhttp's pooled client with no response
-	// timeout at all; keep the pooled transport and add one. The token
-	// travels as a Private-Token header, which net/http does NOT strip when
-	// following a cross-host redirect (unlike Authorization/Cookie), so
-	// off-host redirects are refused by crossHostRedirectGuard.
+	// timeout at all; keep the pooled transport and add a response header
+	// timeout. The token travels as a Private-Token header, which net/http
+	// does NOT strip when following a cross-host redirect (unlike
+	// Authorization/Cookie), so off-host redirects are refused by
+	// crossHostRedirectGuard.
 	transport := cleanhttp.DefaultPooledTransport()
 	transport.ResponseHeaderTimeout = responseHeaderTimeout
 	limiter := newHeaderRateLimiter()

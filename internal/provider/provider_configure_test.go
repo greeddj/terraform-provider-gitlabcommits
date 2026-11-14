@@ -502,10 +502,9 @@ func TestConfigure_UnknownRetrySettingsError(t *testing.T) {
 	}
 }
 
-// TestConfigure_RejectsJobTokens: a CI job token goes out as Private-Token,
-// which GitLab does not accept for one, so every request would fail as a
-// 401 or a 404 that points elsewhere; Configure refuses it up front, by its
-// prefix (after an instance prefix too) or by being the job's CI_JOB_TOKEN.
+// TestConfigure_RejectsJobTokens: Configure rejects a job token by prefix or
+// CI_JOB_TOKEN. GitLab answers one in Private-Token with 404 (non-public
+// project) or 401 (commit to a public project, or older releases).
 func TestConfigure_RejectsJobTokens(t *testing.T) {
 	t.Setenv("GITLAB_BASE_URL", "")
 	cases := []struct {

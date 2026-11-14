@@ -25,14 +25,16 @@ import (
 // variables to run them:
 //
 //	TF_ACC=1
-//	GITLAB_TOKEN=<token with `api` scope; see README Authentication>
+//	GITLAB_TOKEN=<token with `api` scope; see Authentication in docs/index.md>
 //	GITLAB_TEST_PROJECT_ID=<group/project> (plain path, not URL-encoded, or numeric ID)
 //	GITLAB_TEST_BRANCH=<branch>             (defaults to "tf-acc-test"; must pre-exist unless GITLAB_TEST_BRANCH_FROM is set)
-//	GITLAB_TEST_BRANCH_FROM=<ref>           (optional; materialise the branch from this ref and delete it after the test)
+//	GITLAB_TEST_BRANCH_FROM=<branch or SHA> (optional; a branch name or a full 40/64-hex commit SHA, not a tag or a short SHA;
+//	                                         a missing branch is created from it, and the branch is deleted after each
+//	                                         test, also when it existed before)
 //	GITLAB_BASE_URL=<https://gitlab.example.com>  (optional)
 //
-// Each test is responsible for cleaning up the files it creates so the project
-// is left in its original state, no matter the outcome.
+// Cleanup is each test's terraform destroy, plus a best-effort file delete in
+// two tests (accCleanupFile).
 
 const accTestPathPrefix = "tf-acc-test/"
 
@@ -588,9 +590,10 @@ func accBranchFrom() string {
 }
 
 // accBranch returns the branch to test against, defaulting to a fixed name so
-// repeated test runs are idempotent against the same project. When the branch
-// is materialised via GITLAB_TEST_BRANCH_FROM it is deleted after the test so
-// unique per-run branches (CI) do not pile up in the test project.
+// repeated test runs are idempotent against the same project. With
+// GITLAB_TEST_BRANCH_FROM set it is deleted after each test, also when it
+// existed before, so unique per-run branches (CI) do not pile up in the test
+// project.
 func accBranch(t *testing.T) string {
 	t.Helper()
 	branch := os.Getenv("GITLAB_TEST_BRANCH")

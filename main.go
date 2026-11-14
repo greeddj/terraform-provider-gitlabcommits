@@ -28,20 +28,16 @@ var (
 func main() {
 	var debug bool
 
-	// Parse command-line flags.
 	flag.BoolVar(&debug, "debug", false, "set to true to run the provider with support for debuggers like delve")
 	flag.Parse()
 
-	// Configure provider server options.
 	opts := providerserver.ServeOpts{
 		// Address is the provider's registry identifier used by Terraform.
 		// Format: registry.terraform.io/namespace/provider-name
 		Address: "registry.terraform.io/greeddj/gitlabcommits",
-		// Debug enables debugger support when true.
-		Debug: debug,
+		Debug:   debug,
 	}
 
-	// Start the provider server. This blocks until the provider exits.
 	err := providerserver.Serve(context.Background(), provider.New(version), opts)
 
 	if err != nil {

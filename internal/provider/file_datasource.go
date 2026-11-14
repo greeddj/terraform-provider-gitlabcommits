@@ -147,8 +147,9 @@ func (d *fileDataSource) Read(ctx context.Context, req datasource.ReadRequest, r
 		return
 	}
 
-	// cty silently mangles invalid UTF-8 (bytes become U+FFFD), so a binary
-	// file must surface as a null content, not corrupted-but-plausible text.
+	// cty's JSON encoder writes invalid UTF-8 to the state file as U+FFFD,
+	// so a binary file must surface as a null content, not
+	// corrupted-but-plausible text.
 	// Valid text is kept even where cty normalises it to NFC: canonically
 	// equivalent text still serves jsondecode and the like, and
 	// content_base64 carries the exact bytes.

@@ -85,7 +85,8 @@ type resourceDeps struct {
 // update: reference does not point to expected object"; holding the branch
 // lock around the commit removes that race without merging or splitting
 // commits, so every resource still lands at most one. Writers outside this
-// process are not covered and surface through apiErrorDiag.
+// process, and resources that spell project_id differently, are not covered
+// and surface through apiErrorDiag.
 //
 // A claim is a path a resource creates or adopts: Create claims every path
 // it manages, Update the paths it adds. One apply can hand a path from one
@@ -455,9 +456,9 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Required: true,
 				Validators: []validator.Map{
 					mapNonEmpty(),
-					// Interior spaces and other characters are tolerated - git
-					// accepts quite a lot; only traversal segments, NUL bytes,
-					// empty segments, and leading whitespace are rejected.
+					// Git accepts most characters, interior spaces included;
+					// only "." and ".." segments, NUL bytes, empty segments and
+					// segments starting with whitespace are rejected.
 					mapKeysValidRepoPath(),
 				},
 				NestedObject: schema.NestedAttributeObject{
@@ -1033,11 +1034,12 @@ func setRemoteContent(f *fileModel, raw []byte) (misfit string) {
 
 // textContentMisfit says why raw cannot be held in the text `content`
 // attribute, or returns "" when it can. Terraform core builds every string
-// through cty, which replaces invalid UTF-8 with U+FFFD and normalises valid
-// text to Unicode NFC. Invalid bytes stored as text would be corrupted in
-// state and the diff could never converge; text in another form would reach
-// state as the configured NFC text next to the blob_id of the bytes GitLab
-// holds, so the drift would vanish and never be refreshed again.
+// through cty, which normalises text to Unicode NFC and keeps invalid UTF-8,
+// but its JSON encoder writes invalid bytes to the state file as U+FFFD.
+// Invalid bytes stored as text would be corrupted in state and the diff
+// could never converge; text in another form would reach state as the
+// configured NFC text next to the blob_id of the bytes GitLab holds, so the
+// drift would vanish and never be refreshed again.
 func textContentMisfit(raw []byte) string {
 	switch {
 	case !utf8.Valid(raw):
@@ -1321,10 +1323,9 @@ func nothingDeleted(project, branch string, branchFound, keptForOthers bool) (st
 		"no commit. If the token lost access, the files may still exist in the repository.", branch, project)
 }
 
-// ImportState supports importing by "<project_id>::<branch>". After import the
-// files map is empty; running terraform plan will then reconcile the user's
-// HCL with the repo, and adopt_existing=true keeps it from blowing up on
-// already-present paths.
+// ImportState takes "<project_id>::<branch>" and leaves files empty. The plan
+// reads no file; the next apply reconciles the repository with the
+// configuration through adoption (adopt_existing).
 func (r *filesResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	project, branch, err := parseImportID(req.ID)
 	if err != nil {
@@ -1723,7 +1724,8 @@ func adoptAwareActions(p string, f fileModel, probe remoteProbe, useLock bool) (
 	return actions, nil
 }
 
-// lfsPointerVersion is the first line of every Git LFS pointer file.
+// lfsPointerVersion is the first line of every pointer file git-lfs writes;
+// git-lfs also reads legacy version URLs, which the provider does not.
 const lfsPointerVersion = "version https://git-lfs.github.com/spec/v1"
 
 // maxLFSPointerSize bounds the blobs parseLFSPointer considers; git-lfs
@@ -1756,19 +1758,18 @@ func (p lfsPointer) names(raw []byte) bool {
 	return int64(len(raw)) == p.size && sha256.Sum256(raw) == p.oid
 }
 
-// The lines of a Git LFS pointer after the version: any extension lines,
-// then the oid and the size, exactly as git-lfs writes and reads them.
+// Lines of a Git LFS pointer after the version: optional extension lines, the
+// oid and the size, as git-lfs writes them, except that an extension priority
+// may have several digits.
 var (
 	lfsExtensionLine = regexp.MustCompile(`^ext-[0-9]+-\w+ sha256:[0-9a-f]{64}$`)
 	lfsOIDLine       = regexp.MustCompile(`^oid sha256:([0-9a-f]{64})$`)
 	lfsSizeLine      = regexp.MustCompile(`^size (0|[1-9][0-9]*)$`)
 )
 
-// parseLFSPointer reports whether raw is a Git LFS pointer file and returns
-// the object it names. The parse is as strict as git-lfs's own, so ordinary
-// content is never taken for a pointer: at most maxLFSPointerSize bytes of
-// lines that each end in a newline, lfsPointerVersion first, then any
-// extension lines, then the oid line and the size line, and nothing else.
+// parseLFSPointer reports whether raw is a Git LFS pointer and returns the
+// object it names. It accepts the canonical form git-lfs writes, not every
+// form git-lfs decodes.
 func parseLFSPointer(raw []byte) (lfsPointer, bool) {
 	var ptr lfsPointer
 	body, ok := bytes.CutSuffix(raw, []byte("\n"))
@@ -1982,8 +1983,9 @@ func hasPathUnder(paths map[string]bool, dir string) bool {
 // last_commit_id (optimistic_lock off, or no token in state), leaving out
 // the paths fresh already resolved to a file. Without the token GitLab has
 // no guard of its own: it applies the action to whatever tree entry sits at
-// the path, so a delete removes a directory that replaced the file and a
-// chmod gives a directory a file mode. With unrefreshed (detect_drift false
+// the path, so a delete removes a directory that replaced the file, and a
+// chmod that sets the executable bit gives a tree mode 100755 (one that
+// clears it leaves the tree as it is). With unrefreshed (detect_drift false
 // in state, so no refresh dropped a file deleted out of band) every delete
 // is probed, a locked one included: GitLab rejects the locked delete of a
 // missing file with a 400 on every apply, the one that re-enables
@@ -2484,7 +2486,7 @@ func (r *filesResource) missingBranchPreflight(ctx context.Context, project, bra
 	if err != nil {
 		if errors.Is(err, gitlab.ErrNotFound) {
 			return "", fmt.Errorf("project %q does not exist or the token cannot see it (GitLab answers 404 for both); "+
-				"check project_id and the token's scope and membership", project)
+				"check project_id and that the token's user is a member of the project", project)
 		}
 		return "", fmt.Errorf("checking project %q: %w", project, err)
 	}
@@ -2825,21 +2827,22 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 		switch status {
 		case 401:
 			summary = "GitLab authentication failed (HTTP 401)"
-			return summary, fmt.Sprintf("%s: token rejected. Verify the token has the `api` scope (or, for a fine-grained token, the "+
-				"required permissions) and is not expired. A CI job token (CI_JOB_TOKEN) is not supported: GitLab does not "+
-				"accept one in the Private-Token header this provider sends; use a Personal / Project / Group access token. "+
-				"Body: %s", prefix, body)
+			return summary, fmt.Sprintf("%s: token rejected. Check that the token is correct, not expired and not revoked "+
+				"(GitLab answers a missing scope or permission with 403, not 401). A CI job token (CI_JOB_TOKEN) is not "+
+				"supported: GitLab does not accept one in the Private-Token header this provider sends; use a Personal / "+
+				"Project / Group access token. Body: %s", prefix, body)
 		case 403:
 			summary = "GitLab permission denied (HTTP 403)"
 			return summary, fmt.Sprintf("%s: %s Body: %s", prefix,
 				"The token was rejected by GitLab. Verify that: "+
 					"(1) the token has the `api` scope (write_repository alone does not authenticate REST API calls), or the fine-grained permissions "+
 					"Commit: Create, Repository: Read, Branch: Read and Project: Read, plus Branch: Create when create_branch_from is used; "+
-					"(2) the token's user has the Developer role on the project, or Maintainer for a protected branch; "+
-					"(3) on GitLab.com, a top-level group that enforces fine-grained personal access tokens refuses a legacy personal access "+
-					"token after its enforcement date (on GitLab Self-Managed, enforcement only stops legacy tokens from being created or "+
-					"rotated). When a fine-grained permission is missing, or enforcement refused a legacy token, the body names the "+
-					"permissions the request needs.",
+					"(2) the token's user has at least the Developer role on the project and, for a protected branch, a role "+
+					"that its \"Allowed to push and merge\" setting allows (default: Maintainers); "+
+					"(3) on GitLab.com, when the project's top-level group enforces fine-grained tokens, a personal access "+
+					"token must be fine-grained after the enforcement date; project access tokens, group access tokens and "+
+					"service account tokens are exempt. When a fine-grained permission is missing, or enforcement refused a "+
+					"legacy token, the body names the permissions the request needs.",
 				body)
 		case 400, 409:
 			if isLockConflict(err) {
@@ -2856,21 +2859,23 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			// reading it and writing the commit ("reference update: reference
 			// does not point to expected object") or when another writer held
 			// the ref lock past git's lock timeout ("reference update:
-			// reference is already locked"). Commits are serialised per branch
-			// inside this process, so this means a writer outside this
-			// terraform run, or a tag of the same name: GitLab takes the tip it
-			// expects from the bare branch name, which resolves to the tag. The
-			// "reference update:" prefix alone is not matched: it also carries
-			// causes a re-run cannot fix, such as a file/directory conflict
-			// between ref names.
+			// reference is already locked"). This process serialises commits
+			// per branch only under one project_id spelling, so this means
+			// another process, a resource spelling project_id differently, or
+			// a tag of the same name: GitLab takes the tip it expects from the
+			// bare branch name, which resolves to the tag. The "reference
+			// update:" prefix alone is not matched: it also carries causes a
+			// re-run cannot fix, such as a file/directory conflict between ref
+			// names.
 			if lower := strings.ToLower(resp.Message); strings.Contains(lower, "expected object") ||
 				strings.Contains(lower, "already locked") {
 				summary = "Branch changed while the commit was being created"
 				return summary, fmt.Sprintf("%s: another writer pushed to the branch, or held its ref lock, while GitLab was "+
-					"building this commit, so the ref update was refused and nothing was committed. This provider serialises its own commits per "+
-					"branch within one provider configuration (each provider block runs in its own process), so the other "+
-					"writer is another process: a different pipeline, a manual push, a bot, or a second provider block "+
-					"(alias) targeting the same branch. Wait for it to finish and re-run terraform apply. If this happens "+
+					"building this commit, so the ref update was refused and nothing was committed. The provider serialises "+
+					"commits per branch only for resources in one provider configuration that spell project_id the same way. "+
+					"So the other writer is another process (a different pipeline, a manual push, a bot, or a second provider "+
+					"block, an alias), or a resource in this configuration that spells project_id differently (for example a "+
+					"numeric ID and a path). Wait for it to finish and re-run terraform apply. If this happens "+
 					"on every run with no other writer, %s Body: %s", prefix,
 					tagShadowHint(branch, "computes the branch tip it expects, so every commit to the branch is refused"), body)
 			}
@@ -2893,7 +2898,8 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			return summary, fmt.Sprintf("%s: GitLab answered with a redirect to %q. The provider does not follow three kinds "+
 				"of redirect: one to another host or from https to http, since the request carries the API token; one that "+
 				"would turn a write request into a GET (net/http re-sends a POST as a GET on 301, 302 and 303); and the tenth "+
-				"in a row. Point base_url at the final GitLab address. Body: %s", prefix, resp.Response.Header.Get("Location"), body)
+				"in a row. Set base_url to the address of the GitLab instance the redirect points to, not to the full "+
+				"redirect URL (the provider adds /api/v4/ itself). Body: %s", prefix, resp.Response.Header.Get("Location"), body)
 		case 429:
 			summary = "GitLab rate limit exceeded (HTTP 429)"
 			h := resp.Response.Header
@@ -2909,18 +2915,20 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 					note = fmt.Sprintf(" The provider waits at most %.0f minutes for a rate limit, so it did not wait for this one; "+
 						"apply again after that time.", maxServerWait.Minutes())
 				}
-				return summary, fmt.Sprintf("%s: retry after %s.%s Body: %s", prefix, v, note, body)
+				return summary, fmt.Sprintf("%s: retry after %s.%s GitLab 18.7 and later limit commit requests above 20 MB "+
+					"to 3 per 30 s per user, and GitLab 18.1 and later limit reads of files above 10 MB to 5 per minute per "+
+					"project, on GitLab.com and on self-managed GitLab; split the files across resources to keep each commit "+
+					"request under 20 MB. Body: %s", prefix, v, note, body)
 			case h.Get("RateLimit-ResetTime") != "":
 				return summary, fmt.Sprintf("%s: the limit resets at %s. Body: %s", prefix, h.Get("RateLimit-ResetTime"), body)
 			case h.Get("RateLimit-Reset") != "":
 				return summary, fmt.Sprintf("%s: the limit resets at unix time %s. Body: %s", prefix, h.Get("RateLimit-Reset"), body)
 			default:
-				// GitLab's per-endpoint limits answer without any rate-limit
-				// header, unlike the Rack::Attack throttles.
-				return summary, fmt.Sprintf("%s: no rate-limit headers were sent, which is how GitLab's per-endpoint limits "+
-					"answer (on GitLab.com: commit requests over 20 MB are limited to 3 per 30 s and reads of blobs over 10 MB "+
-					"to 5 per minute; self-managed instances configure their own). Raise max_retries / retry_wait_min_ms, or "+
-					"split the bundle across resources. Body: %s", prefix, body)
+				// With no wait from GitLab, retryBackoff doubled retry_wait_min_ms
+				// on each retry and added jitter, so max_retries and the wait
+				// settings set how long it kept trying.
+				return summary, fmt.Sprintf("%s: GitLab sent no Retry-After or reset time. Raise max_retries or "+
+					"retry_wait_min_ms, or apply again later. Body: %s", prefix, body)
 			}
 		default:
 			if status >= 500 {
