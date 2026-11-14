@@ -284,8 +284,8 @@ github.com/zclconf/go-cty v1.19.0 h1:IV8WdqYZc2c5rLX9bEoLNXKojBAp0MZPBHMIrCoa/s4
 github.com/zclconf/go-cty v1.19.0/go.mod h1:12W89jGn3JCOIQi7infWr9m80rOkb5RNYJqXMZcN4c8=
 github.com/zclconf/go-cty-debug v0.0.0-20240509010212-0d6042c53940 h1:4r45xpDWB6ZMSMNJFMOjqrGHynW3DIBuR2H9j0ug+Mo=
 github.com/zclconf/go-cty-debug v0.0.0-20240509010212-0d6042c53940/go.mod h1:CmBdvvj3nqzfzJ6nTCIwDTPZ56aVGvDrmztiO5g3qrM=
-gitlab.com/gitlab-org/api/client-go/v3 v3.32.0 h1:hisNyZHah2TjxlP4C5rgsu+9QSvvTaaGU2aKctlrX7k=
-gitlab.com/gitlab-org/api/client-go/v3 v3.32.0/go.mod h1:jBFhGkTHLKkgeHEdS/A8yA0tQ6UHq96QVsS5muu6flM=
+gitlab.com/gitlab-org/api/client-go/v3 v3.40.0 h1:aWkVhgglUeNPqFVMiYDYv5tmfd8xPqDm7mCwwrsrBKE=
+gitlab.com/gitlab-org/api/client-go/v3 v3.40.0/go.mod h1:jBFhGkTHLKkgeHEdS/A8yA0tQ6UHq96QVsS5muu6flM=
 go.abhg.dev/goldmark/frontmatter v0.3.0 h1:ZOrMkeyyYzhlbenFNmOXyGFx1dFE8TgBWAgZfs9D5RA=
 go.abhg.dev/goldmark/frontmatter v0.3.0/go.mod h1:W3KXvVveKKxU1FIFZ7fgFFQrlkcolnDcOVmu19cCO9U=
 go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
