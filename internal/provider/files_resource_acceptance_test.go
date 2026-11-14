@@ -21,20 +21,9 @@ import (
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 )
 
-// Acceptance tests require a real GitLab project. Set the following environment
-// variables to run them:
-//
-//	TF_ACC=1
-//	GITLAB_TOKEN=<token with `api` scope; see Authentication in docs/index.md>
-//	GITLAB_TEST_PROJECT_ID=<group/project> (plain path, not URL-encoded, or numeric ID)
-//	GITLAB_TEST_BRANCH=<branch>             (defaults to "tf-acc-test"; must pre-exist unless GITLAB_TEST_BRANCH_FROM is set)
-//	GITLAB_TEST_BRANCH_FROM=<branch or SHA> (optional; a branch name or a full 40/64-hex commit SHA, not a tag or a short SHA;
-//	                                         a missing branch is created from it, and the branch is deleted after each
-//	                                         test, also when it existed before)
-//	GITLAB_BASE_URL=<https://gitlab.example.com>  (optional)
-//
-// Cleanup is each test's terraform destroy, plus a best-effort file delete in
-// two tests (accCleanupFile).
+// Acceptance tests run against a real GitLab project. CONTRIBUTING.md,
+// section "Acceptance tests", lists the environment variables. Cleanup is
+// each test's destroy, plus accCleanupFile where a test needs it.
 
 const accTestPathPrefix = "tf-acc-test/"
 
@@ -589,11 +578,9 @@ func accBranchFrom() string {
 	return os.Getenv("GITLAB_TEST_BRANCH_FROM")
 }
 
-// accBranch returns the branch to test against, defaulting to a fixed name so
-// repeated test runs are idempotent against the same project. With
-// GITLAB_TEST_BRANCH_FROM set it is deleted after each test, also when it
-// existed before, so unique per-run branches (CI) do not pile up in the test
-// project.
+// accBranch returns GITLAB_TEST_BRANCH, or a fixed default. With
+// GITLAB_TEST_BRANCH_FROM set, each test deletes the branch afterwards, even
+// one that existed before, so materialised branches do not pile up.
 func accBranch(t *testing.T) string {
 	t.Helper()
 	branch := os.Getenv("GITLAB_TEST_BRANCH")

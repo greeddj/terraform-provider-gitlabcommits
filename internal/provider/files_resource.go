@@ -78,35 +78,9 @@ type resourceDeps struct {
 	retryCommits bool
 }
 
-// branchLocks serialises commits per (project, branch) within one provider
-// process and records the paths resources claim there. Terraform applies
-// resource instances concurrently (-parallelism), and two CreateCommit calls
-// racing on the same branch tip make GitLab reject the loser with "reference
-// update: reference does not point to expected object"; holding the branch
-// lock around the commit removes that race without merging or splitting
-// commits, so every resource still lands at most one. Writers outside this
-// process, and resources that spell project_id differently, are not covered
-// and surface through apiErrorDiag.
-//
-// A claim is a path a resource creates or adopts: Create claims every path
-// it manages, Update the paths it adds. One apply can hand a path from one
-// resource to another (a file moved between two bundles, an address renamed
-// without a moved block, a replacement under create_before_destroy), and
-// Terraform runs the giver's delete and the receiver's adoption either
-// unordered or, under create_before_destroy, adoption first; an adoption of
-// identical content makes no commit, so the delete would still land on its
-// old last_commit_id. So the giver leaves out the delete of a claimed path
-// (commitLocked), and the receiver probes only after passing through the
-// branch lock once (claimPaths): a delete commit already in flight lands
-// before the probe, and any later one sees the claim. The claims also keep a
-// created file from replacing a directory that holds a claimed path
-// (createsOverClaims). Claims live in memory for the life of the process
-// and are never released; a failed Create keeps its claim, so the file
-// stays, which is the safe direction. A later run, a re-run of a failed
-// apply included, cannot see them. projectIDs caches the numeric ID behind
-// each project_id path spelling, looked up only when a claim meets a delete
-// or a create on one branch under different spellings (an all-digit
-// spelling is its own ID).
+// branchLocks serialises commits per (project_id, branch) in this process:
+// Gitaly rejects one of two commits racing on a tip. Its claims protect a
+// path that moves between resources (claimPaths, commitLocked).
 type branchLocks struct {
 	locks      map[string]chan struct{}
 	claims     map[claimKey]map[string]bool
@@ -456,18 +430,9 @@ func (r *filesResource) Configure(_ context.Context, req resource.ConfigureReque
 	r.retryCommits = deps.retryCommits
 }
 
-// ModifyPlan plans the computed values an apply keeps as they are. Once
-// anything in the resource changes, the framework plans every computed
-// attribute unknown, so a one-file edit would list every file as changing
-// and a commit_message edit would plan commit_sha unknown with no commit to
-// come. A file whose content, content_base64 and execute_filemode the plan
-// leaves as state has them (fileKept) keeps its blob_id and last_commit_id:
-// Update emits no action for it and carries both over from state
-// (carryOver). commit_sha is kept too when every file is kept and the plan
-// adds or removes none, since Update then makes no commit and keeps it.
-// Nothing else in the plan can make Update commit. Create, destroy, an
-// unknown files map and a changed or unknown project_id or branch (a
-// replacement, planned again as a create) keep the framework's unknowns.
+// ModifyPlan restores what Update keeps but the framework plans unknown: the
+// prior blob_id and last_commit_id of each kept file (fileKept), and
+// commit_sha when no file changes, is added or removed.
 func (r *filesResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() || req.State.Raw.IsNull() {
 		return
@@ -1756,18 +1721,9 @@ func probeEach(ctx context.Context, paths []string, probe func(context.Context, 
 	return out
 }
 
-// probeAdded probes, at ref, the paths a Create or Update adds. With
-// adopt_existing each path is probed for adoption, content included
-// (probeFile). A path that will be created, being absent or adoption being
-// off, is checked for a directory in its place (directoryEntry): Gitaly lets
-// a created file replace a directory together with everything in it. That is
-// allowed only when the same commit deletes every file in the directory
-// first, a directory of managed files turning into a file; deleted holds the
-// paths the commit deletes. A failed probe or a directory in the way is an
-// error on that file, and nothing is committed. A directory check that
-// answered 404 is trusted only once a branch lookup has answered too (see
-// treeGitaly404Note). A directory another resource in this run fills after
-// the check is caught under the branch lock (see createsOverClaims).
+// probeAdded probes at ref the paths a commit adds: for adoption (probeFile),
+// and for a directory a created file would silently replace (directoryEntry),
+// allowed only if deleted empties it.
 func (r *filesResource) probeAdded(
 	ctx context.Context,
 	plan filesResourceModel,

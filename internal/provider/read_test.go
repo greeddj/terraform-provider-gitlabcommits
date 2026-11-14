@@ -99,11 +99,9 @@ func newTestResource(client *gitlab.Client) *filesResource {
 	return &filesResource{client: client, locks: newBranchLocks()}
 }
 
-// newRetryingResource mirrors the max_retries > 0 wiring: a client that
-// retries (bounded, with millisecond wait bounds so a faked 429 without
-// Retry-After does not stall the test; a 5xx still waits 700-900 ms times
-// the attempt number) and the commit-specific retry policy on the commit
-// request.
+// newRetryingResource mirrors the max_retries > 0 wiring, with millisecond
+// wait bounds. They shape only the 429 backoff: a faked 5xx still waits
+// 700-900 ms times the attempt number.
 func newRetryingResource(t *testing.T, h http.HandlerFunc) *filesResource {
 	t.Helper()
 	srv := httptest.NewServer(h)
@@ -437,13 +435,9 @@ func misfitDriftFake(drift []byte) *repoFake {
 	return &repoFake{files: map[string]string{"f.txt": "newlcid"}, content: map[string][]byte{"f.txt": drift}}
 }
 
-// TestRead_TextMisfitDriftRecordedAsBase64: a file managed through the text
-// content attribute that drifts to bytes it cannot hold (cty's JSON encoder
-// writes invalid UTF-8 to the state file as U+FFFD, and cty turns text in
-// another Unicode form into the NFC form the configuration already has,
-// hiding the drift for good), and Read cannot see whether the configuration
-// has switched to content_base64. So the bytes land in content_base64 with
-// content null and a warning, and the refresh succeeds with the new ids.
+// TestRead_TextMisfitDriftRecordedAsBase64 checks that drift to bytes
+// content cannot hold (textContentMisfit) lands in content_base64 with the
+// new ids, content null and a warning: Read cannot see the configuration.
 func TestRead_TextMisfitDriftRecordedAsBase64(t *testing.T) {
 	for _, m := range textMisfits {
 		t.Run(m.name, func(t *testing.T) {

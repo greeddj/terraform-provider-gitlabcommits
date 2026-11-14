@@ -307,12 +307,9 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 		fmt.Sprintf("terraform-provider-gitlabcommits/%s", p.version),
 	))
 
-	// client-go's default is cleanhttp's pooled client with no response
-	// timeout at all; keep the pooled transport and add a response header
-	// timeout. The token travels as a Private-Token header, which net/http
-	// does NOT strip when following a cross-host redirect (unlike
-	// Authorization/Cookie), so off-host redirects are refused by
-	// crossHostRedirectGuard.
+	// client-go's default client has no response timeout. net/http keeps the
+	// Private-Token header on a cross-host redirect, unlike Authorization, so
+	// crossHostRedirectGuard refuses those.
 	transport := cleanhttp.DefaultPooledTransport()
 	transport.ResponseHeaderTimeout = responseHeaderTimeout
 	limiter := newHeaderRateLimiter()
