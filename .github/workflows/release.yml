@@ -71,7 +71,7 @@ jobs:
           # Newest 2.x at release time, at least the version .goreleaser.yml
           # was last checked against. ci.yml rehearses with the same range;
           # the two must move together.
-          version: '^v2.19'
+          version: '^v2.20'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
