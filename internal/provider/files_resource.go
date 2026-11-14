@@ -2899,7 +2899,17 @@ func apiErrorDiag(action, project, branch string, err error) (string, string) {
 			h := resp.Response.Header
 			switch {
 			case h.Get("Retry-After") != "":
-				return summary, fmt.Sprintf("%s: retry after %s seconds. Body: %s", prefix, h.Get("Retry-After"), body)
+				v := h.Get("Retry-After")
+				wait, inSeconds := retryAfter(v)
+				if inSeconds {
+					v += " seconds"
+				}
+				note := ""
+				if wait > maxServerWait {
+					note = fmt.Sprintf(" The provider waits at most %.0f minutes for a rate limit, so it did not wait for this one; "+
+						"apply again after that time.", maxServerWait.Minutes())
+				}
+				return summary, fmt.Sprintf("%s: retry after %s.%s Body: %s", prefix, v, note, body)
 			case h.Get("RateLimit-ResetTime") != "":
 				return summary, fmt.Sprintf("%s: the limit resets at %s. Body: %s", prefix, h.Get("RateLimit-ResetTime"), body)
 			case h.Get("RateLimit-Reset") != "":

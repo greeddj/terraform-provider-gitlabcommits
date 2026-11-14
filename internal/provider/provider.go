@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"unicode"
 
 	"github.com/hashicorp/go-cleanhttp"
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
@@ -50,6 +52,10 @@ const (
 	maxMaxRetries  = 100
 	maxRetryWaitMs = 3_600_000
 )
+
+// maxServerWait caps a 429 wait that GitLab asks for. A longer limit fails
+// sooner through the doubling wait than by stalling the apply once per retry.
+const maxServerWait = 5 * time.Minute
 
 // jobTokenPattern matches a CI job token: "glcbt-", after the instance token
 // prefix and its hyphen when the instance sets one (GitLab allows up to 20
@@ -112,10 +118,11 @@ func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaReque
 				Optional: true,
 			},
 			"retry_wait_min_ms": schema.Int64Attribute{
-				Description: "Base wait (ms) for rate-limited (429) retries. When GitLab sends a RateLimit-Reset header the " +
-					"wait lasts until the reset, or this value if that is longer; without the header it doubles with each " +
-					"attempt. 5xx and connection retries use client-go's linear schedule instead: 700-900 ms times the " +
-					"attempt number. Default 1000, at most 3600000 (one hour).",
+				Description: "Base wait (ms) for rate-limited (429) retries. When GitLab gives the time to wait in a " +
+					"Retry-After header, or else in a RateLimit-Reset header, the wait lasts that time, or this value if that " +
+					"is longer. When GitLab asks for more than five minutes, or gives no time, the wait doubles with each " +
+					"attempt instead, and the provider reports the 429 after the last retry. 5xx and connection retries use " +
+					"client-go's linear schedule: 700-900 ms times the attempt number. Default 1000, at most 3600000 (one hour).",
 				Optional: true,
 			},
 			"retry_wait_max_ms": schema.Int64Attribute{
@@ -289,10 +296,13 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 			fmt.Sprintf("retry_wait_min_ms (%d) must be > 0 and <= retry_wait_max_ms (%d)", waitMin, waitMax))
 		return
 	}
-	clientOpts = append(clientOpts, gitlab.WithCustomRetryWaitMinMax(
-		time.Duration(waitMin)*time.Millisecond,
-		time.Duration(waitMax)*time.Millisecond,
-	))
+	clientOpts = append(clientOpts,
+		gitlab.WithCustomRetryWaitMinMax(
+			time.Duration(waitMin)*time.Millisecond,
+			time.Duration(waitMax)*time.Millisecond,
+		),
+		gitlab.WithCustomBackoff(retryBackoff),
+	)
 
 	clientOpts = append(clientOpts, gitlab.WithUserAgent(
 		fmt.Sprintf("terraform-provider-gitlabcommits/%s", p.version),
@@ -484,4 +494,64 @@ func (t *rateLimitObserver) CloseIdleConnections() {
 	if c, ok := t.next.(interface{ CloseIdleConnections() }); ok {
 		c.CloseIdleConnections()
 	}
+}
+
+// retryBackoff is the client's backoff. client-go's WithRetryAfterBackoff
+// waits for any Retry-After, up to a day for some limits, on every retry;
+// this one accepts a requested wait of at most maxServerWait.
+func retryBackoff(minWait, maxWait time.Duration, attemptNum int, resp *http.Response) time.Duration {
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		// client-go's schedule for a 5xx or a transport failure.
+		return retryablehttp.LinearJitterBackoff(700*time.Millisecond, 900*time.Millisecond, attemptNum, resp)
+	}
+	wait, ok := requestedWait(resp.Header)
+	if ok {
+		wait = max(wait, minWait)
+	} else {
+		wait = doubled(minWait, attemptNum)
+	}
+	jitter := time.Duration(rand.Float64() * float64(max(maxWait-minWait, 0))) //nolint:gosec // jitter, not a secret
+	if wait > math.MaxInt64-jitter {
+		return math.MaxInt64
+	}
+	return wait + jitter
+}
+
+// requestedWait returns the wait a 429 asks for, if at most maxServerWait.
+// Retry-After comes first: RateLimit-Reset is a Unix time, so it depends on
+// the local clock.
+func requestedWait(h http.Header) (time.Duration, bool) {
+	wait, _ := retryAfter(h.Get("Retry-After"))
+	if wait <= 0 {
+		reset, err := strconv.ParseInt(h.Get("RateLimit-Reset"), 10, 64)
+		if err != nil || reset <= 0 {
+			return 0, false
+		}
+		wait = time.Until(time.Unix(reset, 0))
+	}
+	return wait, wait > 0 && wait <= maxServerWait
+}
+
+// retryAfter parses a Retry-After value, a number of seconds or an HTTP date,
+// and reports whether it was a number of seconds. A negative number counts as
+// zero.
+func retryAfter(v string) (wait time.Duration, inSeconds bool) {
+	if seconds, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return time.Duration(min(max(seconds, 0), int64(math.MaxInt64/time.Second))) * time.Second, true
+	}
+	if date, err := http.ParseTime(v); err == nil {
+		return time.Until(date), false
+	}
+	return 0, false
+}
+
+// doubled returns d doubled n times, saturating instead of wrapping negative.
+func doubled(d time.Duration, n int) time.Duration {
+	for range n {
+		if d > math.MaxInt64/2 {
+			return math.MaxInt64
+		}
+		d *= 2
+	}
+	return d
 }

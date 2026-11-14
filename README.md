@@ -116,7 +116,7 @@ provider "gitlabcommits" {
 | `token` | `GITLAB_TOKEN` | Token for the REST API; see Authentication. An empty string counts as unset. |
 | `base_url` | `GITLAB_BASE_URL`, else `https://gitlab.com` | Base URL of a self-hosted instance. An empty string counts as unset. |
 | `max_retries` | `5` | Retries on 429 and transient 5xx for read and probe requests. The commit request is retried only on 429 and on connection failures before it is sent (see Limits and retries). `0` disables retries; at most `100`. |
-| `retry_wait_min_ms` | `1000` | Base wait for 429 retries: until GitLab's `RateLimit-Reset` when it sends one (or this value, if longer), otherwise doubling per attempt. 5xx and connection retries wait 700-900 ms times the attempt number instead. At most `3600000` (one hour). |
+| `retry_wait_min_ms` | `1000` | Base wait for 429 retries. When GitLab gives the time to wait (`Retry-After`, else `RateLimit-Reset`), the wait lasts that time, or this value if it is longer. When GitLab asks for more than 5 minutes, or gives no time, the wait doubles per attempt. 5xx and connection retries wait 700-900 ms times the attempt number. At most `3600000` (one hour). |
 | `retry_wait_max_ms` | `30000` | Sets the random jitter added to each 429 wait, up to `retry_wait_max_ms - retry_wait_min_ms`; not a bound on the total wait. At most `3600000`. |
 
 ## Authentication
@@ -437,9 +437,14 @@ names the configured bytes (see Limits).
   `GITLAB_COMMITS_MAX_REQUEST_SIZE_BYTES` on self-managed GitLab.
 - **Rate limits.** Read and probe requests are retried on 429 and transient
   5xx (`max_retries`, default 5). `retry_wait_min_ms` is the base wait between
-  429 retries: when GitLab sends `RateLimit-Reset` the wait lasts until the
-  reset (or `retry_wait_min_ms`, if that is longer), otherwise it doubles per
-  attempt. `retry_wait_max_ms` sets the random jitter added on top, up to
+  429 retries. When GitLab gives the time to wait in `Retry-After`, or else in
+  `RateLimit-Reset`, the wait lasts that time (or `retry_wait_min_ms`, if that
+  is longer). The provider uses `Retry-After` first, because it does not
+  depend on the local clock. The provider accepts a requested wait of 5
+  minutes or less. A longer wait would stop the apply once for each retry, so
+  the wait then doubles per attempt, as it does when GitLab gives no time.
+  After the last retry, the provider reports the 429 and the time that GitLab
+  asked for. `retry_wait_max_ms` sets the random jitter added on top, up to
   `retry_wait_max_ms - retry_wait_min_ms`, and does not bound the total wait.
   5xx and connection retries use client-go's linear schedule instead: 700-900
   ms times the attempt number, about 12 s in all with the default 5 retries. On

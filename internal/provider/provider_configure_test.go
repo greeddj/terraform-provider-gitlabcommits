@@ -5,6 +5,7 @@ package provider
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"maps"
@@ -12,6 +13,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -804,6 +806,152 @@ func TestHeaderRateLimiter_Observe(t *testing.T) {
 			}
 			if tokens := lim.Tokens(); c.counted && tokens > float64(c.burst)-0.5 {
 				t.Errorf("tokens = %v, want the request that brought the header counted", tokens)
+			}
+		})
+	}
+}
+
+// TestRetryBackoff: a 429 waits as long as GitLab asks, Retry-After first,
+// but never longer than maxServerWait; without a usable request the wait
+// doubles. Other retries keep client-go's linear schedule.
+func TestRetryBackoff(t *testing.T) {
+	now := time.Now()
+	resetIn := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
+	dateIn := func(d time.Duration) string { return now.Add(d).UTC().Format(http.TimeFormat) }
+	hdr := func(kv ...string) http.Header {
+		h := http.Header{}
+		for i := 0; i+1 < len(kv); i += 2 {
+			h.Set(kv[i], kv[i+1])
+		}
+		return h
+	}
+	const tooMany = http.StatusTooManyRequests
+	exactly := func(d time.Duration) [2]time.Duration { return [2]time.Duration{d, d} }
+
+	for _, tc := range []struct {
+		header           http.Header
+		name             string
+		status           int
+		minWait, maxWait time.Duration
+		attempt          int
+		want             [2]time.Duration
+	}{
+		{name: "502 keeps the linear schedule", status: http.StatusBadGateway,
+			want: [2]time.Duration{700 * time.Millisecond, 900 * time.Millisecond}},
+		{name: "transport failure on the third retry", attempt: 2,
+			want: [2]time.Duration{2100 * time.Millisecond, 2700 * time.Millisecond}},
+		{name: "429 without headers doubles", status: tooMany, header: hdr(), attempt: 3, want: exactly(8 * time.Second)},
+		{name: "Retry-After in seconds", status: tooMany, header: hdr("Retry-After", "60"), want: exactly(time.Minute)},
+		{name: "Retry-After below the minimum", status: tooMany, header: hdr("Retry-After", "1"),
+			minWait: 2 * time.Second, maxWait: 2 * time.Second, want: exactly(2 * time.Second)},
+		{name: "Retry-After at the cap", status: tooMany, header: hdr("Retry-After", "300"), want: exactly(maxServerWait)},
+		{name: "Retry-After over the cap", status: tooMany, header: hdr("Retry-After", "301"), attempt: 2, want: exactly(4 * time.Second)},
+		{name: "Retry-After of a day", status: tooMany, header: hdr("Retry-After", "86400"), want: exactly(time.Second)},
+		{name: "Retry-After as a date", status: tooMany, header: hdr("Retry-After", dateIn(2*time.Minute)),
+			want: [2]time.Duration{118 * time.Second, 121 * time.Second}},
+		{name: "Retry-After date in the past", status: tooMany, header: hdr("Retry-After", dateIn(-time.Minute)), attempt: 1,
+			want: exactly(2 * time.Second)},
+		{name: "Retry-After neither seconds nor a date", status: tooMany, header: hdr("Retry-After", "soon"), attempt: 1,
+			want: exactly(2 * time.Second)},
+		{name: "negative Retry-After", status: tooMany, header: hdr("Retry-After", "-5"), attempt: 1, want: exactly(2 * time.Second)},
+		{name: "Retry-After too long for a duration", status: tooMany, header: hdr("Retry-After", strconv.FormatInt(math.MaxInt64, 10)),
+			attempt: 1, want: exactly(2 * time.Second)},
+		{name: "RateLimit-Reset", status: tooMany, header: hdr("RateLimit-Reset", resetIn(30*time.Second)),
+			want: [2]time.Duration{28 * time.Second, 31 * time.Second}},
+		{name: "RateLimit-Reset over the cap", status: tooMany, header: hdr("RateLimit-Reset", resetIn(10*time.Minute)), attempt: 1,
+			want: exactly(2 * time.Second)},
+		{name: "RateLimit-Reset in the past", status: tooMany, header: hdr("RateLimit-Reset", resetIn(-time.Minute)), attempt: 2,
+			want: exactly(4 * time.Second)},
+		{name: "Retry-After before RateLimit-Reset",
+			status: tooMany, header: hdr("Retry-After", "20", "RateLimit-Reset", resetIn(200*time.Second)), want: exactly(20 * time.Second)},
+		{name: "Retry-After over the cap is not replaced by RateLimit-Reset",
+			status: tooMany, header: hdr("Retry-After", "600", "RateLimit-Reset", resetIn(30*time.Second)), want: exactly(time.Second)},
+		{name: "jitter on top", status: tooMany, header: hdr("Retry-After", "60"), maxWait: 3 * time.Second,
+			want: [2]time.Duration{time.Minute, time.Minute + 2*time.Second}},
+		{name: "doubling saturates", status: tooMany, header: hdr(), minWait: time.Hour, maxWait: time.Hour, attempt: maxMaxRetries,
+			want: exactly(math.MaxInt64)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var resp *http.Response
+			if tc.status != 0 {
+				resp = &http.Response{StatusCode: tc.status, Header: tc.header}
+			}
+			minWait, maxWait := cmp.Or(tc.minWait, time.Second), cmp.Or(tc.maxWait, time.Second)
+			if got := retryBackoff(minWait, maxWait, tc.attempt, resp); got < tc.want[0] || got > tc.want[1] {
+				t.Errorf("wait = %v, want %v to %v", got, tc.want[0], tc.want[1])
+			}
+		})
+	}
+}
+
+// TestConfigure_RetryAfterIsWaitedForUpToTheCap: the commit request, retried
+// through its own policy, waits for a short Retry-After and gives up on one
+// over maxServerWait instead of stalling the apply.
+func TestConfigure_RetryAfterIsWaitedForUpToTheCap(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		retryAfter string
+		limited    bool
+		wantPosts  int32
+		minElapsed time.Duration
+	}{
+		{name: "short Retry-After", retryAfter: "1", wantPosts: 2, minElapsed: time.Second},
+		{name: "Retry-After over the cap", retryAfter: "301", limited: true, wantPosts: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var posts atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if posts.Add(1) == 1 || tc.limited {
+					w.Header().Set("Retry-After", tc.retryAfter)
+					http.Error(w, "rate limited", http.StatusTooManyRequests)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"id":"sha"}`))
+			}))
+			t.Cleanup(srv.Close)
+			t.Setenv("GITLAB_TOKEN", "")
+			resp := runConfigure(t, map[string]tftypes.Value{
+				"token":             tftypes.NewValue(tftypes.String, "tok"),
+				"base_url":          tftypes.NewValue(tftypes.String, srv.URL),
+				"max_retries":       tftypes.NewValue(tftypes.Number, big.NewFloat(2)),
+				"retry_wait_min_ms": tftypes.NewValue(tftypes.Number, big.NewFloat(1)),
+				"retry_wait_max_ms": tftypes.NewValue(tftypes.Number, big.NewFloat(1)),
+			})
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("configure: %v", resp.Diagnostics.Errors())
+			}
+			deps := resp.ResourceData.(*resourceDeps)
+			res := &filesResource{client: deps.client, locks: deps.locks, retryCommits: deps.retryCommits}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() {
+				_, _, err := res.client.Commits.CreateCommit("proj", &gitlab.CreateCommitOptions{
+					Branch:        new("main"),
+					CommitMessage: new("m"),
+				}, res.commitRequestOptions(ctx)...)
+				done <- err
+			}()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(30 * time.Second):
+				cancel()
+				t.Fatalf("still waiting after 30 s for Retry-After: %s", tc.retryAfter)
+			}
+
+			if got := posts.Load(); got != tc.wantPosts {
+				t.Errorf("commit POST attempts = %d, want %d", got, tc.wantPosts)
+			}
+			if tc.limited != (err != nil) {
+				t.Errorf("err = %v, want an error: %v", err, tc.limited)
+			}
+			if elapsed := time.Since(start); elapsed < tc.minElapsed {
+				t.Errorf("elapsed = %v, want at least %v", elapsed, tc.minElapsed)
 			}
 		})
 	}

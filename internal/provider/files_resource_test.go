@@ -746,6 +746,18 @@ func TestApiErrorDiag(t *testing.T) {
 			name: "429-with-retry-after", err: mkErr(429, "rate limited", http.Header{"Retry-After": []string{"60"}}),
 			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
 			contains:    []string{"retry after 60 seconds"},
+			absent:      []string{"did not wait"},
+		},
+		{
+			name: "429-retry-after-over-the-cap", err: mkErr(429, "rate limited", http.Header{"Retry-After": []string{"86400"}}),
+			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
+			contains:    []string{"retry after 86400 seconds", "at most 5 minutes", "did not wait", "apply again"},
+		},
+		{
+			name: "429-retry-after-as-a-date", err: mkErr(429, "rate limited", http.Header{"Retry-After": []string{"Wed, 21 Oct 2037 07:28:00 GMT"}}),
+			wantSummary: "GitLab rate limit exceeded (HTTP 429)",
+			contains:    []string{"retry after Wed, 21 Oct 2037 07:28:00 GMT.", "did not wait"},
+			absent:      []string{"GMT seconds"},
 		},
 		{
 			name: "429-ratelimit-resettime-fallback", err: mkErr(429, "rate limited", http.Header{"Ratelimit-Resettime": []string{"Tue, 05 Jan 2027 10:00:00 GMT"}}),

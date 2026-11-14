@@ -108,7 +108,8 @@ func newRetryingResource(t *testing.T, h http.HandlerFunc) *filesResource {
 	t.Cleanup(srv.Close)
 	client, err := gitlab.NewClient("tok", gitlab.WithBaseURL(srv.URL+"/"),
 		gitlab.WithCustomRetryMax(2),
-		gitlab.WithCustomRetryWaitMinMax(time.Millisecond, 2*time.Millisecond))
+		gitlab.WithCustomRetryWaitMinMax(time.Millisecond, 2*time.Millisecond),
+		gitlab.WithCustomBackoff(retryBackoff))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
