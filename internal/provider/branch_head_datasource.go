@@ -42,19 +42,23 @@ func (d *branchHeadDataSource) Metadata(_ context.Context, req datasource.Metada
 
 func (d *branchHeadDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Returns the SHA at the head of a branch and whether the branch is protected. Useful for wiring " +
-			"downstream pipelines to the exact SHA terraform saw.",
+		Description: "Reads the head commit SHA and the protection status of a branch. " +
+			"Terraform normally reads this data source during plan, before the commits of the same apply. " +
+			"For the commit that a gitlabcommits_files resource makes, use the commit_sha of that resource: with depends_on, " +
+			"the head can be a later commit.",
 		Attributes: map[string]schema.Attribute{
 			"project_id": schema.StringAttribute{Required: true,
-				Description: "Numeric project ID or the plain project path (e.g. \"group/subgroup/project\"); do not URL-encode it, the provider escapes it.",
-				Validators:  []validator.String{stringNotEmpty()}},
+				Description: "The numeric ID or the full path of the project, for example \"group/subgroup/project\". " +
+					"Do not URL-encode the path, because the provider encodes it.",
+				Validators: []validator.String{stringNotEmpty()}},
 			"branch": schema.StringAttribute{Required: true,
-				Description: "Branch name.",
-				Validators:  []validator.String{stringNotEmpty(), stringBranchName()}},
+				Description: "The name of the branch. It must be a valid git ref name: for example, no space, \"..\" or \":\", " +
+					"and no slash-separated part that ends with \".lock\". A tag or a commit SHA fails with \"Branch not found\".",
+				Validators: []validator.String{stringNotEmpty(), stringBranchName()}},
 			"commit_sha": schema.StringAttribute{Computed: true,
-				Description: "SHA of the commit at the branch head."},
+				Description: "The SHA of the head commit of the branch when Terraform reads the data source."},
 			"protected": schema.BoolAttribute{Computed: true,
-				Description: "Whether the branch is protected in GitLab."},
+				Description: "True when the branch is a protected branch in GitLab."},
 		},
 	}
 }

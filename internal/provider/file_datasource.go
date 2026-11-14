@@ -49,54 +49,56 @@ func (d *fileDataSource) Metadata(_ context.Context, req datasource.MetadataRequ
 
 func (d *fileDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Reads a single file from a GitLab repository at the given ref (branch, tag or commit SHA). Useful for migration, " +
-			"comparison against rendered HCL, or wiring up other resources with the file's commit metadata.",
+		Description: "Reads one file of a GitLab project at a branch, a tag or a commit SHA. " +
+			"For a file in Git LFS, the data source reads the LFS pointer, not the LFS object. " +
+			"To read the file after the commit of a gitlabcommits_files resource in the same apply, add that resource to depends_on.",
 		Attributes: map[string]schema.Attribute{
 			"project_id": schema.StringAttribute{
-				Description: "Numeric project ID or the plain project path (e.g. \"group/subgroup/project\"); do not URL-encode it, the provider escapes it.",
-				Required:    true,
-				Validators:  []validator.String{stringNotEmpty()},
+				Description: "The numeric ID or the full path of the project, for example \"group/subgroup/project\". " +
+					"Do not URL-encode the path, because the provider encodes it.",
+				Required:   true,
+				Validators: []validator.String{stringNotEmpty()},
 			},
 			"branch": schema.StringAttribute{
-				Description: "Branch, tag or commit SHA to read the file from. A name git refuses as a ref name (a space, \"..\", \":\", a trailing \".lock\" and the like) fails at plan time; any other name is passed to GitLab as it is.",
-				Required:    true,
-				Validators:  []validator.String{stringNotEmpty(), stringBranchName()},
+				Description: "The branch, the tag or the commit SHA to read the file from. It must be a valid git ref name: for example, " +
+					"no space, \"..\" or \":\", and no slash-separated part that ends with \".lock\".",
+				Required:   true,
+				Validators: []validator.String{stringNotEmpty(), stringBranchName()},
 			},
 			"file_path": schema.StringAttribute{
-				Description: "Path of the file inside the repository (relative, no leading slash).",
-				Required:    true,
-				Validators:  []validator.String{stringNotEmpty(), stringValidRepoPath()},
+				Description: "The path of the file, relative to the root of the repository. It must not start or end with a slash, " +
+					"or contain \"//\", a \".\" or \"..\" part, or a part that starts with white space.",
+				Required:   true,
+				Validators: []validator.String{stringNotEmpty(), stringValidRepoPath()},
 			},
 			"content": schema.StringAttribute{
-				Description: "Decoded text of the git blob stored at the path: for a Git LFS-tracked file the LFS pointer, " +
-					"not the object; for a symlink the link target. Null when the blob is not valid UTF-8 " +
-					"(Terraform strings cannot hold arbitrary bytes without corruption); use content_base64 for binaries. " +
-					"Terraform normalises every string to Unicode NFC, so for text in another form (for example a combining " +
-					"accent, as macOS tools may write it) this value differs bytewise from the file. content_base64 is " +
-					"the byte-exact form: pass content_base64 = data.gitlabcommits_file.<name>.content_base64 to a " +
-					"gitlabcommits_files resource that should reproduce the file exactly.",
+				Description: "The text of the file, or null when the bytes from GitLab are not valid UTF-8, for example in a binary file. " +
+					"GitLab changes text in another encoding, for example UTF-16, to UTF-8. " +
+					"Terraform changes text to Unicode NFC, so the value can differ from the bytes in content_base64.",
 				Computed: true,
 			},
 			"content_base64": schema.StringAttribute{
-				Description: "Base64-encoded bytes of the git blob stored at the path. Always set. For a Git LFS-tracked " +
-					"file this is the LFS pointer, not the object; for a symlink it is the link target.",
+				Description: "The bytes of the file from GitLab, encoded in base64 (never null). " +
+					"These are the stored bytes for UTF-8 text and binary files, and the UTF-8 bytes for text in another encoding. " +
+					"See the provider page, Limits.",
 				Computed: true,
 			},
 			"blob_id": schema.StringAttribute{
-				Description: "Opaque blob identifier returned by GitLab (git SHA-1 today, possibly SHA-256 on SHA-256 repositories).",
+				Description: "The ID of the git object of the file at the ref.",
 				Computed:    true,
 			},
 			"execute_filemode": schema.BoolAttribute{
-				Description: "Whether the file has the executable bit set in the repo.",
+				Description: "True when the file has the executable bit at the ref.",
 				Computed:    true,
 			},
 			"last_commit_id": schema.StringAttribute{
-				Description: "SHA of the most recent commit that touched this file.",
+				Description: "The SHA of the last commit that changed the file, at the ref.",
 				Computed:    true,
 			},
 			"size": schema.Int64Attribute{
-				Description: "Size of the git blob in bytes (for a Git LFS-tracked file, the size of the pointer).",
-				Computed:    true,
+				Description: "The size of the stored file in bytes. For text that GitLab changes to UTF-8, it can differ from " +
+					"the number of decoded bytes in content_base64.",
+				Computed: true,
 			},
 		},
 	}

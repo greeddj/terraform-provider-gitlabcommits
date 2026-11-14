@@ -1,15 +1,15 @@
 ## Summary
 
-<!-- 1-3 bullets: what changes, why. -->
+<!-- 1 to 3 list items: what changes and why. -->
 
 ## Test plan
 
-<!-- Concrete commands you ran. Include "added unit tests for X". -->
+<!-- The commands that you ran and the tests that you added. -->
 
+- [ ] `just docs` and a commit of `docs/`, after a change to a source of `docs/` (see CONTRIBUTING.md, Documentation)
 - [ ] `just ci`
-- [ ] `just docs` (if schema changed)
-- [ ] Conventional commit / PR title (`feat:`, `fix:`, `docs:`) for user-visible changes; the release notes are built from commit titles
+- [ ] `feat:`, `fix:` or `docs:` titles for a change that users can see (see CONTRIBUTING.md, Commit titles)
 
-## Breaking change?
+## Breaking change
 
-<!-- If yes, describe the migration path or link to MIGRATION.md. -->
+<!-- If this PR makes a breaking change, tell how users upgrade, or link to MIGRATION.md. If not, write "None". -->

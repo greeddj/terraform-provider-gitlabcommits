@@ -1,58 +1,57 @@
 # Security policy
 
-## Reporting a vulnerability
+## Report a vulnerability
 
-If you believe you've found a security issue in this provider, **do not open
-a public GitHub issue**. Use one of these private channels instead:
+Do not open a public GitHub issue for a security problem.
+Use one of these private channels:
 
-- **Preferred:** open a GitHub Security Advisory at
+- Best channel: open a GitHub Security Advisory at
   <https://github.com/greeddj/terraform-provider-gitlabcommits/security/advisories/new>.
-  This keeps the discussion threaded against a CVE-trackable record and lets
-  us collaborate on a fix in a private fork.
-- **Alternative:** email the maintainer directly at <greeddj@gmail.com>.
+- Other channel: send an email to the maintainer at <greeddj@gmail.com>.
 
-Please include:
-- a description of the issue and the impact you observed,
-- a minimal reproduction (HCL config + steps),
-- the provider version (`terraform providers` output) and target GitLab version.
+Give this information in the report:
 
-You can expect an initial reply within 7 days. If we confirm the issue we'll
-agree on a coordinated disclosure timeline before any public fix lands.
+- A description of the problem and of its effect.
+- The smallest HCL configuration that shows the problem, and the steps that cause it.
+- The output of `terraform version` in the initialized working directory, and the GitLab version.
+
+The maintainer sends a first reply in 7 days or less.
+If the maintainer finds that the problem is real, you and the maintainer agree on a disclosure date before the fix is public.
 
 ## Scope
 
-In scope:
-- the provider itself (this repository) and its release artifacts,
-- the GitLab API interactions performed by the provider.
+In scope: the provider in this repository, its release files and the GitLab API requests that it sends.
 
 Out of scope:
-- vulnerabilities in GitLab itself - please report those at
-  https://about.gitlab.com/security,
-- vulnerabilities in Terraform Core or HashiCorp's Plugin Framework.
+
+- Vulnerabilities in GitLab. Report them through the GitLab HackerOne program at <https://hackerone.com/gitlab>.
+- Vulnerabilities in Terraform Core or in the Terraform Plugin Framework.
 
 ## Threat model
 
-This provider is designed for managing **non-secret** configuration files in
-GitLab repositories - ArgoCD `Application` manifests, Helm `values.yaml`,
-GitLab CI declarations, Kubernetes manifests, etc.
+The provider manages configuration files that are not secret, for example Argo CD manifests, Helm values files and GitLab CI files.
 
-### Out of scope: secret material in `content`
+### File content
 
-The `content` and `content_base64` attributes are deliberately **not marked
-`Sensitive`**. Values are visible in `terraform plan` / `terraform apply` output
-(including CI logs) and in `terraform.tfstate`. This is by design - config files
-are reviewed in code review, and a redacted plan defeats that.
+The provider does not mark file content as sensitive, because people must examine the content in the plan.
 
-If you need to deliver a secret to a workload, do not put it in a file managed
-by this provider. Use SealedSecrets, the ExternalSecrets Operator, Vault Agent /
-CSI Secrets Store, or masked GitLab CI variables, and reference the secret
-resource by name from the managed file.
+- Plan output, apply output and CI logs show `content` and `content_base64` of the `gitlabcommits_files` resource. Terraform hides only sensitive values, for example a value from a sensitive variable or from the `sensitive()` function.
+- Terraform state holds the content of each managed file in plain text, also sensitive content.
+- The `gitlabcommits_file` data source also stores the file content in state: `content_base64`, and `content` for UTF-8 text.
 
-## What we won't fix
+Do not put secrets in managed files.
+Keep each secret in a secret store, for example Sealed Secrets, External Secrets Operator or Vault.
+Refer to the secret by its name in the managed file.
+Use a state backend that controls access and encrypts the data.
+For more information, see [File content in state](docs/resources/files.md#file-content-in-state).
 
-- Token exposure caused by the user's HCL or state backend. The provider
-  marks tokens `Sensitive: true`; protecting your state file is up to you.
-- File contents leaking into state or plan output. By design the provider stores
-  file content in state and prints it in `terraform plan` / `apply` diffs (and
-  thus CI logs); see the Threat model section above. Do not deliver secrets
-  through it.
+### Token
+
+The provider marks `token` as sensitive and writes no token into state or into its log entries.
+It does not follow a redirect to another host or port, or from `https` to `http`, because each request contains the token.
+For token types, permissions and `base_url`, see [Authentication](docs/index.md#authentication).
+
+## Problems that we do not fix
+
+- A token that your HCL configuration or your state backend exposes. Protect the configuration and the state backend.
+- File content in plan output, apply output, CI logs or state. This is by design (see [File content](#file-content)).

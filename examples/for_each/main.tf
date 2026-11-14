@@ -1,9 +1,5 @@
-# ============================================================================
-# Real-world layout: 20 services x 30 environments
-#   - one terraform resource per service
-#   - at most one commit per service per apply (none when nothing changed)
-#   - all per-env helm values and ArgoCD application manifests in that commit
-# ============================================================================
+# This configuration puts the files of many services and environments on one
+# branch, for example 20 services in 30 environments.
 
 terraform {
   required_providers {
@@ -14,7 +10,8 @@ terraform {
 }
 
 provider "gitlabcommits" {
-  token = var.gitlab_token
+  token    = var.gitlab_token
+  base_url = "https://gitlab.example.com"
 }
 
 variable "gitlab_token" {
@@ -23,17 +20,16 @@ variable "gitlab_token" {
 }
 
 variable "gitops_project" {
-  description = "GitLab project hosting the GitOps repo (e.g. \"platform/gitops\")."
+  description = "The path of the GitLab project, for example \"platform/gitops\". The Argo CD repoURL also uses it."
   type        = string
 }
 
 variable "gitops_branch" {
-  description = "Branch the provider commits to."
+  description = "The branch that the provider commits to."
   type        = string
   default     = "main"
 }
 
-# 30 environments x 20 services = 600 (service, env) pairs handled below.
 variable "environments" {
   type = map(object({
     cluster   = string
@@ -55,14 +51,14 @@ variable "services" {
   }))
 }
 
-# ----------------------------------------------------------------------
-# One resource per service. Inside each resource we generate every file
-# for every environment, so each terraform apply creates at most one
-# commit per service (and one CI pipeline run per service it changed).
-# ----------------------------------------------------------------------
+# Each service has one resource with the files of all environments. A create,
+# an update or a destroy of a resource makes at most one commit.
 resource "gitlabcommits_files" "service" {
   for_each = var.services
 
+  # A change to var.gitops_project or var.gitops_branch replaces every resource.
+  # The destroy can make a delete commit before the create. If the new branch
+  # does not exist, the create fails. See the resource page, Caveats, Replacement.
   project_id     = var.gitops_project
   branch         = var.gitops_branch
   commit_message = "chore(${each.key}): sync gitops manifests via terraform"
@@ -71,7 +67,7 @@ resource "gitlabcommits_files" "service" {
   author_email = "terraform@example.com"
 
   files = merge(
-    # Helm values per environment.
+    # Helm values for each environment.
     {
       for env_name, env in var.environments :
       "services/${each.key}/values/${env_name}.yaml" => {
@@ -96,7 +92,7 @@ resource "gitlabcommits_files" "service" {
       }
     },
 
-    # ArgoCD Application manifest per environment.
+    # An Argo CD Application for each environment.
     {
       for env_name, env in var.environments :
       "services/${each.key}/argocd/${env_name}.yaml" => {
@@ -139,17 +135,12 @@ resource "gitlabcommits_files" "service" {
   )
 }
 
-# ----------------------------------------------------------------------
-# Outputs: per-service commit SHAs (handy for downstream pipelines).
-# ----------------------------------------------------------------------
 output "service_commits" {
-  description = "Map service_name -> SHA of the last commit each resource produced (unchanged when this apply made no commit for it, null if it never committed)."
+  description = "The SHA of the last commit that each resource made. The keys are the service names. Each SHA is null until its resource makes a commit, and again after a replacement that makes no commit."
   value       = { for k, r in gitlabcommits_files.service : k => r.commit_sha }
 }
 
-# ----------------------------------------------------------------------
-# Example variable values (replace with real ones in tfvars / env)
-# ----------------------------------------------------------------------
+# Example values for a .tfvars file:
 # environments = {
 #   eu-prod-1 = { cluster = "https://eu1.example", domain = "eu1.example.com", namespace = "prod",  replicas = 5 }
 #   us-prod-1 = { cluster = "https://us1.example", domain = "us1.example.com", namespace = "prod",  replicas = 5 }

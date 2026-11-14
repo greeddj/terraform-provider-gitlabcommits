@@ -266,41 +266,20 @@ func (r *filesResource) Metadata(_ context.Context, req resource.MetadataRequest
 
 func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Manages a set of files in a single GitLab repository on a single branch. " +
-			"Every change (create / update / delete / chmod) is batched into ONE commit per terraform apply, " +
-			"which means one CI pipeline run per resource. Use one resource per logical bundle " +
-			"(typically per service) so each apply produces at most one commit per service. " +
-			"Commits are serialised per branch within one provider configuration, so for_each resources sharing one " +
-			"branch never race on its tip, and the commit request is retried only on HTTP 429 and on connection " +
-			"failures before it is sent, never on 5xx, so one apply can never land two commits. Within one run of " +
-			"one provider configuration, no resource deletes a file on its branch after another resource created or " +
-			"adopted it there: that delete is dropped with a warning, so a file can move from one resource to another " +
-			"in one apply, and a replacement under create_before_destroy keeps the files the new object took over. A " +
-			"delete commit already in flight is waited for only when both resources spell project_id the same way. " +
-			"Later runs are not covered, a re-run of a failed apply included. " +
-			"Git LFS: GitLab's commits API turns only a created file into an LFS object and commits an update as a " +
-			"regular blob, so an LFS-tracked file this resource updates leaves LFS. Where the provider reads a file's " +
-			"LFS pointer it compares the object the pointer names with the configured bytes when adopting a path and " +
-			"with the bytes in state when refreshing a changed file, and it refuses to change a file whose pointer " +
-			"names other content; see the provider documentation's Limits section.",
+		Description: "This resource manages a set of files on one branch of one GitLab project. " +
+			"Each create, update or destroy makes a maximum of one commit with all the file changes.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
-				Description: "Composite identifier: \"<project_id>::<branch>\".",
+				Description: "The ID of the resource, in the format project_id::branch.",
 				Computed:    true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
 			"project_id": schema.StringAttribute{
-				Description: "Numeric project ID or the plain project path (e.g. \"group/subgroup/project\"); do not URL-encode it, " +
-					"the provider escapes it. Changing it forces replacement, and so do respelling the same project (numeric ID " +
-					"vs path) and a value that is unknown at plan time, even one that turns out unchanged. Without " +
-					"create_before_destroy the old object is destroyed first: with the default delete_on_destroy = true that " +
-					"pushes a commit deleting every managed file from the old project and branch before they are created again. " +
-					"Under create_before_destroy the new object is created first, and when it targets the same project and " +
-					"branch (a respelling, or a value that turned out unchanged) the old object's destroy leaves in place " +
-					"every file the new object adopted or wrote. Keep it known at plan time (literals, variables), or apply " +
-					"delete_on_destroy = false first, which makes such a replacement commit-free.",
+				Description: "The numeric ID or the full path of the GitLab project, for example group/subgroup/project, without URL encoding. " +
+					"Write it the same way in all resources on one branch. " +
+					"A new value or a different spelling replaces the resource (see Caveats, Replacement).",
 				Required: true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
@@ -316,16 +295,9 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 			},
 			"branch": schema.StringAttribute{
-				Description: "Target branch. Must already exist, or set create_branch_from to materialise it; in a repository " +
-					"with no commits yet, leave create_branch_from unset and the first commit creates the branch (for more " +
-					"than one branch, see create_branch_from). " +
-					"Changing it forces replacement, and so does a value that is unknown at plan time, even one that turns " +
-					"out unchanged. Without create_before_destroy the old object is destroyed first: with the default " +
-					"delete_on_destroy = true that pushes a commit deleting every managed file from the old branch before " +
-					"they are created on the new one. Under create_before_destroy the new object is created first, and when " +
-					"the branch is in fact unchanged the old object's destroy leaves in place every file the new object " +
-					"adopted or wrote. Keep it known at plan time (literals, variables), or apply delete_on_destroy = false " +
-					"first, which makes such a replacement commit-free.",
+				Description: "The name of the target branch. " +
+					"It must exist, unless you set create_branch_from or the repository has no commits. " +
+					"A new value replaces the resource (see Caveats, Replacement).",
 				Required: true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
@@ -336,74 +308,55 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 			},
 			"commit_message": schema.StringAttribute{
-				Description: "Message used for any commit (create / update / destroy) the resource produces. " +
-					"Only takes effect on an apply that actually changes file content, mode, or set; editing just " +
-					"commit_message or the author fields produces no commit, so the new value applies to the next change.",
+				Description: "The message of each commit that the resource makes. " +
+					"A destroy commit uses the value in state (see Caveats, Values from the last apply).",
 				Required: true,
 				Validators: []validator.String{
 					stringNotEmpty(),
 				},
 			},
 			"author_email": schema.StringAttribute{
-				Description: "Optional override for commit author email.",
-				Optional:    true,
+				Description: "The email address of the commit author. " +
+					"If you do not set it, GitLab uses its default. " +
+					"A destroy commit uses the value in state.",
+				Optional: true,
 			},
 			"author_name": schema.StringAttribute{
-				Description: "Optional override for commit author name.",
-				Optional:    true,
+				Description: "The name of the commit author. " +
+					"If you do not set it, GitLab uses its default. " +
+					"A destroy commit uses the value in state.",
+				Optional: true,
 			},
 			"detect_drift": schema.BoolAttribute{
-				Description: "If true (default), Read fetches each managed file from GitLab and updates state " +
-					"when the remote blob differs, so terraform plan reflects the real repository state. " +
-					"With false, Read is a no-op and state keeps what the last apply recorded: under optimistic_lock an " +
-					"update, chmod or delete of a file changed out of band fails with GitLab's 400 on every apply, and a " +
-					"file deleted out of band stays in state (an update that removes it from files probes the path first " +
-					"and drops the delete). A refresh reads the value recorded in state, not the configuration, and a " +
-					"failed apply keeps that value, so a new detect_drift value only affects refreshes once an apply has " +
-					"recorded it. To catch up with the repository, set detect_drift = true with files as last applied " +
-					"and apply (this makes no commit), then put back any change you were applying and plan again: that " +
-					"plan compares files with the branch, so with files still as last applied it would revert what " +
-					"changed there.",
+				Description: "If true (default), each refresh reads the managed files and records external changes in state. " +
+					"If false, a refresh sends no request. " +
+					"A refresh uses the value in state, not the configured value " +
+					"(see Caveats, Values from the last apply).",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
 			},
 			"delete_on_destroy": schema.BoolAttribute{
-				Description: "If true (default), terraform destroy creates one commit that removes every managed file. " +
-					"Files already removed out of band are skipped; when none is left, destroy makes no commit and says " +
-					"so in a warning. A file another gitlabcommits_files resource adopted or wrote in the same run is kept, " +
-					"with a warning naming it. Set to false to keep files in place when the resource is removed from state. " +
-					"Terraform does not evaluate configuration during destroy, so this value is read from the state " +
-					"written by the last apply: a change made in HCL must be applied before terraform destroy honours it.",
+				Description: "If true (default), a destroy deletes the managed files in a maximum of one commit. " +
+					"If false, a destroy keeps the files, but an apply still deletes a path that you remove from files. " +
+					"A destroy uses the value in state.",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
 			},
 			"adopt_existing": schema.BoolAttribute{
-				Description: "If true (default), files that exist in the repository but are not yet in state are " +
-					"adopted on the next apply: a create-action targeting an existing path is silently rewritten " +
-					"as an update. When optimistic_lock is enabled, that adopt-update carries the file's current " +
-					"commit, so a concurrent external modification is still detected instead of being overwritten. " +
-					"An existing path whose content and mode already match the plan needs no action at all, so an apply " +
-					"that only adopts identical files makes no commit and leaves commit_sha unset. A path that cannot be " +
-					"read for adoption fails the apply before anything is committed. " +
-					"Required for terraform import to converge cleanly.",
+				Description: "If true (default), the resource adopts a file that already exists at a new path, " +
+					"and changes only the differences from the configuration. " +
+					"If false, a new path that already holds a file makes the apply fail, also after an import.",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
 			},
 			"create_branch_from": schema.StringAttribute{
-				Description: "If set and `branch` does not yet exist, the provider creates it from this " +
-					"branch name or full commit SHA (typically \"main\"; tags are not supported) together with " +
-					"the first commit, as one push event (when adoption leaves nothing to commit, the branch is created on its own). " +
-					"A branch name is resolved to its head commit once, and both adoption and the new branch use that " +
-					"commit, so a commit pushed to the source branch in the meantime, by another resource in the same " +
-					"apply included, is not part of the new branch. In a repository with no commits yet, leave it unset on " +
-					"the resource that makes the first commit; another resource that starts its branch from that commit " +
-					"names that branch here and needs depends_on on that resource, since nothing else orders the two. " +
-					"Only consulted by Create; once the branch exists, changing or removing this value is a " +
-					"state-only no-op (no destroy / recreate). A branch created this way is not deleted by " +
-					"terraform destroy; only the managed files are.",
+				Description: "If the target branch does not exist, the create starts it from this branch name " +
+					"or full commit SHA, for example main. " +
+					"A tag name or a short SHA does not work. " +
+					"A later change makes no commit and no replacement.",
 				Optional: true,
 				Validators: []validator.String{
 					stringNotEmpty(),
@@ -411,48 +364,25 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 			},
 			"optimistic_lock": schema.BoolAttribute{
-				Description: "If true (default), update / delete / chmod actions on a file this resource manages send the " +
-					"file's last_commit_id as the last refresh or apply recorded it, and GitLab rejects the commit with HTTP " +
-					"400 if the file changed after that point: the apply fails with nothing committed instead of overwriting " +
-					"a change another pipeline landed between the plan's refresh and the commit. A change made before that " +
-					"refresh does not fail the apply while detect_drift = true (default): the refresh records it, the plan " +
-					"shows reverting it as a change to the file, and applying the plan overwrites it. So review the plan: " +
-					"applying with -auto-approve overwrites such a change unseen, while applying a reviewed saved plan " +
-					"(terraform plan -out) fails instead of overwriting a file changed after the plan's refresh. With " +
-					"detect_drift = false a change made before that refresh fails the apply as well, at the cost described " +
-					"under detect_drift. A path the plan adds that already holds a file (see adopt_existing) is probed during " +
-					"the apply and updated with the last_commit_id that probe reads, so for it only a change landing between " +
-					"that probe and the commit fails the apply. " +
-					"Set to false to opt out (useful when an external process intentionally co-edits the same files). " +
-					"Without the token the provider probes each path before a delete or chmod, because GitLab would " +
-					"otherwise apply the action to whatever sits at the path, a directory included. " +
-					"The first commit of a branch created from create_branch_from carries no token: GitLab would check " +
-					"it against the default branch rather than the commit the branch starts from, which the provider " +
-					"has just read and which cannot change. " +
-					"Like delete_on_destroy, the destroy commit uses the value recorded by the last apply.",
+				Description: "If true (default), update, delete and chmod actions send the last_commit_id of the file, " +
+					"except in the first commit of a new branch. " +
+					"If the file changed after the provider read that value, the apply fails. " +
+					"With detect_drift = true, the apply overwrites changes from before the refresh " +
+					"(see Caveats, Optimistic locking).",
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
 			},
 			"commit_sha": schema.StringAttribute{
-				Description: "SHA of the last commit produced by this resource. A plan that adds and removes no file and " +
-					"leaves every file's content, content_base64 and execute_filemode as they are, all known at plan time, " +
-					"keeps it known, since the apply makes no commit.",
+				Description: "The SHA of the last commit that this resource made, not the head of the branch. " +
+					"It is null until the first commit. " +
+					"A plan keeps it known when files has the same paths as state and no entry changes.",
 				Computed: true,
 			},
 			"files": schema.MapNestedAttribute{
-				Description: "Map of repository_path -> file definition. The map key is the path inside the repo. " +
-					"A new path where the branch holds a directory fails the apply, since the file would replace the " +
-					"directory with everything in it; the one exception is a directory holding only files this resource " +
-					"manages and drops from the map in the same apply. A new path also fails when another resource in the " +
-					"same apply adds or adopts a file inside a directory of that name. An entry must not be null: omit the " +
-					"key to leave a file out. A plan shows blob_id and last_commit_id as known after apply only for a file it " +
-					"adds, a file whose content, content_base64 or execute_filemode it changes (a switch between content and " +
-					"content_base64 of the same bytes included, though that commits nothing), and a file whose values are " +
-					"not known until apply. Terraform normalises map keys, like every string, to Unicode NFC, so a path the " +
-					"repository stores in another form (for example NFD, as macOS tools may write names) cannot be " +
-					"addressed: a key naming it refers to the NFC spelling, which git treats as another path, and the " +
-					"apply creates a second file under that spelling.",
+				Description: "The files that the resource manages, as a map from each path in the repository to its file. " +
+					"Terraform changes each path to Unicode NFC, so the provider cannot manage a path in another form " +
+					"(see the provider page, Limits).",
 				Required: true,
 				Validators: []validator.Map{
 					mapNonEmpty(),
@@ -467,22 +397,17 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					},
 					Attributes: map[string]schema.Attribute{
 						"content": schema.StringAttribute{
-							Description: "Text content. Mutually exclusive with content_base64. Not intended for secret " +
-								"values: it is stored in plaintext in state and printed in plan / apply output (and thus CI logs). " +
-								"Deliver secrets via SealedSecrets / ExternalSecrets / Vault and reference them from the managed file. " +
-								"Terraform normalises every string to Unicode NFC, so text that must keep another form byte for " +
-								"byte (for example a combining accent) needs content_base64. " +
-								"When the file drifts to bytes content cannot hold (not valid UTF-8, or text in a form other than " +
-								"NFC), a refresh records them in content_base64 instead, with a warning: the next apply restores " +
-								"this content, and switching the file to content_base64 keeps the new bytes.",
+							Description: "The content of the file as text. Set exactly one of content and content_base64. " +
+								"Do not put secrets in it (see Caveats, File content in state). " +
+								"For text that is not in Unicode NFC, use content_base64 (see the provider page, Limits).",
 							Optional: true,
 							Validators: []validator.String{
 								stringConflictsWithSibling("content_base64"),
 							},
 						},
 						"content_base64": schema.StringAttribute{
-							Description: "Base64-encoded content (use for binaries). Mutually exclusive with content. " +
-								"Not intended for secret values (see content).",
+							Description: "The content of the file as standard base64 text with padding, for example for a binary file. " +
+								"Do not put secrets in it (see Caveats, File content in state).",
 							Optional: true,
 							Validators: []validator.String{
 								stringConflictsWithSibling("content"),
@@ -490,21 +415,21 @@ func (r *filesResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 							},
 						},
 						"execute_filemode": schema.BoolAttribute{
-							Description: "Whether the file should have the executable bit set.",
-							Optional:    true,
-							Computed:    true,
-							Default:     booldefault.StaticBool(false),
+							Description: "If true, the file gets the executable bit. " +
+								"The default is false. Set true for each file that must keep the executable bit, " +
+								"also for an adopted file.",
+							Optional: true,
+							Computed: true,
+							Default:  booldefault.StaticBool(false),
 						},
 						"blob_id": schema.StringAttribute{
-							Description: "Opaque blob identifier returned by GitLab; used for drift detection. " +
-								"Format is GitLab-specific (git SHA-1 today, possibly SHA-256 on SHA-256 repositories).",
+							Description: "The git object ID of the file content. " +
+								"A plan shows it as known after apply only for a file that the plan adds or changes.",
 							Computed: true,
 						},
 						"last_commit_id": schema.StringAttribute{
-							Description: "SHA of the last commit that modified the file, as the last refresh or apply " +
-								"recorded it; after a refresh that found the file changed, or an adoption, that is another " +
-								"writer's commit. When optimistic_lock is enabled, sent to GitLab on update / delete / chmod " +
-								"to detect a change made after that point.",
+							Description: "The SHA of the last commit that changed the file, as the last refresh or apply recorded it. " +
+								"With optimistic_lock = true, the provider sends it with each update, delete and chmod of the file.",
 							Computed: true,
 						},
 					},

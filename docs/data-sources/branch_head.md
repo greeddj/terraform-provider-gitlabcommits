@@ -3,18 +3,17 @@
 page_title: "gitlabcommits_branch_head Data Source - gitlabcommits"
 subcategory: ""
 description: |-
-  Returns the SHA at the head of a branch and whether the branch is protected. Useful for wiring downstream pipelines to the exact SHA terraform saw.
+  Reads the head commit SHA and the protection status of a branch. Terraform normally reads this data source during plan, before the commits of the same apply. For the commit that a gitlabcommits_files resource makes, use the commit_sha of that resource: with depends_on, the head can be a later commit.
 ---
 
 # gitlabcommits_branch_head (Data Source)
 
-Returns the SHA at the head of a branch and whether the branch is protected. Useful for wiring downstream pipelines to the exact SHA terraform saw.
+Reads the head commit SHA and the protection status of a branch. Terraform normally reads this data source during plan, before the commits of the same apply. For the commit that a gitlabcommits_files resource makes, use the commit_sha of that resource: with depends_on, the head can be a later commit.
 
 ## Example Usage
 
 ```terraform
-# Read the branch HEAD, e.g. to wire downstream pipelines to the exact SHA
-# terraform saw.
+# Read the head commit and the protection status of the main branch.
 data "gitlabcommits_branch_head" "main" {
   project_id = "platform/gitops"
   branch     = "main"
@@ -34,10 +33,10 @@ output "main_is_protected" {
 
 ### Required
 
-- `branch` (String) Branch name.
-- `project_id` (String) Numeric project ID or the plain project path (e.g. "group/subgroup/project"); do not URL-encode it, the provider escapes it.
+- `branch` (String) The name of the branch. It must be a valid git ref name: for example, no space, ".." or ":", and no slash-separated part that ends with ".lock". A tag or a commit SHA fails with "Branch not found".
+- `project_id` (String) The numeric ID or the full path of the project, for example "group/subgroup/project". Do not URL-encode the path, because the provider encodes it.
 
 ### Read-Only
 
-- `commit_sha` (String) SHA of the commit at the branch head.
-- `protected` (Boolean) Whether the branch is protected in GitLab.
+- `commit_sha` (String) The SHA of the head commit of the branch when Terraform reads the data source.
+- `protected` (Boolean) True when the branch is a protected branch in GitLab.

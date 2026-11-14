@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Something doesn't work as expected
+about: Something does not work as you expect
 labels: bug
 ---
 
@@ -12,19 +12,19 @@ labels: bug
 
 ## What happened
 
-<!-- Plain English description of what went wrong. -->
+<!-- Tell what occurred. Copy the full text of each error and warning. -->
 
-## Expected behaviour
+## Expected result
 
-<!-- What you thought would happen. -->
+<!-- Tell what you expected. -->
 
 ## Reproduction
 
-<!-- Minimal HCL + commands that reproduce the issue. Redact tokens. -->
+<!-- The smallest HCL and the commands that show the problem. Remove all tokens. -->
 
 ```hcl
 ```
 
 ## Logs
 
-<!-- Run with TF_LOG=DEBUG and paste relevant output. Redact tokens. -->
+<!-- Run the command with TF_LOG=DEBUG. Paste the related output. Remove all tokens. -->

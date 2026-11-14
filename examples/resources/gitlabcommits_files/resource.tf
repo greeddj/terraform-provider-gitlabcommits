@@ -1,5 +1,4 @@
-# Manage a bundle of files in one branch of one project. Every change
-# (create / update / delete / chmod) is batched into a single commit.
+# This resource manages four files on the main branch of platform/gitops.
 resource "gitlabcommits_files" "service" {
   project_id     = "platform/gitops"
   branch         = "main"

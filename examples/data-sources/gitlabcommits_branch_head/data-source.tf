@@ -1,5 +1,4 @@
-# Read the branch HEAD, e.g. to wire downstream pipelines to the exact SHA
-# terraform saw.
+# Read the head commit and the protection status of the main branch.
 data "gitlabcommits_branch_head" "main" {
   project_id = "platform/gitops"
   branch     = "main"

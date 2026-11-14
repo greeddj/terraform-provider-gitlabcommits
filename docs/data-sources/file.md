@@ -3,18 +3,17 @@
 page_title: "gitlabcommits_file Data Source - gitlabcommits"
 subcategory: ""
 description: |-
-  Reads a single file from a GitLab repository at the given ref (branch, tag or commit SHA). Useful for migration, comparison against rendered HCL, or wiring up other resources with the file's commit metadata.
+  Reads one file of a GitLab project at a branch, a tag or a commit SHA. For a file in Git LFS, the data source reads the LFS pointer, not the LFS object. To read the file after the commit of a gitlabcommits_files resource in the same apply, add that resource to depends_on.
 ---
 
 # gitlabcommits_file (Data Source)
 
-Reads a single file from a GitLab repository at the given ref (branch, tag or commit SHA). Useful for migration, comparison against rendered HCL, or wiring up other resources with the file's commit metadata.
+Reads one file of a GitLab project at a branch, a tag or a commit SHA. For a file in Git LFS, the data source reads the LFS pointer, not the LFS object. To read the file after the commit of a gitlabcommits_files resource in the same apply, add that resource to depends_on.
 
 ## Example Usage
 
 ```terraform
-# Read one file at a ref, e.g. to compare rendered HCL against what is
-# currently committed, or to feed its metadata into other resources.
+# Read renovate.json from the main branch.
 data "gitlabcommits_file" "renovate_config" {
   project_id = "platform/gitops"
   branch     = "main"
@@ -26,8 +25,7 @@ output "renovate_blob_id" {
 }
 
 output "renovate_content" {
-  # Null for binary (non-UTF-8) files. Terraform normalises text to Unicode
-  # NFC; content_base64 is always set and keeps the file's exact bytes.
+  # For a binary file, content is null. Use content_base64 instead.
   value = data.gitlabcommits_file.renovate_config.content
 }
 ```
@@ -37,15 +35,15 @@ output "renovate_content" {
 
 ### Required
 
-- `branch` (String) Branch, tag or commit SHA to read the file from. A name git refuses as a ref name (a space, "..", ":", a trailing ".lock" and the like) fails at plan time; any other name is passed to GitLab as it is.
-- `file_path` (String) Path of the file inside the repository (relative, no leading slash).
-- `project_id` (String) Numeric project ID or the plain project path (e.g. "group/subgroup/project"); do not URL-encode it, the provider escapes it.
+- `branch` (String) The branch, the tag or the commit SHA to read the file from. It must be a valid git ref name: for example, no space, ".." or ":", and no slash-separated part that ends with ".lock".
+- `file_path` (String) The path of the file, relative to the root of the repository. It must not start or end with a slash, or contain "//", a "." or ".." part, or a part that starts with white space.
+- `project_id` (String) The numeric ID or the full path of the project, for example "group/subgroup/project". Do not URL-encode the path, because the provider encodes it.
 
 ### Read-Only
 
-- `blob_id` (String) Opaque blob identifier returned by GitLab (git SHA-1 today, possibly SHA-256 on SHA-256 repositories).
-- `content` (String) Decoded text of the git blob stored at the path: for a Git LFS-tracked file the LFS pointer, not the object; for a symlink the link target. Null when the blob is not valid UTF-8 (Terraform strings cannot hold arbitrary bytes without corruption); use content_base64 for binaries. Terraform normalises every string to Unicode NFC, so for text in another form (for example a combining accent, as macOS tools may write it) this value differs bytewise from the file. content_base64 is the byte-exact form: pass content_base64 = data.gitlabcommits_file.<name>.content_base64 to a gitlabcommits_files resource that should reproduce the file exactly.
-- `content_base64` (String) Base64-encoded bytes of the git blob stored at the path. Always set. For a Git LFS-tracked file this is the LFS pointer, not the object; for a symlink it is the link target.
-- `execute_filemode` (Boolean) Whether the file has the executable bit set in the repo.
-- `last_commit_id` (String) SHA of the most recent commit that touched this file.
-- `size` (Number) Size of the git blob in bytes (for a Git LFS-tracked file, the size of the pointer).
+- `blob_id` (String) The ID of the git object of the file at the ref.
+- `content` (String) The text of the file, or null when the bytes from GitLab are not valid UTF-8, for example in a binary file. GitLab changes text in another encoding, for example UTF-16, to UTF-8. Terraform changes text to Unicode NFC, so the value can differ from the bytes in content_base64.
+- `content_base64` (String) The bytes of the file from GitLab, encoded in base64 (never null). These are the stored bytes for UTF-8 text and binary files, and the UTF-8 bytes for text in another encoding. See the provider page, Limits.
+- `execute_filemode` (Boolean) True when the file has the executable bit at the ref.
+- `last_commit_id` (String) The SHA of the last commit that changed the file, at the ref.
+- `size` (Number) The size of the stored file in bytes. For text that GitLab changes to UTF-8, it can differ from the number of decoded bytes in content_base64.

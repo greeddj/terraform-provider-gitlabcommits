@@ -2,21 +2,21 @@ terraform {
   required_providers {
     gitlabcommits = {
       source = "greeddj/gitlabcommits"
-      # Pin a version once you depend on released behaviour, e.g.:
-      # version = "~> 0.2.0"
+      # Pin the provider version, for example:
+      # version = "~> 0.3.0"
     }
   }
 }
 
-# Token and base_url can also be supplied via the GITLAB_TOKEN and GITLAB_BASE_URL
-# environment variables, in which case this block can be omitted entirely.
+# You can set the token and the GitLab URL in GITLAB_TOKEN and GITLAB_BASE_URL.
+# Then you do not need this provider block.
 provider "gitlabcommits" {
   token    = var.gitlab_token
-  base_url = "https://gitlab.com"
+  base_url = "https://gitlab.com" # This is the default. For a self-managed GitLab, set its URL.
 }
 
 variable "gitlab_token" {
-  description = "GitLab token with the `api` scope (Personal, Project, or Group access token), or a fine-grained personal access token with the permissions listed in the provider docs."
+  description = "GitLab token: an access token with the api scope, or a fine-grained personal access token. See Authentication on the provider page."
   type        = string
   sensitive   = true
 }

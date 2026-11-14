@@ -88,45 +88,44 @@ func (p *gitlabCommitsProvider) Metadata(_ context.Context, _ provider.MetadataR
 
 func (p *gitlabCommitsProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Terraform provider for managing repository files in GitLab via the Commits API. " +
-			"Each managed resource produces at most one commit per terraform apply, containing all of its file changes, " +
-			"and none when nothing changed. " +
-			"Tested against GitLab 19.x; older versions may work for basic operations but are not supported.",
+		Description: "The gitlabcommits provider manages files on GitLab branches through the GitLab Commits API. " +
+			"Each create, update or destroy of a gitlabcommits_files resource makes a maximum of one commit, " +
+			"with all its file changes. " +
+			"A replacement can make two commits in one apply: a delete commit and a create commit.",
 		Attributes: map[string]schema.Attribute{
 			"token": schema.StringAttribute{
-				Description: "GitLab token used for REST API calls: a Personal, Project, or Group access token with the `api` scope, " +
-					"or a fine-grained personal access token (GitLab 19.2+) with Commit: Create, Repository: Read, Branch: Read and " +
-					"Project: Read (plus Branch: Create when create_branch_from is used). A CI job token (CI_JOB_TOKEN) is rejected: the provider " +
-					"authenticates with the Private-Token header, which GitLab does not accept for a job token, and the job-token " +
-					"allowlist leaves out POST /repository/commits anyway. " +
-					"When unset or empty, the GITLAB_TOKEN environment variable is used. See the provider documentation's Authentication section for details.",
+				Description: "The GitLab access token. " +
+					"A fine-grained token needs Commit: Create, Repository: Read, Branch: Read and Project: Read, " +
+					"and also Branch: Create if you set create_branch_from. " +
+					"If token is null or empty, the provider uses GITLAB_TOKEN. " +
+					"See the provider page, Authentication.",
 				Optional:  true,
 				Sensitive: true,
 			},
 			"base_url": schema.StringAttribute{
-				Description: "GitLab base URL for self-hosted instances. When unset or empty, the GITLAB_BASE_URL environment " +
-					"variable is used, and https://gitlab.com when that is unset or empty too.",
+				Description: "The URL of the GitLab instance, with or without /api/v4, for example https://gitlab.example.com. " +
+					"If base_url is null or empty, the provider uses GITLAB_BASE_URL, " +
+					"or https://gitlab.com if neither has a value. " +
+					"See the provider page, Authentication.",
 				Optional: true,
 			},
 			"max_retries": schema.Int64Attribute{
-				Description: "Maximum number of retries on transient failures (5xx, 429) for read and probe requests. " +
-					"The commit request (POST /repository/commits) is retried only on 429 and on connection failures that " +
-					"happen before the request is sent, never on 5xx, so one apply cannot land two commits. " +
-					"Default 5, at most 100. Set to 0 to disable retries entirely.",
+				Description: "The maximum number of retries of a failed GitLab request, from 0 to 100. " +
+					"The default is 5, and 0 stops all retries. " +
+					"See the provider page, Limits.",
 				Optional: true,
 			},
 			"retry_wait_min_ms": schema.Int64Attribute{
-				Description: "Base wait (ms) for rate-limited (429) retries. When GitLab gives the time to wait in a " +
-					"Retry-After header, or else in a RateLimit-Reset header, the wait lasts that time, or this value if that " +
-					"is longer. When GitLab asks for more than five minutes, or gives no time, the wait doubles with each " +
-					"attempt instead, and the provider reports the 429 after the last retry. 5xx and connection retries use " +
-					"client-go's linear schedule: 700-900 ms times the attempt number. Default 1000, at most 3600000 (one hour).",
+				Description: "The minimum wait in milliseconds before a retry after HTTP 429, from 1 to 3600000. " +
+					"The default is 1000, and the value must not be more than retry_wait_max_ms. " +
+					"See the provider page, Limits.",
 				Optional: true,
 			},
 			"retry_wait_max_ms": schema.Int64Attribute{
-				Description: "Sets the random jitter (ms) added to each rate-limited (429) retry wait, which is up to " +
-					"retry_wait_max_ms - retry_wait_min_ms; the total wait can exceed this value. Must not be below " +
-					"retry_wait_min_ms. Default 30000, at most 3600000 (one hour).",
+				Description: "After HTTP 429, the provider adds a random time to each wait, " +
+					"from 0 to retry_wait_max_ms minus retry_wait_min_ms milliseconds. " +
+					"This value does not limit the wait. " +
+					"It must be from 1 to 3600000 and not less than retry_wait_min_ms, with a default of 30000.",
 				Optional: true,
 			},
 		},

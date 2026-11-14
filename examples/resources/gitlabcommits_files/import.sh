@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Import format: <project_id>::<branch>
-#
-# After import the files map is empty in state. The next plan reconciles
-# the user's HCL with the repository, and adopt_existing=true (default)
-# rewrites "create" actions for paths that already exist into "update"s,
-# so the apply converges without duplicate-file errors. A path whose
-# content and mode already match needs no action, so when the repository
-# already matches the HCL that apply makes no commit.
+# The ID is <project_id>::<branch>, with project_id exactly as in the configuration.
+# With adopt_existing = true (default), the next apply adopts matching files without a commit.
 terraform import 'gitlabcommits_files.service' 'platform/gitops::main'

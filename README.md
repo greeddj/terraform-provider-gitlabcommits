@@ -4,210 +4,76 @@
 [![Release](https://github.com/greeddj/terraform-provider-gitlabcommits/actions/workflows/release.yml/badge.svg)](https://github.com/greeddj/terraform-provider-gitlabcommits/actions/workflows/release.yml)
 [![codecov](https://codecov.io/gh/greeddj/terraform-provider-gitlabcommits/graph/badge.svg)](https://codecov.io/gh/greeddj/terraform-provider-gitlabcommits)
 
-A Terraform provider that manages **bundles of files** in a GitLab repository.
-Every change a resource makes - create, update, delete or chmod - is batched
-into **one commit per `terraform apply`**, so you get **one CI pipeline run per
-resource** instead of one per file.
+The `gitlabcommits` provider manages a bundle of files on one branch of a GitLab project.
+Each create, update or destroy of a `gitlabcommits_files` resource puts all its file changes into one commit.
 
-It exists to solve a very specific operational problem: a GitOps repository
-holding huge fan-outs of nearly-identical YAML (helm values, ArgoCD
-applications) for *N services x M environments*. With `gitlab_repository_file`
-each file becomes its own commit, which is a non-starter at any reasonable scale.
-This provider lets you express the bundle as Terraform and emit at most one
-commit per service per apply.
+A GitOps repository can hold many similar YAML files, for example Helm values for each service and environment.
+With the `gitlab_repository_file` resource of the GitLab provider, each file gets its own commit, and each commit can start a CI pipeline.
+With this provider, one resource manages the files of one service.
 
-> **Note:** This project was created in collaboration with Claude Code.
-
-## How it actually works
-
-A single resource (`gitlabcommits_files`) owns a `map(path -> file)` on one
-branch of one project. The provider:
-
-- **Create** - pushes one commit that creates every file. If `adopt_existing`
-  is true (default) and a path already exists in the repo, the action is
-  silently rewritten from `create` to `update`, so the apply does not fail.
-  A path whose content and mode already match the plan needs no action, so
-  an apply that only adopts identical files makes no commit and leaves
-  `commit_sha` unset. A path that cannot be read for adoption fails the
-  apply before anything is committed. When the branch does not exist yet and
-  `create_branch_from` is set, the branch is created from that ref in the
-  same operation as the commit (one push event); with nothing to commit it is
-  created on its own. A branch name is resolved to its head commit first,
-  and the files are compared with that commit and the branch created from
-  it, even if the source branch moves in the meantime. In a repository with
-  no commits yet, leave `create_branch_from` unset: the first commit creates
-  the branch. Another resource that starts its branch from that commit sets
-  `create_branch_from` to that branch and needs `depends_on` on the first
-  resource: nothing else orders the two, and GitLab refuses a first commit
-  once another one has landed.
-- **Read** - probes each managed file via a HEAD-style metadata call
-  (`GetFileMetaData`) and compares the GitLab-returned `blob_id` and exec
-  bit with state. Only when the blob has actually drifted does it pull the
-  full content. Any drift updates state, so the next plan shows real
-  differences against the repo. A file managed through `content` that
-  drifts to bytes that are not valid UTF-8, or to text in a Unicode form
-  other than NFC (see Limits), is recorded in `content_base64` instead, with
-  a warning: the next apply restores the configured text, and switching the
-  file to `content_base64` keeps the new bytes. A Git LFS pointer that names
-  the content in state is no drift (see Limits).
-- **Update** - diffs plan vs state and emits the **minimum** set of actions:
-  gone paths -> `delete` (emitted first), new paths -> `create`, or nothing
-  when the path already exists with identical content, content changed ->
-  `update`, exec bit flipped -> `chmod`. A file is never created where the
-  branch holds a directory (see Caveats). If nothing changed, no commit is
-  produced. A delete or chmod that carries no lock token (for example with
-  `optimistic_lock = false`) is probed first: a delete of a path that no
-  longer holds a file is dropped, and a chmod of one fails. A delete of a
-  path another resource took over in the same apply is dropped as well (see
-  Caveats). The plan shows `blob_id` and `last_commit_id` as known after
-  apply only for the files the apply adds, whose `content`,
-  `content_base64` or `execute_filemode` it changes (switching between
-  `content` and `content_base64` of the same bytes included, though that
-  makes no commit) or whose values are not known until apply, and
-  `commit_sha` only when some file is one of those or is removed, so a
-  one-file edit lists one file, and an edit to `commit_message` alone shows
-  no computed value changing.
-- **Delete** - pushes one commit that removes every managed file. With
-  `optimistic_lock` the commit goes out without probing: GitLab checks each
-  file's `last_commit_id` itself and rejects the commit when a file was
-  changed or removed out of band. Only then are the files probed, the ones
-  already gone dropped, and the commit retried once, so a destroy still lands
-  at most one commit. A file without a lock token is probed before the commit.
-  Files already absent are skipped (idempotent against external cleanup), and
-  a destroy that finds none left makes no commit and says so in a warning.
-  A file another resource created or adopted in the same apply is kept, with
-  a warning (see Caveats). Disable with `delete_on_destroy = false`.
-
-The composite ID is `<project_id>::<branch>`. Import with that format; the
-files map starts empty and is reconciled on the next plan + apply.
+> **Note:** The author made this project in collaboration with Claude Code.
 
 ## Requirements
 
-- Terraform >= 1.5
-- Tested against GitLab 19.x; older versions may work for basic operations
-  but are not supported
-- A token that can call the GitLab REST API on the target project (see Authentication below)
-- On macOS and Windows, `SSL_CERT_FILE` / `SSL_CERT_DIR`, when set, replace the
-  system certificate store for the provider's TLS connections (Go 1.27 default);
-  unset them if your GitLab's CA lives only in the system store
-- Go >= 1.27.4 (development only)
+- Terraform 1.5 or later.
+- GitLab 19.x, the supported version.
+- A GitLab token that can use the REST API on the project. See [Authentication](docs/index.md#authentication).
+- On macOS and Windows, a value in `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces the system certificate store (the Go 1.27 default).
+  If only the system store holds the CA certificate of your GitLab instance, unset these variables or set `GODEBUG=x509sslcertoverrideplatform=0`.
 
-## Provider configuration
+## Quick start
 
 ```hcl
 terraform {
   required_providers {
     gitlabcommits = {
-      source = "greeddj/gitlabcommits"
-      # Pin a version once you depend on released behaviour, e.g.:
-      # version = "~> 0.2.0"
+      source  = "greeddj/gitlabcommits"
+      version = "~> 0.3.0"
     }
   }
 }
 
 provider "gitlabcommits" {
-  token    = var.gitlab_token              # or GITLAB_TOKEN
-  base_url = "https://gitlab.example.com"  # optional; or GITLAB_BASE_URL
+  # Optional. The default is GITLAB_BASE_URL, then https://gitlab.com.
+  base_url = "https://gitlab.example.com"
+}
+
+resource "gitlabcommits_files" "demo" {
+  project_id     = "platform/gitops"
+  branch         = "main"
+  commit_message = "chore(demo): sync the demo values"
+
+  files = {
+    "services/demo/values.yaml" = {
+      content = yamlencode({ replicas = 2 })
+    }
+  }
 }
 ```
 
-| Argument | Default | Description |
-| --- | --- | --- |
-| `token` | `GITLAB_TOKEN` | Token for the REST API; see Authentication. An empty string counts as unset. |
-| `base_url` | `GITLAB_BASE_URL`, else `https://gitlab.com` | Base URL of a self-hosted instance. An empty string counts as unset. |
-| `max_retries` | `5` | Retries on 429 and transient 5xx for read and probe requests. The commit request is retried only on 429 and on connection failures before it is sent (see Limits and retries). `0` disables retries; at most `100`. |
-| `retry_wait_min_ms` | `1000` | Base wait for 429 retries. When GitLab gives the time to wait (`Retry-After`, else `RateLimit-Reset`), the wait lasts that time, or this value if it is longer. When GitLab asks for more than 5 minutes, or gives no time, the wait doubles per attempt. 5xx and connection retries wait 700-900 ms times the attempt number. At most `3600000` (one hour). |
-| `retry_wait_max_ms` | `30000` | Sets the random jitter added to each 429 wait, up to `retry_wait_max_ms - retry_wait_min_ms`; not a bound on the total wait. At most `3600000`. |
+1. Put this configuration, with the values of your project, in a `.tf` file.
+2. Set the `GITLAB_TOKEN` environment variable to your token.
+3. Run `terraform init`.
+4. Run `terraform apply`.
 
-## Authentication
+## How it works
 
-The provider needs a token that can call the GitLab REST API on the target
-project. Supported token types:
+- One `gitlabcommits_files` resource manages the `files` map on one branch of one project.
+  For more branches or projects, use more resources, for example with `for_each`.
+- An update that changes no content, no executable bit and no path makes no commit.
+- When Terraform destroys a resource, also when you remove it from the configuration, the provider deletes its files (`delete_on_destroy`, default `true`).
+  A change to `project_id` or `branch` replaces the resource, so one apply can make a delete commit and a create commit.
+- When a new path already holds a file, the resource adopts it (`adopt_existing`, default `true`).
+  The commit then changes only the content or the executable bit that is different.
+- A refresh records external changes in state (`detect_drift`, default `true`), so the next plan shows the changes that restore your configuration.
+- Most commits that update or delete a file, or change its executable bit, send the `last_commit_id` of that file (`optimistic_lock`, default `true`).
+  If the file changes after the provider reads that value, GitLab refuses the commit (see [Optimistic locking](docs/resources/files.md#optimistic-locking)).
 
-- **Personal Access Token** with the `api` scope.
-- **Project Access Token** (or **Group Access Token**) with the `api` scope.
-  Recommended for CI/CD - scope a token to exactly the project(s) you manage.
-- **Fine-grained Personal Access Token** (GitLab 19.2+) with these permissions
-  on the target project (or its group): `Commit: Create`, `Repository: Read`,
-  `Branch: Read` and `Project: Read`, plus `Branch: Create` when a resource
-  sets `create_branch_from`. `Project: Read` is used when a resource targets
-  a branch that does not exist yet (to tell an empty repository, or a project
-  the token cannot see, from a missing branch) and to look up a `project_id`
-  spelled as a path when one apply has to match a file across two spellings
-  of it (see Caveats). On GitLab.com such a token is required once the
-  project's top-level group enforces fine-grained tokens: after the
-  enforcement date a legacy personal access token is refused on the group's
-  projects. On GitLab Self-Managed, enforcement only stops legacy tokens from
-  being created or rotated; existing ones keep working until they expire.
+For the full behavior, see [How the resource works](docs/resources/files.md#how-the-resource-works) and [Caveats](docs/resources/files.md#caveats).
 
-The token's user (or the token itself, for Project/Group tokens) needs the
-**Developer** role, or **Maintainer** to push to a protected branch.
+## Example: many services and environments
 
-Pass the token via the `GITLAB_TOKEN` environment variable or the `token`
-attribute on the provider block. In CI, prefer a CI variable such as
-`TF_VAR_gitlab_token` over committing the token. An empty `token` counts as
-unset, so a module variable that defaults to `""` falls back to
-`GITLAB_TOKEN`. `base_url` falls back to `GITLAB_BASE_URL` the same way, and
-to `https://gitlab.com` when that is empty or unset too.
-
-> The `write_repository` scope is for Git-over-HTTP (push/pull) and does
-> **not** authenticate REST API calls - of the legacy scopes only `api` does.
-> `CI_JOB_TOKEN` is not supported, and the provider rejects a job token when
-> it is configured. It authenticates with the `Private-Token` header, which
-> GitLab does not accept for a job token: depending on the version GitLab
-> answers 401, or ignores the token and runs the request anonymously (a 404
-> on a private project, a 401 on the commit for a public one). GitLab's
-> job-token allowlist leaves out `POST /repository/commits` anyway.
-
-## Resource: `gitlabcommits_files`
-
-| Argument | Type | Required | Description |
-| --- | --- | --- | --- |
-| `project_id` | string | yes | Numeric project ID or plain project path (`group/subgroup/project`, not URL-encoded). Changing it, respelling it, or a value unknown at plan time forces replacement; see Caveats. |
-| `branch` | string | yes | Target branch (must exist, or set `create_branch_from`; in a repository with no commits yet the first commit creates it). Changing it, or a value unknown at plan time, forces replacement; see Caveats. |
-| `commit_message` | string | yes | Used for any commit produced (create / update / destroy). |
-| `author_name` | string | no | Override commit author name. |
-| `author_email` | string | no | Override commit author email. |
-| `create_branch_from` | string | no | If set and `branch` does not yet exist, create it from this branch name or full commit SHA (typically `main`; tags are not supported) together with the first commit, or on its own when there is nothing to commit. A branch name is resolved to its head commit once, when the resource is created. In a repository with no commits yet, leave it unset on the resource that makes the first commit; another resource branching from that commit names that branch here and needs `depends_on` on that resource. The branch is not deleted on destroy. |
-| `detect_drift` | bool | no | Default `true`. If false, Read is a no-op. A refresh reads the value from state, so a new value affects refreshes only once an apply has recorded it; see Caveats. |
-| `delete_on_destroy` | bool | no | Default `true`. If false, destroy only drops state. Read from the state of the last apply; see Caveats. |
-| `adopt_existing` | bool | no | Default `true`. Rewrite `create` to `update` for paths that already exist, or to no action when their content already matches (needed for clean import). A path that cannot be read fails the apply without a commit. |
-| `optimistic_lock` | bool | no | Default `true`. Send each managed file's `last_commit_id`, as the last refresh or apply recorded it (for a file the apply adopts, as its probe during the apply reads it), so GitLab rejects the commit with HTTP 400 and the apply fails when the file changed after that point; with `detect_drift = true` a change made before the plan's refresh shows up in the plan and is overwritten by applying it (see Caveats). Set to `false` to opt out. Not sent on the first commit of a branch created from `create_branch_from`. For the destroy commit, read from the state of the last apply. |
-| `files` | map of object | yes | See below. Must not be empty: `files = {}` would mean "delete everything", which is what `terraform destroy` is for. An entry must not be null; omit its key to leave a file out. Keys are normalised to Unicode NFC, so a path stored in another form cannot be addressed (see Limits). |
-| `id` | string | computed | Composite identifier `<project_id>::<branch>`. |
-| `commit_sha` | string | computed | SHA of the most recent commit produced by this resource. A plan that adds and removes no file and leaves every file's `content`, `content_base64` and `execute_filemode` as they are (all known at plan time) keeps it known. |
-
-### `files` entry
-
-| Field | Type | Computed | Notes |
-| --- | --- | --- | --- |
-| `content` | string | no | text content; mutually exclusive with `content_base64`; normalised to Unicode NFC by Terraform, so text that must keep another form needs `content_base64`; drift to bytes that are not valid UTF-8 or text that is not NFC is recorded in `content_base64` (see Read above) |
-| `content_base64` | string | no | base64-encoded content (use for binaries); mutually exclusive with `content` |
-| `execute_filemode` | bool | no | default `false`; toggling triggers a `chmod` action |
-| `blob_id` | string | yes | opaque blob identifier returned by GitLab; used for drift detection (git SHA-1 today, possibly SHA-256 on SHA-256 repos) |
-| `last_commit_id` | string | yes | SHA of the last commit that modified the file, as the last refresh or apply recorded it (after a refresh that found the file changed, or an adoption, another writer's commit); sent on update / delete / chmod when `optimistic_lock = true` |
-
-## Data sources
-
-- `gitlabcommits_file` reads one file at a branch, tag or commit SHA. Inputs:
-  `project_id`, `branch`, `file_path`. Outputs: `content` (null when the file
-  is not valid UTF-8), `content_base64` (always set), `blob_id`,
-  `last_commit_id`, `execute_filemode`, `size`. Useful for comparing rendered
-  HCL with what is committed. Terraform normalises strings to Unicode NFC,
-  so for text in another form `content` differs bytewise from the file;
-  `content_base64` is the byte-exact form, the one to hand to a
-  `gitlabcommits_files` resource that should reproduce the file exactly.
-  The content and size are those of the git blob stored at the path: for a
-  Git LFS-tracked file the LFS pointer, not the object, and for a symlink
-  the link target.
-- `gitlabcommits_branch_head` returns `commit_sha` and `protected` for a
-  branch, e.g. to wire downstream pipelines to the exact SHA terraform saw.
-
-Examples live in [`examples/data-sources/`](examples/data-sources/); the full
-attribute reference for the provider, the resource and both data sources is
-the generated [`docs/`](docs/).
-
-## Typical layout: 20 services x 30 environments
+Here, one resource manages the Helm values and the Argo CD applications of one service for all environments.
 
 ```hcl
 resource "gitlabcommits_files" "service" {
@@ -224,7 +90,6 @@ resource "gitlabcommits_files" "service" {
         content = yamlencode({
           image        = { repository = each.value.image_repo, tag = each.value.image_tag }
           replicaCount = env.replicas
-          ingress      = { enabled = true, host = "${each.key}.${env.domain}" }
         })
       }
     },
@@ -238,7 +103,6 @@ resource "gitlabcommits_files" "service" {
           spec = {
             source      = { path = "services/${each.key}/chart", helm = { valueFiles = ["../values/${env_name}.yaml"] } }
             destination = { server = env.cluster, namespace = env.namespace }
-            syncPolicy  = { automated = { prune = true, selfHeal = true } }
           }
         })
       }
@@ -247,319 +111,42 @@ resource "gitlabcommits_files" "service" {
 }
 ```
 
-20 resources -> at most 20 commits per apply -> at most 20 pipeline runs.
-With one commit per file, the first apply would make 1,200 commits (two files
-per service and environment), and bumping every service's image tag 600.
+With 20 services and 30 environments, the 20 resources manage 1,200 files.
+An apply without a replacement makes at most 20 commits. With one commit for each file, the first apply makes 1,200 commits.
+A replacement of all 20 resources can make 40 commits in one apply.
+The provider makes the commits of these resources one at a time, so they do not conflict (see [Many resources on one branch](docs/resources/files.md#many-resources-on-one-branch)).
 
-A complete example lives in [`examples/for_each/main.tf`](examples/for_each/main.tf).
+A complete example is in [`examples/for_each/main.tf`](examples/for_each/main.tf).
 
-## Import
+## Documentation
 
-```bash
-terraform import 'gitlabcommits_files.service["frontend"]' 'platform/gitops::main'
-```
-
-Import checks that the branch exists. After import the files map is empty in
-state. The next plan will produce `create` actions for every file; with
-`adopt_existing = true` (default) those that already exist in the repo are
-compared with the plan: identical content needs no action, differing content
-becomes an `update`. A configuration that matches the repository therefore
-converges without a commit; a Git LFS-tracked file matches when its pointer
-names the configured bytes (see Limits).
-
-## Caveats worth knowing
-
-- **One resource = one branch = one project**. To target multiple branches or
-  repos, use multiple resources (typically via `for_each`).
-- **Many resources on one branch are safe within one apply.** Terraform runs
-  resources in parallel, and concurrent commits to the same branch would race
-  on its tip (GitLab rejects the loser with HTTP 400 "reference does not point
-  to expected object"). The provider serialises its commits per branch within
-  one provider configuration, so the `for_each` layout above never hits that;
-  each resource still lands at most one commit. Two things stay outside that
-  guarantee: resources sharing a branch must spell `project_id` the same way
-  (a numeric ID and a path are different lock keys; changing the spelling of
-  an existing resource is a replacement, see below), and a second provider
-  block (alias) runs in its own process. Any other writer (another pipeline,
-  a manual push, an aliased provider) is reported as "Branch changed while
-  the commit was being created" and you re-run the apply; if that repeats on
-  every run, look for a tag with the branch's name (see Limits).
-- **Within one apply, a file handed from one resource to another is kept.**
-  Moving a file from one resource's `files` to another's on the same branch,
-  renaming a resource address without a `moved` block, and a replacement
-  under `create_before_destroy` all make one resource delete a path that
-  another creates or adopts in the same apply, and Terraform does not order
-  the delete before the adoption. The provider remembers, in memory and for
-  the length of the run, every path a resource creates or adopts (all of a
-  new resource's files, the files an update adds). Another resource's delete
-  of such a path is dropped with a warning naming it, and a resource that
-  takes a path over looks at the repository only after any delete commit
-  already in flight on the branch has landed. Either way the file ends up on
-  the branch and in the state of the resource that now manages it; the
-  one-commit-per-resource rule is unchanged.
-  - A claim under another spelling of the same project (numeric ID vs path),
-    as a respelled replacement makes, is recognised too. When a delete meets
-    a claim under another spelling, two numeric IDs are compared as numbers
-    and each path spelling is looked up once per run; that also happens for
-    another project that shares the branch name and the path (the same
-    `.gitlab-ci.yml` on `main` in several projects) when either is spelled
-    by path. If a lookup fails, the operation fails and commits nothing, and
-    the error says how to go on: when both spellings name the same project,
-    simply applying again would delete the file. The wait for a delete in
-    flight comes from the branch lock, so it still needs the same spelling.
-  - Not covered: other runs, and a second provider block (alias), which is
-    another process. So move a file in one apply: adding it to the new
-    resource in one apply and removing it from the old one in a later apply
-    makes the later apply delete it, and the new resource finds it missing
-    on its next refresh. A re-run of a failed apply is another run too: when
-    a resource left a file in place for another one and then failed (its
-    lookup or its commit), applying again retries that operation, which
-    then deletes the file. To keep it, remove the failed resource from state
-    (`terraform state rm <address>`, which also drops a replaced object
-    still waiting for its destroy and leaves every file in place), import
-    it again if the configuration still declares it, and apply.
-- **Changing `branch` or `project_id` replaces the resource**, and so do
-  respelling the same project (a numeric ID vs a path),
-  `terraform apply -replace`, `terraform taint` and `replace_triggered_by`.
-  A value that is unknown at plan time counts as a change: when `project_id`
-  or `branch` comes from a data source read during apply (a data source or
-  module with `depends_on`) or from an attribute of a resource being
-  replaced, Terraform plans `(known after apply) # forces replacement` even
-  if the final value is the same. Keep both known at plan time (literals,
-  variables, data sources without `depends_on`); if they cannot be, an
-  applied `delete_on_destroy = false` makes such a replacement commit-free,
-  since the destroy then leaves the files and the create adopts them.
-  - Without `create_before_destroy`, replacement is destroy-then-create: with
-    the default `delete_on_destroy = true` the destroy pushes a commit
-    deleting every managed file from the OLD target before the files are
-    created on the new one. On the same branch that is two commits with none
-    of the files in between, which a push-triggered pipeline or an ArgoCD
-    sync with `prune` can act on.
-  - Under `create_before_destroy` (set on this resource, or imposed by
-    Terraform when a resource that depends on it has it) the new object is
-    created first. On another branch or project the old files are then
-    deleted; on the same branch and project the new object adopts them
-    (without a commit when they already match) and the old object's destroy
-    leaves them in place.
-  - To re-point without a delete commit, set `delete_on_destroy = false` and
-    apply before changing the target, or hand the files over: drop the old
-    instance from state without destroying it, with a
-    `removed { from = <address> lifecycle { destroy = false } }` block
-    (Terraform 1.7+) or `terraform state rm <address>`, then declare the
-    resource for the new target; its first apply adopts matching files
-    without a commit. Renaming the resource address alone does not help:
-    without a `moved` block the old address is destroyed, and with one a
-    changed target is still a replacement. For a pure address refactor
-    (a renamed resource or `for_each` key) use
-    `moved { from = <old address> to = <new address> }`.
-  - Replacing is never needed to re-push files: with `detect_drift = true`
-    (default) a plain `terraform apply` already restores drifted files.
-- **`delete_on_destroy` and `optimistic_lock` apply as last applied.**
-  Terraform does not evaluate configuration during `terraform destroy`, so the
-  destroy commit uses the values recorded in state by the last apply. Change
-  the flag in HCL, run `terraform apply`, then destroy.
-- **A branch deleted out of band is recreated.** When the branch is gone
-  (for example deleted when its merge request was merged), a refresh
-  removes the resource from state and the next apply creates it again,
-  materialising the branch from `create_branch_from`. When the branch goes
-  between the plan and the apply, the commit fails with "Branch no longer
-  exists" and nothing is committed; applying again recovers. With
-  `detect_drift = false` recorded in state, catch up first as the next
-  point describes.
-- **`detect_drift` applies as last applied, too.** With
-  `detect_drift = false` a refresh leaves state as the last apply left it.
-  A refresh is handed the state, not the configuration, so it reads the
-  recorded value, and an apply that fails keeps that value: turning
-  `detect_drift` back on takes effect only once an apply has recorded it.
-  Until then, under `optimistic_lock` an update, chmod or delete of a file
-  changed out of band fails with GitLab's 400 on every apply and every
-  destroy, and `terraform apply -refresh-only` changes nothing. A file
-  deleted out of band stays in state; an update that removes it from
-  `files` probes the path and drops the delete, and a destroy skips it. To
-  catch up with the repository, set `detect_drift = true` with `files` as
-  last applied and apply (this makes no commit), then put back any change
-  you were applying and plan again: that plan compares `files` with the
-  branch, so with `files` still as last applied it would revert what
-  changed there. A failed commit's diagnostic gives this advice when it
-  applies.
-- **State holds your file content.** If you set `content_base64` to the bytes
-  of a 10 MB binary, those bytes live in `terraform.tfstate`. Use a secrets
-  backend and avoid committing huge binaries through this provider.
-- **Optimistic locking is on by default.** Each update / delete / chmod
-  action on a managed file sends the file's `last_commit_id` as the last
-  refresh or apply recorded it, so GitLab rejects the commit with HTTP 400
-  if the file changed after that point: the apply fails with nothing
-  committed instead of overwriting a change another pipeline landed
-  between the plan's refresh and the commit. A change made *before* that
-  refresh does not fail the apply while `detect_drift = true` (default):
-  the refresh records it, the plan shows reverting it as a change to the
-  file, and applying the plan overwrites it. So review the plan: a pipeline
-  that applies with `-auto-approve` overwrites such a change unseen, while
-  applying a reviewed saved plan (`terraform plan -out`) fails instead of
-  overwriting a file changed after the plan's refresh. With
-  `detect_drift = false` a change made before that refresh fails the apply
-  as well, at the cost described above. A path the plan adds that already
-  holds a file (`adopt_existing`) is probed during the apply and updated
-  with the `last_commit_id` that probe reads, so for it only a change
-  landing between that probe and the commit fails the apply. The provider
-  surfaces a rejection as a "Concurrent modification detected" diagnostic
-  with a hint to run `terraform apply -refresh-only` and plan again; that
-  refresh takes the other change into state as the new baseline, so
-  applying the new plan overwrites it, and it is worth reviewing first (with
-  `detect_drift = false` recorded in state that refresh changes nothing,
-  and the diagnostic says what to do instead; see above). Set
-  `optimistic_lock = false` per resource to opt out (e.g. when an external
-  bot intentionally co-edits the same files); the trade-off is silent
-  last-write-wins. Without the token the provider probes each path before a
-  delete or chmod, because GitLab would apply the action to whatever sits at
-  the path, including a directory that replaced the file. The first commit
-  of a branch created from `create_branch_from` carries no token: GitLab
-  would check it against the default branch instead of the commit the new
-  branch starts from, and that commit cannot change.
-- **A file never replaces a directory.** GitLab lets a created file replace
-  a directory at the same path together with everything in it, so a new
-  path where the branch holds a directory fails the apply without a commit.
-  The one exception is a directory holding only files the resource manages
-  and drops from `files` in the same apply: the commit deletes them first,
-  then creates the file. A new path also fails when another resource in the
-  same apply adds or adopts a file inside a directory of that name, even
-  one it has not committed yet.
-- **`commit_message` is per-apply**, not per-file. The same message is used
-  for create / update / destroy commits. This is by design - one resource,
-  one logical change, one message.
-
-## Limits and retries
-
-- **Commit request size.** GitLab caps the commit request body (300 MB by
-  default). Because this provider batches every file change into one request,
-  a very large bundle can hit that cap; the provider surfaces the 413 with
-  advice to split the bundle across multiple resources (`for_each`), or raise
-  `GITLAB_COMMITS_MAX_REQUEST_SIZE_BYTES` on self-managed GitLab.
-- **Rate limits.** Read and probe requests are retried on 429 and transient
-  5xx (`max_retries`, default 5). `retry_wait_min_ms` is the base wait between
-  429 retries. When GitLab gives the time to wait in `Retry-After`, or else in
-  `RateLimit-Reset`, the wait lasts that time (or `retry_wait_min_ms`, if that
-  is longer). The provider uses `Retry-After` first, because it does not
-  depend on the local clock. The provider accepts a requested wait of 5
-  minutes or less. A longer wait would stop the apply once for each retry, so
-  the wait then doubles per attempt, as it does when GitLab gives no time.
-  After the last retry, the provider reports the 429 and the time that GitLab
-  asked for. `retry_wait_max_ms` sets the random jitter added on top, up to
-  `retry_wait_max_ms - retry_wait_min_ms`, and does not bound the total wait.
-  5xx and connection retries use client-go's linear schedule instead: 700-900
-  ms times the attempt number, about 12 s in all with the default 5 retries. On
-  GitLab.com, commit requests above 20 MB (3 per 30 s) and reads of blobs
-  above 10 MB (5 per minute) are throttled separately; self-managed instances
-  configure such limits independently. Those limits send no rate-limit
-  headers, so a 429 without `Retry-After` can mean one of them.
-- **A Gitaly failure can look like a missing file.** GitLab answers a Files
-  API request with 404 when Gitaly times out resolving the ref, exactly as
-  for a file that does not exist; releases up to at least 19.4 do the same
-  when Gitaly is unavailable. Before a 404 lets the provider drop a file
-  from state or skip a delete, it looks the branch up, which reports the
-  same failure as an error, and fails the refresh, apply or destroy if that
-  lookup fails. That narrows the window without closing it: a timeout that
-  has cleared by the time of the branch lookup still reads as a missing
-  file, which a refresh drops from state (the next apply adopts it again
-  without a commit, with `adopt_existing`, the default) and a destroy can
-  leave in the repository.
-- **Timeouts and redirects.** Every request waits at most five minutes for
-  GitLab's response headers once it has been sent, so a wedged instance or
-  proxy fails the apply instead of hanging it (uploads are not bounded by
-  that). A redirect to another host or from https to http is never followed,
-  because the request carries the token, and neither is a 301, 302 or 303
-  on a commit or a branch creation, which net/http would re-send as a GET;
-  the redirect is reported with the target so you can point `base_url` at
-  the final address.
-- **Commits are not idempotent, so the commit request is never replayed on
-  5xx.** `POST /repository/commits` has no request deduplication: if a proxy
-  answered 502/504 after GitLab had already accepted the commit, a retry
-  would land a second commit for the same apply. The provider therefore
-  retries the commit request only on 429 (rejected before processing) and on
-  connection failures that happen before the request is sent (name lookup,
-  connect, TLS handshake timeout, directly or through a proxy). A 5xx, or a
-  connection that fails once the request may have been sent (a reset, or
-  the five-minute wait for the response), fails the apply with a diagnostic
-  that says the commit may or may not have landed; run `terraform plan` to
-  see whether it did, and apply again if it did not. With
-  `detect_drift = false` recorded in state the plan cannot show that: first
-  set `detect_drift = true` with `files` as last applied and apply (this
-  makes no commit), then put the change back in `files` and plan. A destroy
-  can simply be run again, since files already deleted are skipped.
-- **A branch that shares its name with a tag is not supported.** GitLab
-  resolves the bare name to the tag first, and the provider, like GitLab's
-  commits API, names the branch that way. File reads (refreshes, adoption,
-  the probes before a delete) then see the tag's files, so a destroy can
-  leave in place files the tag does not hold, and GitLab checks each commit
-  against the tag: `last_commit_id` against its history, and the branch tip
-  it expects against the tagged commit, so every commit to the branch fails
-  unless the tag points at the branch tip. Such a failure reads as "Branch
-  changed while the commit was being created" or "Concurrent modification
-  detected", and both diagnostics say how to check for the tag
-  (`git ls-remote <remote> refs/tags/<branch>`). Rename or delete the tag.
-- **Git LFS.** GitLab's commits API turns only a created file into an LFS
-  object and commits an update as a regular blob, so a Git LFS-tracked file
-  that a resource updates leaves LFS. The Files API returns an LFS-tracked
-  file's pointer rather than its content, and the provider sees that pointer
-  only where it reads content anyway (adopting a path, and a refresh of a
-  file that changed), so the default path makes no extra request. A pointer
-  that names exactly the configured bytes (SHA-256 and size) counts as the
-  same file on adoption, which then makes no commit, and one that names the
-  bytes in state is no drift on a refresh. A pointer to other content fails
-  the adoption with nothing committed; a refresh records the pointer text
-  in state with a warning, and an apply then refuses to change the file's
-  content or `execute_filemode` while state holds the pointer. Configuring
-  the content the pointer names, with `execute_filemode` as the branch has
-  it, records it without a commit. Change LFS-tracked files with git and
-  Git LFS.
-- **Unicode normalisation.** Terraform normalises every string, map keys
-  included, to Unicode NFC. A repository path stored in another form (for
-  example NFD, as some macOS tools write names) cannot be addressed: a
-  `files` key naming it refers to the NFC spelling, which git treats as a
-  different path, so the apply creates a second file that looks the same and
-  leaves the original unmanaged. File content in another form needs
-  `content_base64`; a file managed through `content` that drifts to such text
-  is recorded in `content_base64` with a warning, and the next apply writes
-  the configured text back.
+- [Provider](docs/index.md): the configuration, [Authentication](docs/index.md#authentication) and [Limits](docs/index.md#limits).
+- [`gitlabcommits_files` resource](docs/resources/files.md): the attributes, the behavior, [Caveats](docs/resources/files.md#caveats) and [Import](docs/resources/files.md#import).
+- [`gitlabcommits_file` data source](docs/data-sources/file.md): one file at a branch, a tag or a commit.
+- [`gitlabcommits_branch_head` data source](docs/data-sources/branch_head.md): the head commit of a branch and its protection status.
+- [Examples](examples/): complete configurations and short examples.
 
 ## Development
 
-```bash
-just build       # check + lint + test, then a static binary in ./dist
-just test        # unit tests (go test -race ./...)
-just lint        # golangci-lint
-just check       # go vet + staticcheck + govulncheck + fieldalignment
-just docs        # regenerate docs/ from the schema (CI fails on drift)
-just ci          # the full CI gate: check + lint + test + tf-fmt + examples + docs + headers + deps
-```
-
-Acceptance tests run against a real GitLab project and are gated by env vars:
+To build and test the provider, you need Go 1.27.4 or later, `just`, `golangci-lint`, the `terraform` CLI and `git`.
 
 ```bash
-TF_ACC=1 \
-GITLAB_TOKEN='...' \
-GITLAB_TEST_PROJECT_ID='you/sandbox' \
-GITLAB_TEST_BRANCH='tf-acc-test' \
-GITLAB_TEST_BRANCH_FROM='main' \
-GITLAB_BASE_URL='https://gitlab.example.com' \
-go test -count=1 -v -timeout=20m -run '^TestAcc' ./internal/...
+just build   # check, lint and test, then a static binary in ./dist
+just test    # go test -race ./...; TF_ACC adds the acceptance tests
+just docs    # generate docs/ from the schema, the templates and the examples
+just ci      # the CI checks, without the goreleaser snapshot build
 ```
 
-`GITLAB_TEST_BRANCH` defaults to `tf-acc-test` and must pre-exist unless
-`GITLAB_TEST_BRANCH_FROM` is set, in which case the tests create it from that
-ref and delete it afterwards; `GITLAB_BASE_URL` is only needed for
-self-hosted GitLab. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full
-development loop.
+For the development procedure and the acceptance tests, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## More
 
-- [CONTRIBUTING.md](CONTRIBUTING.md) - development loop, acceptance tests, PR conventions.
-- [MIGRATION.md](MIGRATION.md) - upgrading from the pre-release `gitlabcommits_commit` and `gitlabcommits_file` resources.
-- [SECURITY.md](SECURITY.md) - threat model and how to report a vulnerability.
+- [MIGRATION.md](MIGRATION.md): the upgrade from the pre-release `gitlabcommits_commit` and `gitlabcommits_file` resources.
+- [SECURITY.md](SECURITY.md): the threat model and how to report a vulnerability.
 
 ## License
 
-MIT - see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
 ## Author
 

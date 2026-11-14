@@ -1,20 +1,20 @@
 ---
 name: Feature request
-about: Suggest a new resource, data source, attribute, or behaviour
+about: Ask for a new resource, data source, attribute or behavior
 labels: enhancement
 ---
 
-## What problem does this solve?
+## Problem
 
-<!-- What are you trying to do? Why isn't the current API enough? -->
+<!-- What do you want to do? Why can the provider not do it now? -->
 
-## Proposed shape
+## Proposed HCL
 
-<!-- HCL snippet demonstrating what the API would look like. -->
+<!-- The HCL that you want to write for the new resource, data source, attribute or behavior. -->
 
 ```hcl
 ```
 
-## Alternatives considered
+## Alternatives
 
-<!-- Workarounds, related tools, why they don't fit. -->
+<!-- The workarounds or other tools that you tried, and why they are not enough. -->

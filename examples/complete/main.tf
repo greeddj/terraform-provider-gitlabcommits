@@ -12,15 +12,13 @@ provider "gitlabcommits" {
 }
 
 variable "gitlab_token" {
-  description = "GitLab Personal/Project Access Token with the `api` scope, or a fine-grained personal access token with the permissions listed in the provider docs."
+  description = "A personal, project or group access token with the api scope, or a fine-grained personal access token. See the provider page, Authentication."
   type        = string
   sensitive   = true
 }
 
-# ----------------------------------------------------------------------
-# Minimal example: one resource = one service = at most one commit per apply
-# (none when nothing changed)
-# ----------------------------------------------------------------------
+# One resource manages the files of one service. A create, an update or a
+# destroy makes at most one commit. A replacement can make two commits.
 resource "gitlabcommits_files" "frontend" {
   project_id     = "platform/gitops"
   branch         = "main"
@@ -51,5 +49,5 @@ resource "gitlabcommits_files" "frontend" {
 
 output "frontend_commit" {
   value       = gitlabcommits_files.frontend.commit_sha
-  description = "SHA of the last commit the frontend bundle produced (null if it never committed)."
+  description = "The SHA of the last commit that the frontend resource made. It is null until the resource makes a commit, and again after a replacement that makes no commit."
 }
