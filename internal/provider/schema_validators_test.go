@@ -15,10 +15,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 )
 
-// TestStringConflictsWithSibling exercises the content/content_base64 mutual
-// exclusion directly: setting both is a conflict, setting one is fine. A
-// synthetic flat config stands in for the nested file object, so no
-// resource.Test machinery is needed.
+// TestStringConflictsWithSibling: setting both content and content_base64 is
+// a conflict, setting one is fine. A synthetic flat config stands in for the
+// nested file object.
 func TestStringConflictsWithSibling(t *testing.T) {
 	ctx := t.Context()
 	sch := rschema.Schema{Attributes: map[string]rschema.Attribute{
@@ -209,10 +208,9 @@ func TestStringValidRepoPath(t *testing.T) {
 	}
 }
 
-// TestStringBranchName pins git's ref-name rules: every name git accepts as
-// a branch or tag passes, whatever characters it holds, and a name git
-// refuses fails at plan time. ':' must stay rejected, since the resource
-// and import IDs join project_id and branch with "::".
+// TestStringBranchName: a ref name git accepts passes, whatever its
+// characters, and one it refuses fails; ':' must stay rejected, since
+// resource and import IDs join project_id and branch with "::".
 func TestStringBranchName(t *testing.T) {
 	valid := []string{
 		"main", "release/1.2", "feature_x-1", "a.b", "x.lockfile", "a,b",

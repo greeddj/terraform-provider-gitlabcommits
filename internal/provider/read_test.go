@@ -48,10 +48,9 @@ func readState(blobID string) filesResourceModel {
 	}
 }
 
-// runRead builds a ReadRequest from the model and invokes Read, returning the
-// response and (on success) the resulting state model. The response starts
-// as a copy of the current state, as fwserver seeds it, so a Read that means
-// to remove the resource has to say so.
+// runRead invokes Read on the model, returning the state model on success.
+// The response starts as a copy of the state, as fwserver seeds it, so
+// removal must be explicit.
 func runRead(t *testing.T, client *gitlab.Client, state filesResourceModel) (*resource.ReadResponse, filesResourceModel) {
 	t.Helper()
 	ctx := t.Context()
@@ -116,9 +115,9 @@ func newRetryingResource(t *testing.T, h http.HandlerFunc) *filesResource {
 	return &filesResource{client: client, locks: newBranchLocks(), retryCommits: true}
 }
 
-// TestRead_DropsMissingFile covers the drift drop-pass: a managed file that
-// 404s on the metadata probe is removed from state so the next plan recreates
-// it. The branch itself still exists, so the resource stays in state.
+// TestRead_DropsMissingFile: a managed file whose metadata probe 404s is
+// dropped from state so the next plan recreates it; the branch still exists,
+// so the resource stays.
 func TestRead_DropsMissingFile(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -145,9 +144,9 @@ func TestRead_DropsMissingFile(t *testing.T) {
 	}
 }
 
-// TestRead_BranchGoneRemovesResource: when every managed file vanishes AND the
-// branch itself 404s, the resource must be removed from state (with a warning)
-// instead of surviving as a stranded shell with an empty files map.
+// TestRead_BranchGoneRemovesResource: when every managed file and the branch
+// 404, the resource is removed from state with a warning, not kept as a
+// shell with an empty files map.
 func TestRead_BranchGoneRemovesResource(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "gone", http.StatusNotFound)
@@ -166,8 +165,8 @@ func TestRead_BranchGoneRemovesResource(t *testing.T) {
 }
 
 // TestRead_EmptyFilesChecksBranch: right after import there is nothing to
-// probe, so the branch is the only thing Read can verify - gone means the
-// resource is removed, present means state passes through.
+// probe, so Read checks only the branch: gone removes the resource, present
+// keeps state as it is.
 func TestRead_EmptyFilesChecksBranch(t *testing.T) {
 	for _, branchStatus := range []int{http.StatusOK, http.StatusNotFound} {
 		t.Run(http.StatusText(branchStatus), func(t *testing.T) {
@@ -197,12 +196,9 @@ func TestRead_EmptyFilesChecksBranch(t *testing.T) {
 	}
 }
 
-// TestRead_TwoFileProbeOutcomes pins how per-file probe outcomes combine: a
-// 404 drops only its own path, and only once the branch lookup has answered
-// (a Gitaly failure reaches the Files API as a 404 but fails the branch
-// lookup, which fails the refresh with nothing dropped); any other probe
-// failure fails the refresh with nothing dropped; and two 404s on a live
-// branch empty the files map but keep the resource.
+// TestRead_TwoFileProbeOutcomes: a 404 drops only its own path, and only once
+// the branch lookup answers (Gitaly failures reach the Files API as 404s);
+// any other probe failure fails the refresh.
 func TestRead_TwoFileProbeOutcomes(t *testing.T) {
 	cases := []struct {
 		status       map[string]int
@@ -286,9 +282,9 @@ func TestRead_TwoFileProbeOutcomes(t *testing.T) {
 	}
 }
 
-// TestRead_DriftedBlobFetchFailureFails: once the probe reports a new blob,
-// a failed content fetch must fail the refresh. Treating it as unchanged
-// would keep the old content in state while GitLab holds different bytes.
+// TestRead_DriftedBlobFetchFailureFails: when the probe reports a new blob, a
+// failed content fetch fails the refresh; treating it as unchanged would keep
+// stale content in state.
 func TestRead_DriftedBlobFetchFailureFails(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -417,11 +413,9 @@ func TestRead_OversizedBlobIDIgnored(t *testing.T) {
 	}
 }
 
-// textMisfits are drifted bytes the text content attribute cannot hold,
-// with what the warning says about each: "a" in UTF-16LE with its byte order
-// mark, as PowerShell 5 writes it, which is not valid UTF-8, and "café" with
-// a combining accent, as macOS tools may write it, which Terraform would
-// turn into its NFC form on the way into state.
+// textMisfits pair drifted bytes content cannot hold with the reason the
+// warning gives: UTF-16LE with a BOM (PowerShell 5) and a decomposed "café"
+// (macOS tools), which Terraform normalises to NFC.
 var textMisfits = []struct {
 	name, misfit string
 	drift        []byte
@@ -464,11 +458,9 @@ func TestRead_TextMisfitDriftRecordedAsBase64(t *testing.T) {
 	}
 }
 
-// TestTextMisfitDrift_Converges drives the refresh above into the next apply
-// both ways the warning offers. With the configuration unchanged, the plan
-// restores the text: one update, carrying the token that refresh read, so
-// the lock passes. With the configuration switched to content_base64 of the
-// new bytes, nothing is committed.
+// TestTextMisfitDrift_Converges: after a misfit refresh, the unchanged
+// configuration restores the text in one update carrying the refreshed token,
+// and content_base64 of the new bytes commits nothing.
 func TestTextMisfitDrift_Converges(t *testing.T) {
 	refresh := func(t *testing.T, client *gitlab.Client) filesResourceModel {
 		t.Helper()
@@ -523,11 +515,9 @@ func TestTextMisfitDrift_Converges(t *testing.T) {
 	}
 }
 
-// TestRead_UnchangedBlobSkipsGetFile pins the core drift-detection invariant:
-// when the HEAD probe reports the same blob_id and exec bit as state, Read
-// must not download content - and must refresh last_commit_id only from the
-// probe (a delete-then-re-add with identical content moves the commit id
-// while keeping the blob).
+// TestRead_UnchangedBlobSkipsGetFile: when the HEAD probe matches state's
+// blob_id and exec bit, Read downloads no content but still takes
+// last_commit_id from the probe, which a re-add of identical content moves.
 func TestRead_UnchangedBlobSkipsGetFile(t *testing.T) {
 	cases := []struct {
 		name      string

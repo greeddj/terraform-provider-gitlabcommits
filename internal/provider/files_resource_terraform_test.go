@@ -35,12 +35,9 @@ func requireTerraform(t *testing.T) {
 	}
 }
 
-// TestTerraformPlan_ShowsOnlyWhatChanges runs Terraform itself against
-// repoFake. A plan that edits one file of three shows only that file's
-// computed values and commit_sha as known after apply, and a plan that only
-// edits commit_message shows no computed value changing and commits nothing.
-// Terraform checks every apply against its plan, so a value the plan kept
-// and the apply changed would fail the step as an inconsistent result.
+// TestTerraformPlan_ShowsOnlyWhatChanges runs Terraform against repoFake:
+// editing one file of three plans only that file's ids and commit_sha
+// unknown, and a commit_message edit keeps them all known and commits nothing.
 func TestTerraformPlan_ShowsOnlyWhatChanges(t *testing.T) {
 	requireTerraform(t)
 	fake := &repoFake{files: map[string]string{}}
@@ -113,14 +110,9 @@ resource "gitlabcommits_files" "test" {
 	}
 }
 
-// TestTerraformRefresh_NonNFCDriftIsPlanned runs Terraform itself against
-// repoFake: a file managed through content is rewritten out of band to the
-// same text in another Unicode form, a combining accent in place of the
-// precomposed letter. Terraform normalises every string a provider returns
-// to NFC, so recorded in content that drift would turn back into the
-// configured text next to the new blob_id, and no plan would ever show it.
-// Recorded in content_base64 it is planned, and the apply writes the
-// configured NFC bytes back in one commit.
+// TestTerraformRefresh_NonNFCDriftIsPlanned runs Terraform, which normalises
+// provider strings to NFC: an out-of-band NFD rewrite of a content file must
+// still be planned, and the apply writes NFC back in one commit.
 func TestTerraformRefresh_NonNFCDriftIsPlanned(t *testing.T) {
 	requireTerraform(t)
 	const nfc, nfd = "caf\u00e9\n", "cafe\u0301\n"

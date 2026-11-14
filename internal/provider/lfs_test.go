@@ -74,11 +74,9 @@ func TestParseLFSPointer(t *testing.T) {
 	}
 }
 
-// TestAdoptAwareActions_LFSPointer: the Files API returns an LFS-tracked
-// file's pointer, not the file. A pointer to the planned bytes is the same
-// file (at most a chmod); a pointer to other content cannot be adopted,
-// since GitLab would commit the update as a regular blob and the file would
-// leave LFS.
+// TestAdoptAwareActions_LFSPointer: a pointer to the planned bytes is the
+// same file (at most a chmod); one to other content fails, since an update
+// would take the file out of LFS.
 func TestAdoptAwareActions_LFSPointer(t *testing.T) {
 	pointer := []byte(lfsPointerFor("payload"))
 	cases := []struct {
@@ -112,11 +110,9 @@ func TestAdoptAwareActions_LFSPointer(t *testing.T) {
 	}
 }
 
-// TestAdoptLFSPointer_CreateAndImport drives both adoptions, Create and the
-// import round-trip through Update, against a branch whose f.txt is an LFS
-// pointer. A pointer to the configured bytes adopts without a commit and
-// records the pointer's blob_id, so the next refresh finds no drift; one to
-// other content fails the file before anything is committed.
+// TestAdoptLFSPointer_CreateAndImport: Create and the import round-trip adopt
+// a pointer to the configured bytes without a commit, storing its blob_id so
+// refresh sees no drift; a pointer to other content fails.
 func TestAdoptLFSPointer_CreateAndImport(t *testing.T) {
 	type adoption struct {
 		run  func(t *testing.T, client *gitlab.Client) (filesResourceModel, bool, string)
@@ -191,12 +187,9 @@ func lfsState(content string, asBase64 bool) filesResourceModel {
 	return s
 }
 
-// TestRead_LFSPointer: a refresh of a drifted blob sees the pointer of an
-// LFS-tracked file. A pointer to the content state holds is no drift, in
-// either form and also when state has no blob_id (a stamp after the commit
-// failed); only the ids move. A pointer to other content is recorded as it
-// is, with a warning that an apply refuses to change the file, unless state
-// already records that pointer text.
+// TestRead_LFSPointer: a pointer naming the content in state, in either form
+// or without a blob_id, moves only the ids; other pointers are recorded, with
+// a warning unless state holds them.
 func TestRead_LFSPointer(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -247,11 +240,9 @@ func TestRead_LFSPointer(t *testing.T) {
 	}
 }
 
-// TestUpdate_LFSPointerInState: once a refresh has recorded an LFS pointer
-// in state, the pointer is what the branch holds. A plan of the object it
-// names changes nothing and commits nothing; any other content change, and
-// a chmod, is refused before the commit, since GitLab would commit the file
-// as a regular blob outside LFS.
+// TestUpdate_LFSPointerInState: with a pointer recorded in state, planning the
+// object it names, or the pointer text, commits nothing; other content or an
+// exec bit change fails with no commit.
 func TestUpdate_LFSPointerInState(t *testing.T) {
 	pointer := lfsPointerFor("new")
 	cases := []struct {

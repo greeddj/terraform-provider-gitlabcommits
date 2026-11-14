@@ -350,14 +350,9 @@ func TestDecodeRemoteContent(t *testing.T) {
 	})
 }
 
-// TestStampBlobsAfterCommit_FetchesMetadata verifies that stampBlobs issues
-// parallel HEAD probes at the created commit and populates BlobID from the
-// X-Gitlab-Blob-Id header and LastCommitID from X-Gitlab-Last-Commit-Id,
-// not from the commitSHA argument.
-//
-// The test is parameterised on blob-id format to prove that stampBlobs is
-// opaque to blob-id length: both 40-char SHA-1 and 64-char SHA-256 IDs must
-// round-trip cleanly through state.
+// TestStampBlobsAfterCommit_FetchesMetadata: stampBlobs probes at the created
+// commit and takes BlobID and LastCommitID from the probe headers, not from
+// commitSHA, for both SHA-1 and SHA-256 blob ids.
 func TestStampBlobsAfterCommit_FetchesMetadata(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -375,9 +370,8 @@ func TestStampBlobsAfterCommit_FetchesMetadata(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Per-path blob IDs and server-side last-commit-ids the stub will return.
-			// These server-commit values are distinct from "deadbeef" (our commitSHA arg)
-			// so a regression that silently falls back to commitSHA fails the assertion.
+			// Server-side ids per path. The last-commit ids differ from "deadbeef", the
+			// commitSHA argument, so a fallback to commitSHA fails the assertion.
 			type pathMeta struct {
 				blobID       string
 				lastCommitID string
@@ -564,9 +558,9 @@ func TestBuildID(t *testing.T) {
 	}
 }
 
-// TestParseImportID covers the import ID parser used by ImportState. It must
-// reject anything that does not split cleanly into exactly two non-empty
-// halves so the caller never silently keeps part of the suffix.
+// TestParseImportID: an import ID must split into exactly two non-empty
+// halves, trimmed; anything else is rejected, so the caller never silently
+// keeps part of the suffix.
 func TestParseImportID(t *testing.T) {
 	cases := []struct {
 		in       string
@@ -600,12 +594,9 @@ func TestParseImportID(t *testing.T) {
 	}
 }
 
-// TestApiErrorDiag pins the HTTP-status -> diagnostic mapping. Each branch
-// (401/403/404/400/409/429/default) carries actionable wording for the user;
-// asserting the summary plus key detail substrings here keeps the wording from
-// drifting silently and locks in the truncation + Retry-After behaviour. The
-// caller's action appears exactly once, in the summary or the detail, and
-// absent lists what the detail must not say.
+// TestApiErrorDiag pins the summary and key detail text per HTTP status,
+// truncation and Retry-After included; the caller's action appears exactly
+// once, and absent lists what the detail must not say.
 func TestApiErrorDiag(t *testing.T) {
 	const action = `probing file "f.txt"`
 	mkErr := func(status int, msg string, headers http.Header) error {
@@ -653,12 +644,9 @@ func TestApiErrorDiag(t *testing.T) {
 			contains:    []string{"does not exist"},
 		},
 		{
-			// Not the shared sentinel, and carrying a live *http.Response.
-			// (*ErrorResponse).Is matches on the status code alone, so errors.Is
-			// claims it before the status switch does - which is the only thing
-			// keeping it out of that switch's default, since unlike the sentinel
-			// it clears the nil guard. CheckResponse does not build this shape
-			// today, so nothing else pins the order.
+			// Unlike the sentinel, this 404 carries a *http.Response and clears the
+			// switch's nil guard: only errors.Is running first keeps it out of the
+			// default, an order only this case pins.
 			name: "404-with-response", err: mkErr(404, "404 Project Not Found", nil),
 			wantSummary: "GitLab resource not found (HTTP 404)",
 			contains:    []string{"does not exist"},
@@ -899,10 +887,9 @@ func TestErrorClassifiers(t *testing.T) {
 	}
 }
 
-// TestCommitErrorDiag: a commit request that may have landed says so, a 5xx
-// because the request is never replayed and a transport failure unless it
-// provably happened before anything was sent; an answer from GitLab that
-// rejected the commit, or a failure before the request left, does not.
+// TestCommitErrorDiag: a 5xx, and a transport failure not provably pre-wire,
+// say the commit may have landed; a GitLab rejection, a pre-wire failure or
+// a cancelled lock wait do not.
 func TestCommitErrorDiag(t *testing.T) {
 	mkErr := func(status int, msg string) error {
 		return &gitlab.ErrorResponse{StatusCode: status, Response: &http.Response{StatusCode: status}, Message: msg}
@@ -949,17 +936,9 @@ func TestCommitErrorDiag(t *testing.T) {
 	}
 }
 
-// TestStampBlobs_OneProbeFailure verifies the fail-soft contract: when one
-// HEAD probe returns a server error, stampBlobs appends a warning (not an
-// error), leaves that file's BlobID null, and still stamps BlobID correctly
-// for the file whose probe succeeded.
-//
-// LastCommitID diverges between the two paths:
-//   - good-path: comes from the probe's X-Gitlab-Last-Commit-Id ("server-commit-good")
-//   - bad-path:  falls back to commitSHA ("deadbeef") because the probe failed
-//
-// Both paths count as touched by the commit, which is the only case in
-// which stampBlobs probes a path at all.
+// TestStampBlobs_OneProbeFailure: one failed probe is a warning, not an
+// error: that file gets a null BlobID and commitSHA as LastCommitID, the other
+// file the probed ids.
 func TestStampBlobs_OneProbeFailure(t *testing.T) {
 	const (
 		goodBlob           = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"
@@ -1039,12 +1018,9 @@ func TestStampBlobs_OneProbeFailure(t *testing.T) {
 	}
 }
 
-// TestStampBlobs_OversizedBlobIDRejected verifies the defensive length cap: when
-// the server returns a blob_id or last_commit_id longer than 256 bytes
-// (anything above SHA-512 hex is unexpected and could indicate a
-// hostile/MITM'd response), stampBlobs treats the probe as failed: BlobID is
-// null, LastCommitID falls back to commitSHA, and a warning (not an error)
-// naming the path once is emitted.
+// TestStampBlobs_OversizedBlobIDRejected: a blob_id or last_commit_id over
+// 256 bytes, possibly a hostile response, is a failed probe: null BlobID,
+// commitSHA as LastCommitID, and one warning naming the path once.
 func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
 	oversized := strings.Repeat("a", 300)
 	for _, tc := range []struct{ name, blob, lcid string }{
@@ -1107,8 +1083,8 @@ func TestStampBlobs_OversizedBlobIDRejected(t *testing.T) {
 }
 
 // TestStampBlobs_HeaderlessProbeIsFailure: a 2xx metadata response without
-// the blob / last-commit headers must not be stored as empty strings; it is
-// a failed probe (warning, null blob_id, commitSHA kept as the lock token).
+// the id headers is a failed probe (warning, null blob_id, commitSHA kept as
+// the lock token), never stored as empty strings.
 func TestStampBlobs_HeaderlessProbeIsFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1131,9 +1107,8 @@ func TestStampBlobs_HeaderlessProbeIsFailure(t *testing.T) {
 	}
 }
 
-// TestStampBlobs_TouchedSubset: only the touched paths are probed and
-// restamped; the rest of the map is left exactly as handed in. A nil set
-// touches nothing, so it can never stamp the commit's SHA as the lock token
+// TestStampBlobs_TouchedSubset: only touched paths are probed and restamped;
+// a nil set touches nothing, so the commit's SHA never becomes the lock token
 // of a file the commit did not modify.
 func TestStampBlobs_TouchedSubset(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1184,13 +1159,9 @@ func TestStampBlobs_TouchedSubset(t *testing.T) {
 	})
 }
 
-// TestStampBlobs_ProbesAtCreatedCommit is the directly-falsifying test for
-// the anti-race semantics: probes must run at the commit stampBlobs was
-// handed, not at branch HEAD. The stub serves the racer's blob and commit id
-// for every ref except ours; if stampBlobs asked for branch HEAD it would
-// stamp the racer's values next to our content, blinding drift detection and
-// handing the next locked apply the racer's token. State must end up with the
-// values visible at OUR commit.
+// TestStampBlobs_ProbesAtCreatedCommit: stampBlobs must probe at our commit,
+// not branch HEAD, where the stub serves a racer's ids; those would hide drift
+// and become the next apply's lock token.
 func TestStampBlobs_ProbesAtCreatedCommit(t *testing.T) {
 	const (
 		ourCommitSHA      = "ours"
@@ -1306,9 +1277,9 @@ func TestContentChanged(t *testing.T) {
 		})
 	}
 
-	// Two different base64 spellings of the same byte (non-canonical trailing
-	// bits) must compare equal via the decode fallback - if Go's decoder
-	// rejects the non-canonical form this subtest documents that too.
+	// Two base64 spellings of one byte (non-canonical trailing bits) must compare
+	// equal through the decode fallback; the subtest skips if Go's decoder rejects
+	// the non-canonical form.
 	t.Run("non-canonical base64 spellings", func(t *testing.T) {
 		got, err := contentChanged(b64("aQ=="), b64("aR=="))
 		if err != nil {

@@ -85,11 +85,9 @@ func TestFileDataSource_HappyPath(t *testing.T) {
 	}
 }
 
-// TestFileDataSource_NotFound: a 404 maps to the dedicated diagnostic that
-// names the file, not a generic API error. client-go answers every 404 with
-// one shared error before it reads the body, so a project the token cannot
-// see looks exactly like a missing file, and the detail must not claim more
-// than that.
+// TestFileDataSource_NotFound: a 404 gets the "File not found" diagnostic;
+// client-go never reads a 404 body, so the detail also names a project the
+// token cannot see.
 func TestFileDataSource_NotFound(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -138,10 +136,9 @@ func TestFileDataSource_BinaryContentNull(t *testing.T) {
 	}
 }
 
-// TestFileDataSource_NonNFCTextKeepsContent: valid text in a Unicode form
-// other than NFC still sets content, which serves jsondecode and the like
-// once Terraform has normalised it to NFC, while content_base64 keeps the
-// file's exact bytes.
+// TestFileDataSource_NonNFCTextKeepsContent: valid non-NFC text still sets
+// content (Terraform normalises it to NFC), which serves jsondecode;
+// content_base64 keeps the file's exact bytes.
 func TestFileDataSource_NonNFCTextKeepsContent(t *testing.T) {
 	nfd := []byte("cafe\u0301\n")
 	encoded := base64.StdEncoding.EncodeToString(nfd)

@@ -127,12 +127,9 @@ func TestBranchLocks_Claims(t *testing.T) {
 	}
 }
 
-// TestClaims_AdoptionWaitsForADeleteInFlight: when one resource drops a path
-// and another takes it over in the same apply, Terraform may run both at
-// once. The receiver must not probe while the giver's delete commit is in
-// flight: it would find the file, adopt it without a commit and record it,
-// and the commit would then remove it. It claims the path and passes through
-// the branch lock first, so it finds the file gone and creates it again.
+// TestClaims_AdoptionWaitsForADeleteInFlight: a receiver probing during the
+// giver's delete commit would adopt a file about to go; it passes through the
+// branch lock first and creates the file again.
 func TestClaims_AdoptionWaitsForADeleteInFlight(t *testing.T) {
 	for _, c := range []struct {
 		name            string
@@ -208,11 +205,8 @@ func TestClaims_AdoptionWaitsForADeleteInFlight(t *testing.T) {
 }
 
 // TestClaims_CreateBeforeDestroyKeepsAdoptedFiles: under create_before_destroy
-// a replacement on the same branch creates the new object first, which adopts
-// the old object's files, and destroys the old object afterwards. That
-// destroy must leave every path the new object took over in place and still
-// delete the ones only the old object managed. In the default order the
-// destroy runs first and the create puts the files back.
+// the old object's destroy leaves the paths the new object adopted in place
+// and deletes the rest; in the default order the create puts them back.
 func TestClaims_CreateBeforeDestroyKeepsAdoptedFiles(t *testing.T) {
 	cases := []struct {
 		oldTokens    map[string]string
@@ -284,11 +278,9 @@ func TestClaims_CreateBeforeDestroyKeepsAdoptedFiles(t *testing.T) {
 	}
 }
 
-// TestClaims_PathMovedBetweenResources: a file moved from one resource's
-// files map to another's on the same branch. Applied receiver first, the
-// receiver adopts it without a commit and the giver must then leave it in
-// place, committing only its other changes; applied giver first, the file is
-// deleted and created again.
+// TestClaims_PathMovedBetweenResources: a file moved to another resource on
+// the branch. Receiver first, it is adopted without a commit and kept; giver
+// first, it is deleted and created again.
 func TestClaims_PathMovedBetweenResources(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -357,14 +349,9 @@ func TestClaims_PathMovedBetweenResources(t *testing.T) {
 	}
 }
 
-// TestClaims_AnotherSpellingOfTheProject: a replacement that respells
-// project_id ("proj" -> "123") under create_before_destroy claims the paths
-// under the new spelling. The old object's destroy, under the old one,
-// resolves both: "123" is the numeric ID itself, "proj" takes one lookup.
-// The same ID keeps the file, a different one deletes it, and a failed
-// lookup fails the operation without a commit, naming both spellings and the
-// path and warning that simply applying again would delete the file. Two
-// path spellings are looked up once each and cached for the process.
+// TestClaims_AnotherSpellingOfTheProject: a claim under another project_id
+// spelling keeps the file only for the same ID (path spellings looked up once);
+// a failed lookup commits nothing and says not to re-apply.
 func TestClaims_AnotherSpellingOfTheProject(t *testing.T) {
 	cases := []struct {
 		projects      map[string]int64
@@ -504,10 +491,8 @@ func TestClaims_NoLookupWithoutAnotherSpelling(t *testing.T) {
 }
 
 // TestClaims_AllDigitSpellingsNeedNoLookup: GitLab resolves an all-digit
-// project_id by ID, so two of them are compared as numbers without a
-// request. Resources for different projects that share a branch name and a
-// path (the same .gitlab-ci.yml on main everywhere) must not make a destroy
-// depend on a lookup, and "0123" names project 123.
+// project_id by ID, so claims under such spellings are compared as numbers
+// without a request; "0123" names project 123.
 func TestClaims_AllDigitSpellingsNeedNoLookup(t *testing.T) {
 	fake := &repoFake{files: map[string]string{"a.txt": "l1", "b.txt": "l2"}}
 	res := newTestResource(fake.client(t))
@@ -530,11 +515,9 @@ func TestClaims_AllDigitSpellingsNeedNoLookup(t *testing.T) {
 	wantDiag(t, "warning", resp.Diagnostics.Warnings(), `project_id "0123", the same project as "123"`)
 }
 
-// TestClaims_DestroyFallbackLeavesClaimedFilesAlone: when GitLab rejects a
-// destroy commit, Delete probes and retries only the deletes it actually
-// sent. A path left in place for another resource is neither probed nor
-// warned about again, and when every other file turns out gone the warning
-// says the kept files are not among them.
+// TestClaims_DestroyFallbackLeavesClaimedFilesAlone: after a rejected destroy
+// commit, Delete probes and retries only the deletes it sent, never a claimed
+// path, and the warning sets the kept files apart.
 func TestClaims_DestroyFallbackLeavesClaimedFilesAlone(t *testing.T) {
 	fake := &repoFake{files: map[string]string{"f.txt": "l1"}}
 	res := newTestResource(fake.client(t))
@@ -566,9 +549,9 @@ func TestClaims_DestroyFallbackLeavesClaimedFilesAlone(t *testing.T) {
 	}
 }
 
-// TestClaims_CheckedUnderTheBranchLock: a destroy checks the claims only once
-// it holds the branch lock, right before its commit, so a path claimed while
-// it waited for the lock is still left in place.
+// TestClaims_CheckedUnderTheBranchLock: a destroy checks the claims under the
+// branch lock, right before its commit, so a path claimed while it waited for
+// the lock stays in place.
 func TestClaims_CheckedUnderTheBranchLock(t *testing.T) {
 	fake := &repoFake{files: map[string]string{"f.txt": "l1"}}
 	res := newTestResource(fake.client(t))
@@ -597,10 +580,9 @@ func TestClaims_CheckedUnderTheBranchLock(t *testing.T) {
 	wantDiag(t, "warning", destroy.diags().Warnings(), "adopted or wrote \"f.txt\"")
 }
 
-// TestClaims_ProbesWaitForTheBranchLock: Create and an Update that adds a
-// path claim it and pass through the branch lock before they probe it, so
-// while another commit holds the lock nothing is probed. A claim is kept when
-// the operation then fails.
+// TestClaims_ProbesWaitForTheBranchLock: Create and an Update adding a path
+// claim it and pass through the branch lock before probing; the claim stays
+// when the operation then fails.
 func TestClaims_ProbesWaitForTheBranchLock(t *testing.T) {
 	for _, update := range []bool{false, true} {
 		name := "create"
@@ -660,13 +642,9 @@ func TestClaims_WarningNamesThePath(t *testing.T) {
 	}
 }
 
-// TestClaims_CreateOverADirectoryFilledMeanwhile: a resource that creates a
-// file where another resource in the same apply adds a file inside a
-// directory of that name would replace the directory, and wipe that file,
-// if the other commit lands after its directory check. The other resource
-// claimed its path before committing, so the claim, checked under the
-// branch lock, fails the create before it is sent. Here the other resource
-// runs to completion while the directory check's answer is on its way.
+// TestClaims_CreateOverADirectoryFilledMeanwhile: a create of conf whose
+// directory check ran before another resource committed conf/x fails on that
+// resource's claim under the branch lock, so the directory is not replaced.
 func TestClaims_CreateOverADirectoryFilledMeanwhile(t *testing.T) {
 	for _, update := range []bool{false, true} {
 		name := "create"
@@ -713,9 +691,8 @@ func TestClaims_CreateOverADirectoryFilledMeanwhile(t *testing.T) {
 }
 
 // TestClaims_CreateOverAClaimedDirectory: a claim inside the directory a
-// create would replace fails the create when it names the same project,
-// under any spelling, and is ignored when it names another project that
-// shares the branch name. A failed lookup commits nothing.
+// create would replace fails the create for the same project under any
+// spelling, not for another project; a failed lookup commits nothing.
 func TestClaims_CreateOverAClaimedDirectory(t *testing.T) {
 	cases := []struct {
 		projects      map[string]int64

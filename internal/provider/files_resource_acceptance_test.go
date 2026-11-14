@@ -27,9 +27,9 @@ import (
 
 const accTestPathPrefix = "tf-acc-test/"
 
-// TestAccFiles_basic creates a two-file bundle in one commit, changes one
-// file, and asserts that the next apply lands exactly one commit, which
-// updates that file and leaves the other one alone.
+// TestAccFiles_basic creates a two-file bundle in one commit, then changes
+// one file and pins that the next apply lands one commit, which leaves the
+// other file's ids alone.
 func TestAccFiles_basic(t *testing.T) {
 	testAccPreCheck(t)
 
@@ -78,11 +78,9 @@ func TestAccFiles_basic(t *testing.T) {
 	})
 }
 
-// TestAccFiles_driftRestored: with detect_drift = true the refresh before
-// the plan records a file changed out of band, the plan reverts it, and the
-// apply restores the configured content in one commit. That commit carries
-// the last_commit_id the refresh recorded, so the optimistic lock lets it
-// through.
+// TestAccFiles_driftRestored: with detect_drift = true the refresh records an
+// out-of-band edit, and the apply reverts it in one commit, which carries the
+// refreshed last_commit_id, so the optimistic lock passes.
 func TestAccFiles_driftRestored(t *testing.T) {
 	testAccPreCheck(t)
 
@@ -129,9 +127,9 @@ func TestAccFiles_driftRestored(t *testing.T) {
 	})
 }
 
-// TestAccFiles_addAndRemove proves that adding and removing entries in the
-// files map lands one commit per apply, which creates the added file,
-// deletes the removed one and leaves the kept one as it was.
+// TestAccFiles_addAndRemove pins that adding and removing files map entries
+// in one apply lands one commit, and that the kept file keeps its
+// last_commit_id.
 func TestAccFiles_addAndRemove(t *testing.T) {
 	testAccPreCheck(t)
 
@@ -222,10 +220,9 @@ func TestAccFiles_directoryToFile(t *testing.T) {
 	})
 }
 
-// TestAccFiles_import covers the round-trip: create a file, make Terraform
-// forget the resource without destroying it (a removed block with destroy =
-// false), import it into the same state, then re-apply the configuration,
-// which adopts the identical file without a commit.
+// TestAccFiles_import creates a file, forgets the resource with a removed
+// block (destroy = false), imports it, and pins that the next apply adopts
+// the identical file without a commit.
 func TestAccFiles_import(t *testing.T) {
 	testAccPreCheck(t)
 
@@ -233,9 +230,9 @@ func TestAccFiles_import(t *testing.T) {
 	branch := accBranch(t)
 	head := newAccHead(t, project, branch)
 	path := accTestPathPrefix + "import/a.yaml"
-	// Once the forget step has applied, a failing step can leave a state
-	// with no resource or an empty files map, whose destroy deletes nothing
-	// and leaves the file on a pre-existing branch.
+	// After the forget step, a failing step can leave a state (no resource,
+	// or an empty files map) whose destroy deletes nothing, leaving the file
+	// on a pre-existing branch.
 	accCleanupFile(t, project, branch, path)
 
 	cfg := accConfig(project, branch, map[string]string{path: "v: 1\n"})
@@ -283,12 +280,9 @@ removed {
 				ImportStateVerify:  false, // files map is intentionally empty after import
 				ImportStatePersist: true,  // the next step must start from the imported, empty-files state
 			},
-			// Re-apply the same config after import. The plan adds the file
-			// to the empty files map, adopt_existing compares the repository
-			// content with the plan and finds it identical, so the apply
-			// converges without a commit (commit_sha stays unset); the
-			// framework's automatic plan-after-apply check enforces zero
-			// drift.
+			// After import, the plan adds the file to the empty files map;
+			// adoption finds identical content, so the apply makes no commit
+			// and commit_sha stays unset.
 			{
 				Config:           cfg,
 				ConfigPlanChecks: accExpectAction(plancheck.ResourceActionUpdate),
@@ -372,10 +366,8 @@ func accCheckFileBytes(project, branch, path string, want []byte) resource.TestC
 
 // --- helpers ---
 
-// accHead follows the head of the test branch through a test case, so each
-// step can assert how many commits its apply landed. Every check advances
-// it to the head it read; a step that commits out of band calls record
-// after doing so.
+// accHead tracks the test branch head so each step can count the commits
+// its apply landed; a step that commits out of band calls record afterwards.
 type accHead struct {
 	project, branch string
 	sha             string
@@ -390,9 +382,8 @@ func newAccHead(t *testing.T, project, branch string) *accHead {
 }
 
 // record reads the commit the next apply starts from: the branch head or,
-// while the branch does not exist and GITLAB_TEST_BRANCH_FROM is set, the
-// commit the provider creates the branch from (that commit SHA, or the head
-// of that branch).
+// while the branch is missing, the commit GITLAB_TEST_BRANCH_FROM resolves
+// to (a SHA, or a branch head).
 func (h *accHead) record(t *testing.T) {
 	t.Helper()
 	sha, err := accBranchHead(h.project, h.branch)
@@ -554,10 +545,9 @@ func accDeleteFile(t *testing.T, project, branch, path string) {
 	}
 }
 
-// accCleanupFile deletes path after the test, best-effort, for a test whose
-// destroy may leave it behind, so a pre-existing shared branch is left clean
-// (per-run branches are deleted wholesale anyway). It runs after
-// CheckDestroy, so its commit never reaches the commit checks there.
+// accCleanupFile deletes path best-effort after the test, for a test whose
+// destroy may leave it on a pre-existing branch. It runs after CheckDestroy,
+// which never counts its commit.
 func accCleanupFile(t *testing.T, project, branch, path string) {
 	t.Helper()
 	t.Cleanup(func() {
@@ -602,11 +592,9 @@ func accBranch(t *testing.T) string {
 	return branch
 }
 
-// accResourceHeader renders the shared opening of the test resource config:
-// provider block, project/branch/commit_message, and - when
-// GITLAB_TEST_BRANCH_FROM is set - create_branch_from so the provider
-// materialises the branch on first apply (unique per-run branches in CI never
-// pre-exist).
+// accResourceHeader renders the provider block and the opening of the test
+// resource. With GITLAB_TEST_BRANCH_FROM set it adds create_branch_from,
+// since CI's per-run branches never pre-exist.
 func accResourceHeader(project, branch string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `
@@ -647,10 +635,9 @@ func accClient() (*gitlab.Client, error) {
 	return gitlab.NewClient(token, opts...)
 }
 
-// accCheckFileGone asserts that path is absent at branch HEAD. A 404 counts
-// as gone only once a branch lookup succeeds too, since GitLab also answers
-// the Files API with 404 when Gitaly fails to resolve the ref (the rule
-// absentPaths follows); any other failure is an error, never "gone".
+// accCheckFileGone asserts that path is absent at branch HEAD. Like
+// absentPaths, it trusts a 404 only once a branch lookup succeeds, since a
+// Gitaly failure also answers 404.
 func accCheckFileGone(project, branch, path string) resource.TestCheckFunc {
 	return func(_ *terraform.State) error {
 		c, err := accClient()
@@ -693,10 +680,9 @@ func accCheckFileExec(project, branch, path string, want bool) resource.TestChec
 	}
 }
 
-// TestAccFiles_optimisticLockConflict provokes a real optimistic-lock 400:
-// detect_drift=false keeps the stale last_commit_id in state, an out-of-band
-// commit moves the file, and the next apply must fail with the dedicated
-// conflict diagnostic instead of silently overwriting the external edit.
+// TestAccFiles_optimisticLockConflict: with detect_drift=false state keeps a
+// stale last_commit_id after an out-of-band edit, so the next apply must fail
+// with the conflict diagnostic, not overwrite the edit.
 func TestAccFiles_optimisticLockConflict(t *testing.T) {
 	testAccPreCheck(t)
 
@@ -735,14 +721,9 @@ func TestAccFiles_optimisticLockConflict(t *testing.T) {
 				ConfigPlanChecks: accExpectAction(plancheck.ResourceActionUpdate),
 				ExpectError:      regexp.MustCompile(`Concurrent modification detected`),
 			},
-			// Recovery: the rejected apply must land nothing (PreConfig checks
-			// that) and leave the prior state, v1 with the stale token,
-			// untouched. detect_drift=false blocks a refresh from helping, so
-			// re-applying with the lock would 400 forever. Disabling the lock
-			// lets the update land in one commit, and only because state still
-			// holds v1: a failed apply that had saved v2 would plan no change
-			// to the file, commit nothing, and leave the external edit next
-			// to a state claiming v2.
+			// Recovery: the rejected apply landed nothing (PreConfig checks
+			// that) and kept v1 in state, so with optimistic_lock off the
+			// update lands in one commit; a saved v2 would commit nothing.
 			{
 				PreConfig: func() {
 					rejected := resource.ComposeAggregateTestCheckFunc(
@@ -765,9 +746,8 @@ func TestAccFiles_optimisticLockConflict(t *testing.T) {
 }
 
 // TestAccFiles_destroyAfterOutOfBandDelete: with detect_drift=false state
-// still lists a file someone deleted by hand, so the destroy commit names it
-// with its last_commit_id and GitLab rejects that commit. Destroy must then
-// retry once without the missing file and remove the rest, in one commit.
+// keeps a file deleted by hand, GitLab rejects the locked destroy commit, and
+// Destroy must retry once without that file, landing one commit.
 func TestAccFiles_destroyAfterOutOfBandDelete(t *testing.T) {
 	testAccPreCheck(t)
 
@@ -817,10 +797,8 @@ func TestAccFiles_destroyAfterOutOfBandDelete(t *testing.T) {
 }
 
 // TestAccFiles_removeAfterOutOfBandDelete: with detect_drift=false state
-// still lists a file someone deleted by hand, and its locked delete would be
-// rejected on every apply. Removing it from files, in the same apply that
-// turns detect_drift back on, must probe the path, drop the delete and
-// commit nothing.
+// keeps a file deleted by hand. Removing it in the apply that turns
+// detect_drift on must probe it, drop its locked delete and commit nothing.
 func TestAccFiles_removeAfterOutOfBandDelete(t *testing.T) {
 	testAccPreCheck(t)
 

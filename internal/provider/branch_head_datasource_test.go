@@ -62,10 +62,9 @@ func TestBranchHeadDataSource_HappyPath(t *testing.T) {
 	}
 }
 
-// TestBranchHeadDataSource_NotFound: a 404 maps to the dedicated diagnostic
-// that names the branch. client-go answers every 404 with one shared error
-// before it reads the body, so a project the token cannot see looks exactly
-// like a missing branch, and the detail must not claim more than that.
+// TestBranchHeadDataSource_NotFound: a 404 gets the "Branch not found"
+// diagnostic; client-go never reads a 404 body, so the detail also names a
+// project the token cannot see.
 func TestBranchHeadDataSource_NotFound(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

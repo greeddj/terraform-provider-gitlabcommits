@@ -109,14 +109,9 @@ func (v stringRegexValidator) ValidateString(_ context.Context, req validator.St
 	}
 }
 
-// stringBranchName is the shared check for branch and ref attributes: git's
-// ref-name rules (git check-ref-format, plus the leading dash --branch
-// rejects), so every name git accepts, "+", "@", "#" and non-ASCII
-// included, passes, and a name git would refuse fails at plan time. What
-// else GitLab refuses (a name like HEAD, a refs/heads/ prefix) is left to
-// GitLab. ':' is among git's forbidden characters and must stay rejected
-// here as well: the resource ID and the import ID join project_id and
-// branch with "::".
+// stringBranchName applies git check-ref-format's rules plus the leading dash
+// --branch rejects; GitLab's own rules are left to GitLab. ':' must stay
+// rejected: IDs join project_id and branch with "::".
 func stringBranchName() validator.String {
 	return stringBranchNameValidator{}
 }
@@ -249,11 +244,9 @@ func (v mapNonEmptyValidator) ValidateMap(_ context.Context, req validator.MapRe
 	}
 }
 
-// mapKeysValidRepoPath validates every key in the files map as a repository
-// path. Explicit logic instead of a character-class regex: only the exact "."
-// and ".." traversal segments are rejected, so legal git names like
-// "..config" stay usable; the rest (exotic characters, length limits) is
-// GitLab's to validate server-side.
+// mapKeysValidRepoPath validates every files key as a repository path.
+// Traversal checks match whole "." and ".." segments only, so a legal git
+// name like "..config" passes; GitLab validates the rest.
 func mapKeysValidRepoPath() validator.Map {
 	return mapKeysRepoPathValidator{}
 }
@@ -300,15 +293,9 @@ func validateRepoPath(p string) error {
 	return nil
 }
 
-// objectFileContentRequired enforces the "at least one" half of the
-// content/content_base64 contract at plan time: a file object that sets neither
-// is rejected during validate/plan instead of failing at apply with a runtime
-// "either content or content_base64 must be set". Combined with the per-attribute
-// stringConflictsWithSibling validators (the "not both" half), this gives the two
-// fields exactly-one-of semantics before any commit is attempted. A null entry
-// (`"path" = null`, easily produced by a conditional inside merge()) is
-// rejected too: it passes every other check, and apply could only fail on it
-// with an error that reads like a provider bug.
+// objectFileContentRequired is the "at least one" half of the
+// content/content_base64 exactly-one-of. It also rejects a null entry,
+// typical of a conditional in merge(), that otherwise fails only at apply.
 func objectFileContentRequired() validator.Object {
 	return objectFileContentRequiredValidator{}
 }

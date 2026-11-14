@@ -63,8 +63,8 @@ func fileAttr(p, name string) *tftypes.AttributePath {
 }
 
 // TestFilesSchema_ValidateResourceConfig pins the validators wired into the
-// resource schema. An empty files map matters most: Update has no guard of
-// its own and would turn it into one commit deleting every managed file.
+// resource schema. An empty files map matters most: Update has no guard and
+// would delete every managed file in one commit.
 func TestFilesSchema_ValidateResourceConfig(t *testing.T) {
 	withFile := func(f fileModel) filesResourceModel {
 		m := configOf(readState(""))
@@ -174,12 +174,9 @@ func TestFilesSchema_ValidateResourceConfig(t *testing.T) {
 	}
 }
 
-// TestPlannedModel_MatchesFramework ties the CRUD harness to the framework:
-// the plan plannedModel builds for Create and Update must be exactly the one
-// PlanResourceChange produces. A Computed attribute added to the schema that
-// plannedModel does not mark unknown, or a change to what ModifyPlan keeps,
-// fails here, instead of letting the CRUD tests hand the resource a value
-// Terraform would never hand it.
+// TestPlannedModel_MatchesFramework pins that the plan plannedModel builds for
+// Create and Update equals what PlanResourceChange produces, so a new Computed
+// attribute or a ModifyPlan change must be mirrored in plannedModel.
 func TestPlannedModel_MatchesFramework(t *testing.T) {
 	ctx := t.Context()
 	sresp := &resource.SchemaResponse{}
@@ -299,12 +296,9 @@ func TestPlannedModel_MatchesFramework(t *testing.T) {
 	}
 }
 
-// TestFilesSchema_ProjectAndBranchRequireReplace: project_id and branch
-// select the repository location, so changing either must replace the
-// resource. As an in-place Update, diffActions compares only files and would
-// record the files on a branch that never received them. A value unknown at
-// plan time counts as a change, as the attribute descriptions say: the plan
-// cannot promise an in-place update that may turn into a replacement.
+// TestFilesSchema_ProjectAndBranchRequireReplace: a changed or unknown
+// project_id or branch must replace the resource, since an in-place Update
+// diffs only files and would record them on a branch that never received them.
 func TestFilesSchema_ProjectAndBranchRequireReplace(t *testing.T) {
 	cases := []struct {
 		change      func(*filesResourceModel)
@@ -400,13 +394,9 @@ func valueAt(t *testing.T, v tftypes.Value, p *tftypes.AttributePath) tftypes.Va
 	return got.(tftypes.Value)
 }
 
-// TestModifyPlan_KeepsWhatApplyKeeps: the plan keeps the blob_id and
-// last_commit_id of every file whose content, content_base64 and
-// execute_filemode stay as state has them, and commit_sha when that holds
-// for every file and none is added or removed, since Update carries exactly
-// those values over (TestUpdate_AppliedStateKeepsThePlan). Everything else
-// stays known after apply: a known value Update then changed would fail the
-// apply as an inconsistent result, with the commit already landed.
+// TestModifyPlan_KeepsWhatApplyKeeps: the plan keeps a file's ids only when
+// its content, content_base64 and execute_filemode equal state, and commit_sha
+// only when every file does and none is added or removed.
 func TestModifyPlan_KeepsWhatApplyKeeps(t *testing.T) {
 	ctx := t.Context()
 	sresp := &resource.SchemaResponse{}
@@ -586,13 +576,9 @@ func TestModifyPlan_KeepsWhatApplyKeeps(t *testing.T) {
 	})
 }
 
-// TestUpdate_AppliedStateKeepsThePlan drives Update with the plan the
-// framework produces, ModifyPlan included, and requires the applied state to
-// keep every value that plan knew (checkUpdateResult): an untouched file
-// beside an edit, a commit_message change that commits nothing, and the
-// deletes Update drops after planning, for a path another resource claimed
-// and for a token-less delete of a path already gone, as well as an
-// identical adoption. Terraform would fail each of those applies otherwise.
+// TestUpdate_AppliedStateKeepsThePlan hands Update the framework's own plan
+// and requires the applied state to keep every value the plan knew, also
+// when Update drops planned deletes or adopts identical content.
 func TestUpdate_AppliedStateKeepsThePlan(t *testing.T) {
 	ctx := t.Context()
 	sresp := &resource.SchemaResponse{}

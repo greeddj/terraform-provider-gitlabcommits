@@ -105,13 +105,9 @@ func TestConfigure_PlaintextHTTPWarnsAndWiresRedirectGuard(t *testing.T) {
 	}
 }
 
-// TestConfigure_WiresEveryResourceAndDataSource hands what the provider's
-// Configure returns to every resource and data source it registers, as the
-// framework does. Each must accept its own kind of provider data, reject the
-// other kind, and ignore nil (the framework passes nil before the provider
-// is configured). The resource must end up with the shared client, this
-// configuration's branch locks and its commit retry setting; the data sources
-// with the shared client.
+// TestConfigure_WiresEveryResourceAndDataSource: each resource and data
+// source must take its own provider data, reject the other kind, and ignore
+// the nil the framework passes before the provider is configured.
 func TestConfigure_WiresEveryResourceAndDataSource(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
 	t.Setenv("GITLAB_BASE_URL", "")
@@ -267,11 +263,9 @@ func TestConfigure_TokenSourcing(t *testing.T) {
 	})
 }
 
-// TestConfigure_EmptySettingsCountAsUnset: a module passing a variable that
-// defaults to "" must not override the environment. An empty base_url that
-// won would point the client at gitlab.com, client-go's default, and send a
-// self-managed instance's token there; an empty token that won would fail
-// with advice to export the GITLAB_TOKEN already exported.
+// TestConfigure_EmptySettingsCountAsUnset: an empty token or base_url, as
+// from a module variable defaulting to "", falls back to the environment;
+// otherwise a self-managed instance's token could reach gitlab.com.
 func TestConfigure_EmptySettingsCountAsUnset(t *testing.T) {
 	empty := tftypes.NewValue(tftypes.String, "")
 	t.Run("empty token, GITLAB_TOKEN set", func(t *testing.T) {
@@ -389,9 +383,9 @@ type closeIdleRecorder struct {
 func (r *closeIdleRecorder) CloseIdleConnections() { r.closed = true }
 
 // TestConfigure_CloseIdleConnectionsReachesThePool: the retrying client
-// flushes the idle pool when a request finally fails, through
-// http.Client.CloseIdleConnections, which does nothing unless the
-// transport implements the method; the rate-limit observer must pass it on.
+// flushes the idle pool after a final failure through
+// http.Client.CloseIdleConnections, a no-op unless the transport implements
+// it, so the rate-limit observer must forward it.
 func TestConfigure_CloseIdleConnectionsReachesThePool(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
 	t.Setenv("GITLAB_BASE_URL", "")
@@ -631,13 +625,10 @@ func TestConfigure_BaseURLCredentialsStayOutOfLogs(t *testing.T) {
 	})
 }
 
-// TestConfigure_RateLimitHeaderIsRaceFree: GitLab.com sends RateLimit-Limit,
-// and the provider's requests run concurrently. client-go's own limiter
-// reassigns a field on the first response that every later request reads
-// unsynchronised, so a request starting in another goroutine after that
-// response is a data race; go test -race (which just test runs) reports it
-// unless Configure installs its own limiter. That limiter must still take
-// its rate from the header.
+// TestConfigure_RateLimitHeaderIsRaceFree: client-go sets its limiter from
+// the first RateLimit-Limit response, and later requests read it
+// unsynchronised; Configure's limiter must keep the header's rate without
+// that race, which only -race catches.
 func TestConfigure_RateLimitHeaderIsRaceFree(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("RateLimit-Limit", "600000")
@@ -678,10 +669,9 @@ func TestConfigure_RateLimitHeaderIsRaceFree(t *testing.T) {
 	}
 }
 
-// TestConfigure_RateLimitHeaderAfterAHop: client-go takes RateLimit-Limit
-// from the answer a request finally gets, so a first request that reaches it
-// through a followed same-host redirect, or through a retry after a 502,
-// still configures the limiter from the header that answer carries.
+// TestConfigure_RateLimitHeaderAfterAHop: client-go reads RateLimit-Limit
+// from the final answer, so a first request that follows a same-host
+// redirect or retries a 502 still sets the limiter from that answer.
 func TestConfigure_RateLimitHeaderAfterAHop(t *testing.T) {
 	hops := map[string]func(w http.ResponseWriter, r *http.Request){
 		"followed redirect": func(w http.ResponseWriter, r *http.Request) {
@@ -738,10 +728,9 @@ func (r *replayTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// TestRateLimitObserver_WhichResponsesSettle: a redirect, a 5xx or a 429
-// without RateLimit-Limit leaves the limiter to a later response; any
-// response with the header, and a 2xx or another 4xx without it, settles it
-// for good, the way the answer client-go reads it from does.
+// TestRateLimitObserver_WhichResponsesSettle: the observer skips a redirect,
+// 5xx or 429 without RateLimit-Limit and settles the limiter on any other
+// response, like client-go, which reads the final answer.
 func TestRateLimitObserver_WhichResponsesSettle(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -788,11 +777,9 @@ func TestRateLimitObserver_WhichResponsesSettle(t *testing.T) {
 	}
 }
 
-// TestHeaderRateLimiter_Observe pins the derivation client-go uses: two
-// thirds of the per-minute limit per second as the rate, a third (at least
-// one) as the burst, the request that brought the header counted, and only
-// the first response considered. counted is checked only where the rate is
-// slow enough for the missing token to still show.
+// TestHeaderRateLimiter_Observe pins client-go's derivation: two thirds of
+// the per-minute limit per second, a third (at least one) as burst, the
+// header's request counted, only the first response read.
 func TestHeaderRateLimiter_Observe(t *testing.T) {
 	cases := []struct {
 		name, header string
@@ -832,6 +819,8 @@ func TestHeaderRateLimiter_Observe(t *testing.T) {
 			if lim.Burst() != c.burst {
 				t.Errorf("burst = %d, want %d", lim.Burst(), c.burst)
 			}
+			// counted is set only where the rate is slow enough for the
+			// missing token to still show.
 			if tokens := lim.Tokens(); c.counted && tokens > float64(c.burst)-0.5 {
 				t.Errorf("tokens = %v, want the request that brought the header counted", tokens)
 			}

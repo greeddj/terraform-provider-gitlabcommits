@@ -41,11 +41,9 @@ var (
 // have no time limit.
 const responseHeaderTimeout = 5 * time.Minute
 
-// Upper bounds for the retry settings. A larger value is a typo rather than a
-// policy: a wait of days that only a cancelled run ends, a millisecond count
-// that wraps time.Duration negative (429 retries then fire back to back), or
-// a max_retries that the int conversion truncates on the 32-bit release
-// builds, silently disabling retries.
+// Upper bounds for the retry settings: a larger value is a typo. They also
+// keep a millisecond count from wrapping time.Duration negative and
+// int(maxRetries) from truncating on 32-bit builds.
 const (
 	maxMaxRetries  = 100
 	maxRetryWaitMs = 3_600_000
@@ -180,10 +178,9 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 		return
 	}
 
-	// An empty string counts as unset, so a module variable defaulting to ""
-	// falls back to the environment instead of overriding it: an empty
-	// base_url would otherwise send a self-managed instance's token to
-	// gitlab.com, client-go's default.
+	// An empty string counts as unset: an empty base_url from a module
+	// variable defaulting to "" would otherwise send a self-managed instance's
+	// token to gitlab.com, client-go's default.
 	token := os.Getenv("GITLAB_TOKEN")
 	if v := config.Token.ValueString(); v != "" {
 		token = v
@@ -200,9 +197,9 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 		)
 		return
 	}
-	// The token goes straight into a header; net/http rejects control
-	// characters there with an opaque transport error, and a trailing newline
-	// from a file or $(cat ...) is the usual way one gets in.
+	// net/http rejects control characters in the token's header with an opaque
+	// transport error. A trailing newline from a file or $(cat ...) is the
+	// usual cause.
 	if token != strings.TrimSpace(token) || strings.ContainsFunc(token, unicode.IsControl) {
 		resp.Diagnostics.AddAttributeError(
 			path.Root("token"),
@@ -227,9 +224,9 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 	clientOpts := []gitlab.ClientOptionFunc{}
 	logURL := ""
 	if baseURL != "" {
-		// client-go only logs its own URL validation failure and carries on,
-		// so a schemeless value would surface much later as a transport error.
-		// The value is not echoed: it may carry a proxy's credentials.
+		// client-go only logs its own URL validation failure; a schemeless
+		// value would surface later as a transport error. The value is not
+		// echoed: it may carry credentials.
 		u, err := url.Parse(baseURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			resp.Diagnostics.AddAttributeError(
@@ -353,28 +350,16 @@ func (p *gitlabCommitsProvider) Resources(_ context.Context) []func() resource.R
 	}
 }
 
-// crossHostRedirectGuard is the http.Client CheckRedirect policy for the GitLab
-// client. net/http strips Authorization/Cookie on a cross-host redirect but
-// leaves custom headers like Private-Token intact, so a 3xx pointing off-host
-// would otherwise forward the API token to an attacker-controlled host. Same-host
-// redirects (including http->https upgrades) are allowed, but an https->http
-// downgrade is refused - it would resend the token in cleartext. So is a hop
-// on which net/http changed the method: on 301/302/303 it turns a POST into
-// a body-less GET, which would read the list at the commit or branch URL and
-// fail as a JSON decode error; a 307/308 keeps the method and the body and is
-// followed. A refusal returns http.ErrUseLastResponse rather than an error:
-// the 3xx then reaches client-go as a plain non-2xx response, which it does
-// not retry (an error from CheckRedirect would be replayed max_retries times
-// as a transport failure), and apiErrorDiag explains it with the Location
-// header. The chain is capped at 10 to match net/http's default behaviour,
-// which a non-nil CheckRedirect drops, and the cap is reported the same way.
+// crossHostRedirectGuard refuses an off-host hop (net/http keeps
+// Private-Token on it), an https->http downgrade and a changed method. It
+// returns the 3xx rather than an error, which the retry would replay.
 func crossHostRedirectGuard(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
 	}
 	if len(via) >= 10 {
-		// Same treatment as a refused hop: an error here would be replayed
-		// by the client's retry for GET/HEAD, a 3xx is reported once.
+		// net/http stops after 10 hops only without a custom CheckRedirect;
+		// this restores that cap.
 		return http.ErrUseLastResponse
 	}
 	if req.URL.Host != via[0].URL.Host {
@@ -389,9 +374,9 @@ func crossHostRedirectGuard(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// isJobToken reports whether token is a CI job token, by its prefix or, for
-// a job token from before the prefix or an instance prefix the pattern
-// misses, by being the job's own CI_JOB_TOKEN.
+// isJobToken reports whether token is a CI job token: it matches
+// jobTokenPattern or equals CI_JOB_TOKEN, which catches older unprefixed
+// tokens and instance prefixes the pattern misses.
 func isJobToken(token string) bool {
 	if jobToken := os.Getenv("CI_JOB_TOKEN"); jobToken != "" && token == jobToken {
 		return true
@@ -399,9 +384,9 @@ func isJobToken(token string) bool {
 	return jobTokenPattern.MatchString(token)
 }
 
-// withoutUserinfo renders u with its userinfo masked, for the log: a
-// basic-auth proxy's credentials, or a token in the user part as git URLs
-// carry one, must not reach a TF_LOG file that CI keeps.
+// withoutUserinfo renders u with its userinfo masked for the log: proxy
+// credentials or a token in the user part must not reach a TF_LOG file that
+// CI keeps.
 func withoutUserinfo(u *url.URL) string {
 	if u.User == nil {
 		return u.String()
@@ -411,13 +396,9 @@ func withoutUserinfo(u *url.URL) string {
 	return masked.String()
 }
 
-// headerRateLimiter is the GitLab client's rate limiter. client-go derives
-// one itself from the first response's RateLimit-Limit header, but stores it
-// in a plain field that every request reads without synchronisation: a data
-// race once requests run concurrently, as the refresh fan-outs and parallel
-// resource instances sharing the client do. Installing this limiter with
-// gitlab.WithCustomLimiter turns that derivation off; observe repeats it and
-// publishes the result through an atomic pointer.
+// headerRateLimiter is the client's rate limiter. client-go would derive one
+// from RateLimit-Limit into a plain field that concurrent requests race on;
+// WithCustomLimiter stops that, and observe stores it atomically.
 type headerRateLimiter struct {
 	current atomic.Pointer[rate.Limiter]
 	once    sync.Once
@@ -433,11 +414,9 @@ func (l *headerRateLimiter) Wait(ctx context.Context) error {
 	return l.current.Load().Wait(ctx)
 }
 
-// observe configures the limiter from the first response it is handed, as
-// client-go does: two thirds of GitLab's per-minute limit as the steady rate
-// and a third as the burst, with the request that brought the header
-// counted. A first response without a usable header leaves the limiter off
-// for good.
+// observe configures the limiter once, from the first response it is handed,
+// with client-go's formula. A first response without a usable
+// RateLimit-Limit leaves the limiter off for good.
 func (l *headerRateLimiter) observe(h http.Header) {
 	l.once.Do(func() {
 		perMinute, _ := strconv.ParseFloat(h.Get("RateLimit-Limit"), 64)
@@ -467,13 +446,9 @@ func (t *rateLimitObserver) RoundTrip(req *http.Request) (*http.Response, error)
 	return resp, err
 }
 
-// settlesLimiter reports whether resp may configure the rate limiter.
-// client-go reads the header from the answer a request finally gets, after
-// redirects were followed and retries were made, while a transport sees every
-// hop. A redirect, a 5xx or a 429 is often only a hop before that answer, so
-// one without RateLimit-Limit leaves the choice to a later response instead
-// of turning the limiter off for the whole run; a response that carries the
-// header always settles it.
+// settlesLimiter reports whether resp may configure the rate limiter. A 3xx,
+// 5xx or 429 without RateLimit-Limit is often a hop before the answer
+// client-go reads, so a later response decides.
 func settlesLimiter(resp *http.Response) bool {
 	if resp.Header.Get("RateLimit-Limit") != "" {
 		return true
@@ -482,11 +457,9 @@ func settlesLimiter(resp *http.Response) bool {
 	return code < 300 || (code >= 400 && code < 500 && code != http.StatusTooManyRequests)
 }
 
-// CloseIdleConnections forwards to the pooled transport. http.Client reaches
-// a transport's idle pool only through this method, and go-retryablehttp
-// calls it whenever a request finally fails or is cancelled, to drop idle
-// connections that may be as broken as the one that failed; without the
-// forward the pool would keep them.
+// CloseIdleConnections forwards to the pooled transport, whose idle pool
+// http.Client reaches only through this method. go-retryablehttp calls it
+// after a request finally fails, to drop suspect idle connections.
 func (t *rateLimitObserver) CloseIdleConnections() {
 	if c, ok := t.next.(interface{ CloseIdleConnections() }); ok {
 		c.CloseIdleConnections()
@@ -494,8 +467,8 @@ func (t *rateLimitObserver) CloseIdleConnections() {
 }
 
 // retryBackoff is the client's backoff. client-go's WithRetryAfterBackoff
-// waits for any Retry-After, up to a day for some limits, on every retry;
-// this one accepts a requested wait of at most maxServerWait.
+// waits for any Retry-After, up to a day for some limits; this one accepts a
+// requested wait of at most maxServerWait.
 func retryBackoff(minWait, maxWait time.Duration, attemptNum int, resp *http.Response) time.Duration {
 	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
 		// client-go's schedule for a 5xx or a transport failure.

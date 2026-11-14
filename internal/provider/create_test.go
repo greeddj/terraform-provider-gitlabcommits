@@ -33,10 +33,8 @@ func decodeCommit(t *testing.T, r *http.Request) gitlab.CreateCommitOptions {
 }
 
 // TestCreate_StartSHACarriesNoLockToken: with start_sha and no start_branch,
-// GitLab checks last_commit_id against the default branch instead of the
-// base commit the probes read, so the first commit of a branch created from
-// create_branch_from carries no token, on the adopt-update and on its
-// companion chmod alike, whether the source is a branch or a commit SHA.
+// GitLab checks last_commit_id against the default branch, not the base, so a
+// new branch's first commit carries no token, on adopt-update and chmod alike.
 func TestCreate_StartSHACarriesNoLockToken(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	for _, from := range []string{"main", sha} {
@@ -98,11 +96,9 @@ func TestCreate_StartSHACarriesNoLockToken(t *testing.T) {
 	}
 }
 
-// TestCreate_BranchCreatedMeanwhileIsProbedAgain: when another instance
-// created the branch between the first probe and the lock, Create probes the
-// branch again under the lock and commits against it with the branch's
-// tokens and no start_sha. Here the source held f.txt as planned, but the
-// branch the other instance created holds other content.
+// TestCreate_BranchCreatedMeanwhileIsProbedAgain: a branch another instance
+// created after the first probe is probed again under the lock, and the
+// commit targets it with its tokens and no start_sha.
 func TestCreate_BranchCreatedMeanwhileIsProbedAgain(t *testing.T) {
 	var featureGets atomic.Int32
 	var mu sync.Mutex
@@ -164,13 +160,9 @@ func TestCreate_BranchCreatedMeanwhileIsProbedAgain(t *testing.T) {
 	}
 }
 
-// TestCreate_SourceBranchMovingAfterTheProbeIsNotUsed: create_branch_from is
-// resolved to its head commit once; the probes read that commit and the new
-// branch starts from it, even when another resource moves the source branch
-// before the commit (here, during the second lookup of the target, which
-// follows the probes: the one confirming new.txt's directory check, or the
-// locked re-check). State then describes what the new branch holds. The
-// commit and the bare branch creation are both covered.
+// TestCreate_SourceBranchMovingAfterTheProbeIsNotUsed: create_branch_from
+// resolves to a commit once; probes, state and the new branch, by commit or
+// bare creation, stay on it when the source moves after the probes.
 func TestCreate_SourceBranchMovingAfterTheProbeIsNotUsed(t *testing.T) {
 	const moved = "5eed00000000000000000000000000000000b2b2"
 	for _, withNew := range []bool{true, false} {
@@ -268,12 +260,9 @@ func TestCreate_SourceBranchMovingAfterTheProbeIsNotUsed(t *testing.T) {
 	}
 }
 
-// TestAdoptProbeFailureFailsBeforeCommit: a probe of a path to adopt that
-// fails, or answers with ids that cannot be used, fails Create and Update on
-// that file before anything is committed, with GitLab's own status in the
-// diagnostic. Falling back to a create would fail on "already exists" and
-// hide the cause; falling back to an update would commit content that may
-// already match, or record a mode GitLab does not have.
+// TestAdoptProbeFailureFailsBeforeCommit: a failed adopt probe (with GitLab's
+// status) or unusable ids fail the file in Create and Update before any
+// commit, never a fallback to create or update.
 func TestAdoptProbeFailureFailsBeforeCommit(t *testing.T) {
 	status := func(code int) http.HandlerFunc {
 		return func(w http.ResponseWriter, _ *http.Request) { http.Error(w, http.StatusText(code), code) }
@@ -364,10 +353,9 @@ func TestCreate_DirectoryInTheWayFails(t *testing.T) {
 	}
 }
 
-// TestDirectoryCheck404NeedsTheBranchLookup: GitLab answers a tree listing
-// with 404 when Gitaly fails to resolve the ref, as for a path that is not a
-// directory, so the answer is trusted only once a branch lookup has
-// answered too. When that lookup fails, Create and Update commit nothing.
+// TestDirectoryCheck404NeedsTheBranchLookup: a tree listing 404s both for a
+// non-directory and when Gitaly fails to resolve the ref, so Create and
+// Update commit nothing when the branch lookup fails.
 func TestDirectoryCheck404NeedsTheBranchLookup(t *testing.T) {
 	for _, update := range []bool{false, true} {
 		name := "create"
@@ -413,10 +401,9 @@ func TestDirectoryCheck404NeedsTheBranchLookup(t *testing.T) {
 	}
 }
 
-// TestUpdate_DirectoryToFile: a directory turns into a file within one
-// commit only when the commit deletes every file in it first; a file the
-// resource does not manage, found on any page of the listing, fails the
-// update instead of being wiped with the directory.
+// TestUpdate_DirectoryToFile: a directory becomes a file only when the commit
+// deletes every file in it; an unmanaged file on any listing page, or a
+// claimed one, fails the update.
 func TestUpdate_DirectoryToFile(t *testing.T) {
 	state := managedFiles(true, map[string]string{"conf/app.yaml": "l1"})
 	plan := managedFiles(true, map[string]string{"conf": ""})
@@ -496,11 +483,9 @@ func TestUpdate_DirectoryToFile(t *testing.T) {
 	})
 }
 
-// TestCreate_BareBranchCreationReplayedAfter5xx: client-go replays the
-// branch POST after a 5xx, and when GitLab had already created the branch
-// the replay answers "Branch already exists". The branch is there, so Create
-// succeeds without a commit and logs a warning; when the branch is not
-// there, the error stands.
+// TestCreate_BareBranchCreationReplayedAfter5xx: client-go replays the branch
+// POST after a 5xx; a "Branch already exists" reply for a branch that exists
+// is success with a logged warning, otherwise an error.
 func TestCreate_BareBranchCreationReplayedAfter5xx(t *testing.T) {
 	for _, created := range []bool{true, false} {
 		t.Run(fmt.Sprintf("branch created %v", created), func(t *testing.T) {
@@ -654,8 +639,8 @@ func TestCreate_LogsTheActionCount(t *testing.T) {
 }
 
 // TestMissingBranchPreflight_ResolvesBase pins the commit a missing branch
-// starts from: a commit SHA as it is (lowercased), a branch by its head, and
-// no commit at all on an empty repository without create_branch_from.
+// starts from: a commit SHA lowercased, a branch by its head, none on an
+// empty repository without create_branch_from.
 func TestMissingBranchPreflight_ResolvesBase(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	cases := []struct {

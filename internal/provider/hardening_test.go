@@ -30,11 +30,9 @@ func TestDecodeRemoteContent_NilFile(t *testing.T) {
 	}
 }
 
-// TestCrossHostRedirectGuard verifies the token-exfiltration guard: same-host
-// redirects (any scheme) pass, off-host redirects, https->http downgrades
-// and hops on which net/http turned a POST into a GET are refused by handing
-// back the 3xx (ErrUseLastResponse, so the client neither follows nor
-// retries), and the chain is capped at 10.
+// TestCrossHostRedirectGuard: same-host hops that keep the method pass;
+// off-host hops, https->http downgrades and a POST turned into a GET get
+// ErrUseLastResponse, neither followed nor retried; chains stop at 10.
 func TestCrossHostRedirectGuard(t *testing.T) {
 	mkMethod := func(method, raw string) *http.Request {
 		u, err := url.Parse(raw)
@@ -130,12 +128,9 @@ func TestCrossHostRedirect_EndToEnd(t *testing.T) {
 	}
 }
 
-// TestSameHostRedirectOnCommit drives a Create through the configured client
-// while GitLab redirects the commit POST to another path on the same host.
-// net/http re-sends a POST as a GET on 301, 302 and 303, which would read
-// the commit list and fail as a JSON decode error; that hop is refused and
-// reported as a redirect, once. A 307 or 308 keeps the method and the body
-// and is followed: the commit lands once, at the new address.
+// TestSameHostRedirectOnCommit: net/http re-sends a POST redirected with
+// 301/302/303 as a GET, so that hop is refused and reported; a 307/308 keeps
+// the body and commits once at the new address.
 func TestSameHostRedirectOnCommit(t *testing.T) {
 	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
 		t.Run(strconv.Itoa(status), func(t *testing.T) {
@@ -213,10 +208,8 @@ func TestSameHostRedirectOnCommit(t *testing.T) {
 	}
 }
 
-// TestNullBodyDecodesToNilCommit documents the precondition the Create/Update
-// nil-guards defend against: client-go decodes a 2xx JSON-null body into
-// a nil *Commit with no error. If a future client-go changes this, the guards can
-// be revisited.
+// TestNullBodyDecodesToNilCommit pins why the Create/Update nil-guards exist:
+// client-go decodes a 2xx JSON-null body into a nil *Commit with no error.
 func TestNullBodyDecodesToNilCommit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
@@ -242,10 +235,9 @@ func TestNullBodyDecodesToNilCommit(t *testing.T) {
 	}
 }
 
-// TestBranchHeadDataSource_NoHeadCommit drives the branch_head data source
-// against a server that returns a branch without a usable head commit (a
-// null or omitted commit, or one with no id), asserting a clean error
-// diagnostic instead of a nil-deref panic or an empty commit_sha.
+// TestBranchHeadDataSource_NoHeadCommit: a branch with a null, omitted or
+// id-less commit is a clean error diagnostic, not a nil-deref panic or an
+// empty commit_sha.
 func TestBranchHeadDataSource_NoHeadCommit(t *testing.T) {
 	for _, tc := range []struct{ name, body string }{
 		{name: "null commit", body: `{"name":"main","commit":null,"protected":false}`},
@@ -269,10 +261,9 @@ func TestBranchHeadDataSource_NoHeadCommit(t *testing.T) {
 	}
 }
 
-// TestDiffActions_AdoptForwardsLockToken: when adopt_existing rewrites a
-// new-to-state path that already exists remotely into an update, the probed
-// last_commit_id is forwarded under optimistic_lock so the overwrite is still
-// guarded against a concurrent writer; with optimistic_lock off, no token is sent.
+// TestDiffActions_AdoptForwardsLockToken: an adopt-update of a path that
+// exists remotely carries the probed last_commit_id under optimistic_lock,
+// and no token with the lock off.
 func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
 	const probedLCID = "abc123probed"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -344,9 +335,8 @@ func TestDiffActions_AdoptForwardsLockToken(t *testing.T) {
 }
 
 // TestDiffActions_AdoptEmitsChmodOnExecMismatch: the commits API ignores
-// execute_filemode on update actions, so adopting an existing file whose
-// remote exec bit differs from the plan must add a companion chmod to the
-// same action set; matching bits must not.
+// execute_filemode on update, so an adopt-update whose remote exec bit differs
+// adds a companion chmod; matching bits do not.
 func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	const probedLCID = "abc123probed"
 	remoteExec := false
@@ -440,11 +430,9 @@ func TestDiffActions_AdoptEmitsChmodOnExecMismatch(t *testing.T) {
 	})
 }
 
-// TestTreeEntryWithoutPath: a tree listing that answers with a null entry or
-// an entry without a path fails the file it was listed for, in the one-entry
-// directory check and in the recursive listing of a directory turning into
-// a file alike, and nothing is committed. Read as "no directory" it would let
-// a create replace a directory; dereferenced it would panic the provider.
+// TestTreeEntryWithoutPath: a null or path-less entry in the one-entry or
+// recursive tree listing fails its file and commits nothing; taken as "no
+// directory" it would let a create replace one.
 func TestTreeEntryWithoutPath(t *testing.T) {
 	for _, body := range []string{`[null]`, `[{"path":"","type":"blob"}]`} {
 		for _, recursive := range []bool{false, true} {

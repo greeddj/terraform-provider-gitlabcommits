@@ -79,20 +79,9 @@ func deleteRequest(t *testing.T, res *filesResource, state filesResourceModel) (
 	return resource.DeleteRequest{State: st}, &resource.DeleteResponse{State: tfsdk.State{Schema: sch, Raw: st.Raw.Copy()}}
 }
 
-// repoFake is a small stateful GitLab: files maps every path on the branch
-// to its last commit id. Like GitLab it answers a metadata probe and a tree
-// listing from that map and rejects with HTTP 400, landing nothing, a commit
-// that creates an existing path, or updates, deletes or chmods a missing one
-// or with a stale last_commit_id; an accepted commit is applied to the map.
-// branchStatus, commitStatus and probeStatus (per path) override the answers
-// for GET /branches/, a commit and a probe. Every file holds the content
-// "x", which a content fetch returns, unless content holds other bytes for
-// its path. Every project_id spelling reaches the same branch; projects
-// answers a project lookup with the numeric id for a spelling
-// (projectStatus overrides it), and while it is nil a lookup is an
-// unexpected call. beforeCommit, when set, runs as a commit arrives and
-// before it is handled, without holding the fake's lock. Commits, probes
-// (metadata requests) and project lookups are recorded, accepted or not.
+// repoFake is a small stateful GitLab: files maps each path to its last
+// commit id. It refuses commits as GitLab does (HTTP 400) and records every
+// commit, probe and lookup.
 type repoFake struct {
 	files         map[string]string
 	content       map[string][]byte
@@ -327,11 +316,9 @@ func runUpdateOn(t *testing.T, res *filesResource, plan, state filesResourceMode
 	return resp
 }
 
-// updateRequest builds the plan/state pair for res.Update the way fwserver
-// does: the plan carries the unknowns plannedModel adds, and the response
-// starts as the prior state. Kept apart from runUpdateOn so concurrency
-// tests build requests on the test goroutine (t.Fatalf must not run
-// anywhere else) and only call Update from workers.
+// updateRequest builds res.Update's request as fwserver does: plannedModel's
+// unknowns in the plan, the prior state in the response. It calls t.Fatalf,
+// so only the test goroutine may call it.
 func updateRequest(t *testing.T, res *filesResource, plan, state filesResourceModel) (resource.UpdateRequest, *resource.UpdateResponse) {
 	t.Helper()
 	ctx := t.Context()
@@ -384,15 +371,9 @@ func createRequest(t *testing.T, res *filesResource, plan filesResourceModel) (r
 	return resource.CreateRequest{Plan: pl}, &resource.CreateResponse{State: tfsdk.State{Schema: sch, Raw: empty}}
 }
 
-// plannedModel returns m as the framework plans it against prior, nil for a
-// Create: every Computed attribute with no default and no configured value
-// is unknown (known after apply), except what an Update plan keeps at its
-// prior value. That is id, through UseStateForUnknown, and, while project_id
-// and branch are unchanged, what ModifyPlan keeps: the blob_id and
-// last_commit_id of every file whose content, content_base64 and
-// execute_filemode equal prior's, and commit_sha when every file does and
-// the plan adds or removes none. The files map is copied, so a state model
-// sharing it never sees the unknowns.
+// plannedModel returns m as the framework plans it against prior (nil on
+// Create): unset Computed values become unknown, except id on Update and
+// what ModifyPlan keeps. It copies m.Files.
 func plannedModel(m filesResourceModel, prior *filesResourceModel) filesResourceModel {
 	m.Files = maps.Clone(m.Files)
 	sameTarget := prior != nil && m.ProjectID.Equal(prior.ProjectID) && m.Branch.Equal(prior.Branch)
@@ -423,11 +404,9 @@ func plannedModel(m filesResourceModel, prior *filesResourceModel) filesResource
 	return m
 }
 
-// checkCreateResult pins what a Create may hand back. Success is a fully
-// known state: Terraform rejects unknowns after apply, when the commit has
-// already landed. Failure is no state at all: a Create that returns state
-// next to an error is tainted and replaced, which pushes a delete commit.
-// It only calls t.Error, so workers may use it.
+// checkCreateResult requires success to return a fully known state
+// (Terraform rejects unknowns after apply) and failure no state (state
+// beside an error is tainted; replacing it pushes a delete commit).
 func checkCreateResult(t *testing.T, resp *resource.CreateResponse) {
 	t.Helper()
 	switch {
@@ -442,10 +421,9 @@ func checkCreateResult(t *testing.T, resp *resource.CreateResponse) {
 	}
 }
 
-// checkUpdateResult is the Update counterpart: success is a fully known
-// state that keeps every value the plan already knew, and failure leaves the
-// prior state exactly as it was, since anything else would record content
-// that never landed.
+// checkUpdateResult requires success to return a fully known state that
+// keeps every value the plan knew. Failure must keep the prior state, or
+// state may record content that never landed.
 func checkUpdateResult(t *testing.T, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	t.Helper()
 	switch {
@@ -462,10 +440,9 @@ func checkUpdateResult(t *testing.T, req resource.UpdateRequest, resp *resource.
 	}
 }
 
-// checkKeepsPlan fails when applied differs from a value planned as known.
-// Terraform rejects that after apply, with the commit already landed, as
-// "Provider produced inconsistent result after apply"; an unknown planned
-// value may become anything. It only calls t.Error, so workers may use it.
+// checkKeepsPlan fails when applied changes a value planned as known:
+// Terraform rejects that after the commit landed, as an inconsistent result
+// after apply. An unknown planned value may become anything.
 func checkKeepsPlan(t *testing.T, planned, applied tftypes.Value) {
 	t.Helper()
 	diffs, err := planned.Diff(applied)
@@ -534,9 +511,8 @@ func TestUpdate_NullCommitBodyErrors(t *testing.T) {
 }
 
 // TestCommitConflict_LeavesStateUntouched: when GitLab rejects the commit
-// under optimistic_lock, Create returns no state (state next to an error is
-// tainted and replaced with a delete commit) and Update keeps the prior
-// state (the planned content never landed).
+// under optimistic_lock, Create returns no state (state beside an error
+// taints the resource) and Update keeps the prior state.
 func TestCommitConflict_LeavesStateUntouched(t *testing.T) {
 	conflict := func(t *testing.T, posts *atomic.Int32) *gitlab.Client {
 		return newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -594,14 +570,9 @@ func TestCommitConflict_LeavesStateUntouched(t *testing.T) {
 	})
 }
 
-// TestCommitErrors_UnrefreshedStateNote: while state records detect_drift =
-// false a refresh changes nothing, so the refresh a lock conflict suggests
-// and the plan a server error suggests cannot help; Update and Delete then
-// add how to recover, and only then. The recorded value counts, not the
-// plan's, and other rejections get no note. For Update the recovery puts
-// the change back before planning, and dropping the lock is offered only
-// as a shortcut, with the cases it cannot handle. A connection dropped once
-// the commit request was sent leaves the outcome as open as a server error.
+// TestCommitErrors_UnrefreshedStateNote: a lock conflict, server error or
+// lost connection gets the recovery note only while state (not the plan)
+// records detect_drift = false, when a refresh changes nothing.
 func TestCommitErrors_UnrefreshedStateNote(t *testing.T) {
 	const conflict = `{"message":"The file has changed since you started editing it: f.txt"}`
 	cases := []struct {
@@ -702,11 +673,9 @@ func TestCommitErrors_UnrefreshedStateNote(t *testing.T) {
 	}
 }
 
-// TestUpdate_BranchGoneBeforeCommit: a branch deleted after the plan (a
-// merge request merged with its source branch deleted) makes GitLab refuse
-// the commit with a 400 that names no branch. Update looks the branch up and
-// says the branch is gone, that nothing was committed, and how to recover,
-// which depends on the detect_drift value state records.
+// TestUpdate_BranchGoneBeforeCommit: GitLab refuses a commit to a branch
+// deleted after the plan with a 400 naming no branch; Update reports "Branch
+// no longer exists" and the recovery for state's detect_drift.
 func TestUpdate_BranchGoneBeforeCommit(t *testing.T) {
 	for _, stale := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stale=%v", stale), func(t *testing.T) {
@@ -741,9 +710,8 @@ func TestUpdate_BranchGoneBeforeCommit(t *testing.T) {
 }
 
 // TestUpdate_BranchLookupFailsAfterRejectedCommit: when the branch lookup
-// that follows a 400 on the update commit fails itself, nothing says the
-// branch is gone, so the commit's own diagnostic is reported rather than
-// "Branch no longer exists" and its recreate advice.
+// after a 400 on the commit fails itself, nothing proves the branch gone, so
+// the commit's own diagnostic is reported.
 func TestUpdate_BranchLookupFailsAfterRejectedCommit(t *testing.T) {
 	for _, status := range []int{http.StatusForbidden, http.StatusInternalServerError} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
@@ -785,10 +753,9 @@ func TestCreate_BranchLookupFailureNamesTheActionOnce(t *testing.T) {
 	}
 }
 
-// TestDelete_ProbeFailuresMakeOneDiagnostic: when the probes before a
-// destroy fail alike (a revoked token), the destroy reports one error that
-// names the first path in full and lists the others, rather than one error
-// per file, and commits nothing.
+// TestDelete_ProbeFailuresMakeOneDiagnostic: when every probe before a
+// destroy fails alike (a revoked token), one error names the first path in
+// full and lists the others; nothing is committed.
 func TestDelete_ProbeFailuresMakeOneDiagnostic(t *testing.T) {
 	fake := &repoFake{
 		files:       map[string]string{"a.txt": "la", "b.txt": "lb", "c.txt": "lc"},
@@ -833,11 +800,9 @@ func TestAlsoFailed(t *testing.T) {
 	}
 }
 
-// TestDelete_RetryConflictUnrefreshedNote: a destroy whose first commit
-// GitLab rejects for a file deleted out of band is retried without it (the
-// two recorded commits), and when the retry is rejected in turn for a file
-// edited out of band, that one error carries the same recovery as the first
-// commit's would, and only while state records detect_drift = false.
+// TestDelete_RetryConflictUnrefreshedNote: the destroy retry without a file
+// deleted out of band is rejected for an edited one; its error carries the
+// recovery note exactly while state records detect_drift = false.
 func TestDelete_RetryConflictUnrefreshedNote(t *testing.T) {
 	for _, stale := range []bool{true, false} {
 		t.Run(fmt.Sprintf("stale=%v", stale), func(t *testing.T) {
@@ -894,14 +859,9 @@ func TestDelete_DeleteOnDestroyFalseSkipsAPI(t *testing.T) {
 	}
 }
 
-// TestDelete_Outcomes pins how destroy reaches its one commit. A delete that
-// carries a last_commit_id goes out unprobed, since GitLab checks the token
-// itself; only a rejection (a 400, or the 404 of a project that is gone)
-// makes Delete probe and retry once without the files already gone, and any
-// other failure is reported as it is. A delete without a token is probed
-// first, because GitLab would remove whatever sits at the path. A 404 counts
-// only once the branch lookup succeeds, and a destroy that finds nothing to
-// delete warns.
+// TestDelete_Outcomes: destroy lands at most one commit; deletes with a
+// token go unprobed, a 400 or 404 brings one retry without absent files, and
+// token-less deletes are probed first.
 func TestDelete_Outcomes(t *testing.T) {
 	cases := []struct {
 		repo         map[string]string // path -> last commit id on the branch
@@ -1158,20 +1118,9 @@ func TestDelete_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
 const branchGoneUnsent = `branch "main" no longer exists in project "proj" (deleted out of band, for example by ` +
 	`merging a merge request that deletes its source branch), so nothing was committed.`
 
-// TestUpdate_UnguardedDeleteAndChmodAreProbed: a delete or chmod without a
-// last_commit_id has no guard at GitLab, so its path is probed first; a
-// delete of a path that no longer holds a file is dropped and a chmod of one
-// fails. With the lock on and every token present nothing is probed before
-// the commit, and a path the adopt probe has just found is not probed again.
-// A state that recorded detect_drift = false was never refreshed, so there
-// every delete is probed, a locked one included (GitLab would reject the
-// locked delete of a missing file on every apply), and once only, whether
-// the plan turns detect_drift back on (stale) or keeps it off (keepOff too).
-// A probed path gone together with its branch fails the update naming the
-// branch, rather than dropping the delete into an apply that commits
-// nothing and records the kept files on a branch that no longer exists.
-// Every plan drops rm.txt and sets run.sh's exec bit to chmod; adopt adds
-// new.sh, executable, with the content the branch already holds.
+// TestUpdate_UnguardedDeleteAndChmodAreProbed: GitLab guards only actions
+// with a last_commit_id, so a token-less delete or chmod is probed first,
+// and with detect_drift = false in state every delete is, locked ones too.
 func TestUpdate_UnguardedDeleteAndChmodAreProbed(t *testing.T) {
 	cases := []struct {
 		repo                               map[string]string
@@ -1416,11 +1365,9 @@ func TestCommitLocked_CancelledWaitSendsNothing(t *testing.T) {
 	checkUpdateResult(t, req, resp)
 }
 
-// TestCreate_CancelledLockWaitBeforeCommitSendsNothing: Create takes the
-// branch lock a second time, after its probes, for the branch re-check and
-// the commit. Another commit takes the lock while a probe is in flight, so
-// that second wait is the one ctx ends; nothing is committed and no state is
-// returned.
+// TestCreate_CancelledLockWaitBeforeCommitSendsNothing: another holder takes
+// the branch lock during a probe, so ctx ends Create's wait before the
+// re-check and commit; nothing is committed, no state returned.
 func TestCreate_CancelledLockWaitBeforeCommitSendsNothing(t *testing.T) {
 	var res *filesResource
 	var held sync.Once
@@ -1477,13 +1424,9 @@ func TestUpdate_NoOpProducesNoCommit(t *testing.T) {
 	}
 }
 
-// TestCreate_EmptyRepository: on a project with no commits every branch
-// lookup 404s and no ref exists to branch from. Without create_branch_from,
-// Create sends one commit naming the branch alone, which GitLab makes the
-// root commit together with the branch; nothing can exist yet, so nothing is
-// probed before it. With create_branch_from set the ref cannot exist yet,
-// and Create says to order this resource after the one that makes the first
-// commit, or to remove create_branch_from, rather than ignoring it.
+// TestCreate_EmptyRepository: in a repository without commits, Create probes
+// nothing and sends one commit naming the branch alone, the root commit;
+// create_branch_from fails (no ref exists), suggesting depends_on or removing it.
 func TestCreate_EmptyRepository(t *testing.T) {
 	for _, withFrom := range []bool{false, true} {
 		t.Run(fmt.Sprintf("create_branch_from set %v", withFrom), func(t *testing.T) {
@@ -1760,13 +1703,9 @@ func TestBranchHelpers(t *testing.T) {
 // of a missing target branch.
 const sourceHead = "5eed00000000000000000000000000000000a1a1"
 
-// TestCreate_EmptyRepositoryFirstCommitTakenMeanwhile: two resources that
-// bootstrap different branches of one empty repository in one apply are not
-// ordered by the branch lock. When another writer makes the first commit
-// after the preflight, GitLab refuses this root commit with a 400 that names
-// no cause; a repository that holds commits by then is reported as such,
-// with the ways out. A 400 on a repository that is still empty is the
-// commit's own error.
+// TestCreate_EmptyRepositoryFirstCommitTakenMeanwhile: when GitLab refuses
+// the root commit with a 400, Create reports that another writer made the
+// first commit if the repository now holds commits, else the commit's own error.
 func TestCreate_EmptyRepositoryFirstCommitTakenMeanwhile(t *testing.T) {
 	for _, taken := range []bool{true, false} {
 		t.Run(fmt.Sprintf("taken=%v", taken), func(t *testing.T) {
@@ -1836,10 +1775,10 @@ func projectJSON(w http.ResponseWriter, empty bool) {
 	_, _ = fmt.Fprintf(w, `{"id":1,"empty_repo":%t}`, empty)
 }
 
-// TestCreate_FirstCommitRejectionNamesRef: when GitLab rejects the first
-// commit that was to materialise the branch, the diagnostic names the branch,
-// the create_branch_from ref and the commit it resolved to, since that
-// pairing is the usual culprit.
+// TestCreate_FirstCommitRejectionNamesRef: when GitLab rejects the commit
+// that materialises the branch, the diagnostic names the branch, the
+// create_branch_from ref and its resolved commit, since that pairing is the
+// usual culprit.
 func TestCreate_FirstCommitRejectionNamesRef(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1877,13 +1816,9 @@ func TestCreate_FirstCommitRejectionNamesRef(t *testing.T) {
 	}
 }
 
-// TestCreate_AdoptsFromCreateBranchFromRef is the regression test for
-// adoption across branch materialisation: when the branch does not exist yet
-// and create_branch_from points at a branch that already contains a managed
-// path, the adopt probe must resolve against that branch's head commit - the
-// new branch inherits the file, so a plain create would die with "already
-// exists". The branch itself is materialised by start_sha on the commit,
-// never by a separate branch-creation call.
+// TestCreate_AdoptsFromCreateBranchFromRef: for a missing branch, the adopt
+// probe reads the create_branch_from head, so an inherited file becomes an
+// update, not a failing create; start_sha on the commit creates the branch.
 func TestCreate_AdoptsFromCreateBranchFromRef(t *testing.T) {
 	var commitBody string
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2026,10 +1961,9 @@ func proxyErr(err error) error {
 	return &url.Error{Op: "Post", Err: &net.OpError{Op: "proxyconnect", Net: "tcp", Err: err}}
 }
 
-// TestCommitRetryPolicy pins which failures may replay the commit POST: rate
-// limiting and connection failures that happen before the request is sent,
-// nothing else - a replay after GitLab already landed the commit would be a
-// second commit for one apply.
+// TestCommitRetryPolicy pins which failures may replay the commit POST: only a
+// 429 and some failures before the request is sent, since replaying a landed
+// commit makes a second one.
 func TestCommitRetryPolicy(t *testing.T) {
 	cases := []struct {
 		err   error
@@ -2194,9 +2128,8 @@ func TestBranchLocks_SerialisesPerBranch(t *testing.T) {
 }
 
 // TestUpdate_ConcurrentSameBranchCommitsAreSerialised: resource instances
-// sharing one branch (the for_each layout under terraform -parallelism) must
-// never have two commit POSTs in flight at once - that is the ref race GitLab
-// rejects with HTTP 400 "reference does not point to expected object".
+// sharing one branch never have two commit POSTs in flight at once: GitLab
+// rejects that ref race with HTTP 400 "reference does not point to expected object".
 func TestUpdate_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
 	var overlap inFlight
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2238,11 +2171,9 @@ func TestUpdate_ConcurrentSameBranchCommitsAreSerialised(t *testing.T) {
 	}
 }
 
-// TestCreate_ConcurrentBranchMaterialisationIsSerialised: several instances
-// creating on the same missing branch must not all try to materialise it.
-// Create holds the branch lock from the existence check through the commit,
-// so the first instance creates the branch with start_sha and the others
-// then see it, probe it again and commit plainly.
+// TestCreate_ConcurrentBranchMaterialisationIsSerialised: instances creating
+// on one missing branch re-check it under the lock, so exactly one sends
+// start_sha and the others find the branch, probe it again and commit plainly.
 func TestCreate_ConcurrentBranchMaterialisationIsSerialised(t *testing.T) {
 	var branchCreated atomic.Bool
 	var startSHACommits, commits, branchProbes atomic.Int32
@@ -2368,11 +2299,9 @@ func TestCreate_ConcurrentOnExistingBranchCommitsAreSerialised(t *testing.T) {
 	}
 }
 
-// TestCreate_ErrorInsideLockReleasesIt: Create returns from inside its
-// critical section when the branch re-check or the bare branch creation
-// fails, and the lock must be free afterwards, or every sibling on that
-// branch would wait until the apply is cancelled. f.txt exists at the
-// source, so no directory check adds a branch lookup before the lock.
+// TestCreate_ErrorInsideLockReleasesIt: a failed branch re-check or bare
+// branch creation under the lock frees the lock. f.txt exists at the source,
+// so the second branch lookup is the re-check.
 func TestCreate_ErrorInsideLockReleasesIt(t *testing.T) {
 	for _, identical := range []bool{false, true} {
 		name := "branch re-check fails"
@@ -2430,10 +2359,9 @@ func TestCreate_ErrorInsideLockReleasesIt(t *testing.T) {
 	}
 }
 
-// TestCreate_CommitSHASourceUsesStartSHA: a create_branch_from that is a
-// full commit SHA is used as it is, with no branch lookup, and travels as
-// start_sha. Gitaly takes only lowercase hex there, so an uppercase SHA is
-// lowercased, for the probes as well.
+// TestCreate_CommitSHASourceUsesStartSHA: a full commit SHA in
+// create_branch_from needs no branch lookup and travels as start_sha,
+// lowercased for the commit and the probes, since Gitaly takes only lowercase hex.
 func TestCreate_CommitSHASourceUsesStartSHA(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
 	for _, configured := range []string{sha, strings.ToUpper(sha)} {
@@ -2532,9 +2460,9 @@ func TestCreate_CommitIsNotRetriedOn5xx(t *testing.T) {
 	}
 }
 
-// adoptServer fakes a branch whose f.txt already holds remoteContent: the
-// branch exists, the adopt probe finds the file, and the content fetch
-// returns remoteContent. Commit POSTs are counted and answered with 201.
+// adoptServer fakes an existing branch whose f.txt holds remoteContent. It
+// counts commit POSTs in posts, records the last body in commitBody and
+// answers 201.
 func adoptServer(t *testing.T, remoteContent string, posts *atomic.Int32, commitBody *string) *gitlab.Client {
 	t.Helper()
 	return newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2613,11 +2541,9 @@ func TestCreate_AdoptDifferentContentUpdates(t *testing.T) {
 	}
 }
 
-// TestCreate_AdoptNonNFCRemoteUpdates: Terraform hands the provider every
-// string in Unicode NFC, so a remote file holding the same text in another
-// form (a combining accent, as macOS tools may write it) differs bytewise
-// from the plan. Adoption compares bytes, so it commits the configured NFC
-// text instead of taking the file for identical.
+// TestCreate_AdoptNonNFCRemoteUpdates: Terraform hands the provider NFC
+// strings, so a remote file with the same text in another normal form differs
+// bytewise, and adoption commits the configured NFC text.
 func TestCreate_AdoptNonNFCRemoteUpdates(t *testing.T) {
 	var posts atomic.Int32
 	var body string
@@ -2644,10 +2570,9 @@ func TestCreate_AdoptNonNFCRemoteUpdates(t *testing.T) {
 	}
 }
 
-// TestCreate_AdoptIdenticalBesideNewPathCommitsOnlyTheNewPath: one path that
-// already matches the plan and one that does not exist yet make a single
-// commit carrying only the create. The adopted path is never probed at the
-// new commit; its computed fields come from the adopt probe.
+// TestCreate_AdoptIdenticalBesideNewPathCommitsOnlyTheNewPath: a matching
+// path beside a new one makes one commit with only the create; the adopted
+// path keeps the adopt probe's ids, with no probe at the new commit.
 func TestCreate_AdoptIdenticalBesideNewPathCommitsOnlyTheNewPath(t *testing.T) {
 	var posts atomic.Int32
 	var body string
@@ -2794,10 +2719,9 @@ func TestCreate_AdoptIdenticalOnMissingBranchCreatesBranchOnly(t *testing.T) {
 	}
 }
 
-// TestCreate_MissingBranchFailureMakesNoCommit: when the branch still has to
-// be materialised, a failed re-check under the lock or a failed bare branch
-// creation fails Create before any commit, and without state. f.txt exists
-// at the source, so no directory check adds a branch lookup before the lock.
+// TestCreate_MissingBranchFailureMakesNoCommit: a failed branch re-check or
+// bare branch creation fails Create without commit or state. f.txt exists at
+// the source, so the second branch lookup is the re-check.
 func TestCreate_MissingBranchFailureMakesNoCommit(t *testing.T) {
 	cases := []struct {
 		name string
@@ -2855,9 +2779,8 @@ func TestCreate_MissingBranchFailureMakesNoCommit(t *testing.T) {
 }
 
 // TestCreate_AdoptExistingFalseCreatesWithoutProbing: with adopt_existing
-// off, Create never probes the branch for existing files; it only checks
-// that no directory sits at the path, sends a plain, unlocked create and
-// leaves an existing file to fail loudly at GitLab.
+// off, Create probes no file, checks only for a directory at the path and
+// sends a plain create, so an existing file fails at GitLab.
 func TestCreate_AdoptExistingFalseCreatesWithoutProbing(t *testing.T) {
 	var body string
 	var committed atomic.Bool
@@ -2896,11 +2819,9 @@ func TestCreate_AdoptExistingFalseCreatesWithoutProbing(t *testing.T) {
 	}
 }
 
-// TestUpdate_StampsOnlyTouchedPaths: after a commit that changed one of two
-// files, the untouched file keeps its state values and is never probed. The
-// untouched file switches to content_base64 of the same bytes, which needs
-// no action but which the plan leaves with its computed fields unknown, so
-// only carrying them over from state can fill them.
+// TestUpdate_StampsOnlyTouchedPaths: Update never probes a file its commit
+// left untouched; the file keeps its state ids, which its switch to
+// content_base64 of the same bytes leaves unknown in the plan.
 func TestUpdate_StampsOnlyTouchedPaths(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -3006,12 +2927,9 @@ func TestUpdate_MixedActionsProduceExactlyOneCommit(t *testing.T) {
 	}
 }
 
-// TestUpdate_NoOpPreservesUnknownComputedFields drives the zero-action
-// branch with every computed field unknown, id included, and asserts state
-// ends up fully known with the prior computed values. The file switches to
-// content_base64 of the same bytes: that needs no action, but the plan
-// leaves its ids and commit_sha unknown, so only the zero-action branch can
-// fill them.
+// TestUpdate_NoOpPreservesUnknownComputedFields: the zero-action branch fills
+// every unknown computed field, id included, from prior state. The switch to
+// content_base64 of the same bytes needs no action but leaves them unknown.
 func TestUpdate_NoOpPreservesUnknownComputedFields(t *testing.T) {
 	client := newReadClient(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected API call %s %s for a no-op update", r.Method, r.URL.Path)
