@@ -153,7 +153,8 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 		resp.Diagnostics.AddAttributeError(
 			path.Root("base_url"),
 			"Unknown GitLab Base URL",
-			"base_url must be a known value at provider configure time.",
+			"base_url must be a known value at provider configure time. Use a static value, set GITLAB_BASE_URL and leave "+
+				"base_url unset, or create the source first with `terraform apply -target=<address>`.",
 		)
 	}
 	// Unknown retry settings must not silently become defaults: the user set
@@ -170,7 +171,8 @@ func (p *gitlabCommitsProvider) Configure(ctx context.Context, req provider.Conf
 			resp.Diagnostics.AddAttributeError(
 				path.Root(a.name),
 				"Unknown retry configuration",
-				a.name+" must be a known value at provider configure time.",
+				a.name+" must be a known value at provider configure time. Use a static value, or create the source "+
+					"first with `terraform apply -target=<address>`. This setting has no environment variable.",
 			)
 		}
 	}

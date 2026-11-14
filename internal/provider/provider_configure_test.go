@@ -485,18 +485,47 @@ func TestConfigure_InvalidRetryBoundsError(t *testing.T) {
 	})
 }
 
-// TestConfigure_UnknownRetrySettingsError: unknown retry values must be
-// rejected instead of silently replaced with defaults.
-func TestConfigure_UnknownRetrySettingsError(t *testing.T) {
+// TestConfigure_UnknownSettingsError: an unknown value fails on its attribute
+// with a way out, and a retry value is never silently replaced with a default.
+func TestConfigure_UnknownSettingsError(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
-	for _, attr := range []string{"max_retries", "retry_wait_min_ms", "retry_wait_max_ms"} {
-		t.Run(attr, func(t *testing.T) {
-			resp := runConfigure(t, map[string]tftypes.Value{
-				"token": tftypes.NewValue(tftypes.String, "tok"),
-				attr:    tftypes.NewValue(tftypes.Number, tftypes.UnknownValue),
-			})
-			if !resp.Diagnostics.HasError() {
-				t.Fatalf("expected an error for unknown %s", attr)
+	t.Setenv("GITLAB_BASE_URL", "")
+	const target = "create the source first with `terraform apply -target=<address>`."
+	retryDetail := func(attr string) string {
+		return attr + " must be a known value at provider configure time. Use a static value, or " + target +
+			" This setting has no environment variable."
+	}
+	cases := []struct {
+		typ                   tftypes.Type
+		attr, summary, detail string
+	}{
+		{
+			attr: "token", typ: tftypes.String, summary: "Unknown GitLab API Token",
+			detail: "Token must be a known value at provider configure time. " +
+				"Use a static value, set GITLAB_TOKEN and leave token unset, or " + target,
+		},
+		{
+			attr: "base_url", typ: tftypes.String, summary: "Unknown GitLab Base URL",
+			detail: "base_url must be a known value at provider configure time. " +
+				"Use a static value, set GITLAB_BASE_URL and leave base_url unset, or " + target,
+		},
+		{attr: "max_retries", typ: tftypes.Number, summary: "Unknown retry configuration", detail: retryDetail("max_retries")},
+		{attr: "retry_wait_min_ms", typ: tftypes.Number, summary: "Unknown retry configuration", detail: retryDetail("retry_wait_min_ms")},
+		{attr: "retry_wait_max_ms", typ: tftypes.Number, summary: "Unknown retry configuration", detail: retryDetail("retry_wait_max_ms")},
+	}
+	for _, c := range cases {
+		t.Run(c.attr, func(t *testing.T) {
+			attrs := map[string]tftypes.Value{"token": tftypes.NewValue(tftypes.String, "tok")}
+			attrs[c.attr] = tftypes.NewValue(c.typ, tftypes.UnknownValue)
+			errs := runConfigure(t, attrs).Diagnostics.Errors()
+			if len(errs) != 1 || errs[0].Summary() != c.summary {
+				t.Fatalf("want one %q error, got %v", c.summary, errs)
+			}
+			if d, ok := errs[0].(interface{ Path() path.Path }); !ok || !d.Path().Equal(path.Root(c.attr)) {
+				t.Errorf("the error must point at %s, got %v", c.attr, errs[0])
+			}
+			if got := errs[0].Detail(); got != c.detail {
+				t.Errorf("detail:\n got %q\nwant %q", got, c.detail)
 			}
 		})
 	}
